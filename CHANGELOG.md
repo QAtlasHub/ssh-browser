@@ -30,6 +30,11 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- A control API on the loopback path, with a 32-byte token compared in constant time,
+  protocol version negotiation, and no CORS participation at all. Nothing writes through
+  it yet; it exists so the boundary is settled before there is something behind it.
+- The alias origin answers anything other than `GET` or `HEAD` with a `405`, rather than
+  serving a write as though it were a read.
 - `Range` requests, so video and PDF can seek. A file over 8 MB is fetched by range
   and not cached; anything smaller is fetched whole, held, and sliced. `If-Range` is
   never honoured because the only validator offered is weak, and a multi-range request
