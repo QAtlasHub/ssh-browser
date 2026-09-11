@@ -30,8 +30,10 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
-- A request whose final path component is a symlink is refused, decided from the
-  cached listing rather than from a REALPATH per request.
+- Symlinks are refused rather than followed, at every component of a path rather
+  than only the last, so reaching a file through a symlinked directory is refused
+  too. Decided from batched ancestor listings, so a path of depth d costs one round
+  trip rather than d: measured at 6 round trips for depth 4 against 5 for depth 1.
 
 ### Fixed
 
