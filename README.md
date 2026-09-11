@@ -64,7 +64,7 @@ impersonate anything else, which is not true of a stock mkcert CA.
 ## Usage
 
 ```
-ssh-browser serve panza=Panza:/usr/share/doc ohtaka=issp-ohtaka:/home/me/docs
+ssh-browser serve docs=myhost:/srv/docs cluster=login-node:/home/me/public_html
 ```
 
 That listens on 127.0.0.1:7391 and prints what to do next. Point the browser at the
@@ -74,10 +74,10 @@ PAC the daemon serves,
 chrome --proxy-pac-url=http://127.0.0.1:7391/proxy.pac
 ```
 
-then open `http://panza.ssh-browser/`. Each alias is its own origin, so a page under
+then open `http://docs.ssh-browser/`. Each alias is its own origin, so a page under
 one alias cannot fetch from another.
 
-Without touching proxy settings at all, `http://127.0.0.1:7391/panza/` serves the
+Without touching proxy settings at all, `http://127.0.0.1:7391/docs/` serves the
 same tree. That is useful for a quick look, but it puts every alias in one origin,
 so prefer the PAC.
 
@@ -103,4 +103,4 @@ into a Windows path.
 
 ## License
 
-MIT OR Apache-2.0
+MIT

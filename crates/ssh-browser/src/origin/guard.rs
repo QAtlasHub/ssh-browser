@@ -138,9 +138,9 @@ mod tests {
     #[test]
     fn an_alias_host_is_recognised() {
         assert_eq!(
-            classify("ohtaka.ssh-browser", "/docs/", "ssh-browser", 7391).unwrap(),
+            classify("docs.ssh-browser", "/docs/", "ssh-browser", 7391).unwrap(),
             Target::Alias {
-                alias: "ohtaka",
+                alias: "docs",
                 path: "/docs/"
             }
         );
@@ -160,7 +160,7 @@ mod tests {
     fn a_rebinding_host_is_refused() {
         assert!(classify("evil.example", "/", "ssh-browser", 7391).is_err());
         assert!(classify("127.0.0.1:9999", "/", "ssh-browser", 7391).is_err());
-        assert!(classify("ohtaka.ssh-browser.evil.example", "/", "ssh-browser", 7391).is_err());
+        assert!(classify("docs.ssh-browser.evil.example", "/", "ssh-browser", 7391).is_err());
     }
 
     #[test]
