@@ -30,6 +30,13 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- `Range` requests, so video and PDF can seek. A file over 8 MB is fetched by range
+  and not cached; anything smaller is fetched whole, held, and sliced. `If-Range` is
+  never honoured because the only validator offered is weak, and a multi-range request
+  is answered whole rather than as `multipart/byteranges`.
+- `RemoteFs::read_ranges`, which chunks and issues a whole set of ranges together, so
+  a one-megabyte range costs one round trip rather than the thirty-two its chunks
+  would suggest.
 - Symlinks are refused rather than followed, at every component of a path rather
   than only the last, so reaching a file through a symlinked directory is refused
   too. Decided from batched ancestor listings, so a path of depth d costs one round

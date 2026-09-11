@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Entry, RemoteFs};
+use super::{Entry, RangeReq, RemoteFs};
 use crate::sftp::transport::{self, SshChild};
 use crate::sftp::wire::{
     Attrs, CLOSE, DATA, Dec, Enc, FXF_READ, HANDLE, NAME, OPEN, OPENDIR, READ, READDIR, STATUS,
@@ -214,6 +214,113 @@ impl RemoteFs for SftpFs {
                 }
             }
             live = still_live;
+        }
+
+        for handle in handles.iter().flatten() {
+            let _ = self.issue(CLOSE, Enc::new().str(handle).done()).await;
+        }
+        out
+    }
+
+    async fn read_ranges(&self, reqs: &[RangeReq]) -> Vec<Result<Vec<u8>>> {
+        let mut opens = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            opens.push(
+                self.issue(
+                    OPEN,
+                    Enc::new()
+                        .str(r.path.as_bytes())
+                        .u32(FXF_READ)
+                        .u32(0)
+                        .done(),
+                )
+                .await,
+            );
+        }
+
+        let mut handles: Vec<Option<Vec<u8>>> = Vec::with_capacity(reqs.len());
+        let mut out: Vec<Result<Vec<u8>>> = Vec::with_capacity(reqs.len());
+        for (rx, r) in opens.into_iter().zip(reqs) {
+            let opened = match rx {
+                Ok(rx) => await_reply(rx)
+                    .await
+                    .and_then(|reply| handle_from(&reply, &r.path)),
+                Err(e) => Err(e),
+            };
+            match opened {
+                Ok(h) => {
+                    handles.push(Some(h));
+                    out.push(Ok(Vec::new()));
+                }
+                Err(e) => {
+                    handles.push(None);
+                    out.push(Err(e));
+                }
+            }
+        }
+
+        // Chunk every range up front and issue the whole set at once. A one-megabyte
+        // range is thirty-two reads; sending them one at a time would cost
+        // thirty-two round trips and put the invariant back where it started.
+        struct Piece {
+            req: usize,
+            offset: u64,
+            len: u32,
+        }
+        let mut pieces = Vec::new();
+        for (i, r) in reqs.iter().enumerate() {
+            if handles[i].is_none() {
+                continue;
+            }
+            let mut at = r.offset;
+            let end = r.offset.saturating_add(r.len);
+            while at < end {
+                let len =
+                    u32::try_from((end - at).min(u64::from(READ_CHUNK))).unwrap_or(READ_CHUNK);
+                pieces.push(Piece {
+                    req: i,
+                    offset: at,
+                    len,
+                });
+                at += u64::from(len);
+            }
+        }
+
+        let mut rxs = Vec::with_capacity(pieces.len());
+        for p in &pieces {
+            let handle = handles[p.req].as_ref().expect("pieces skip failed opens");
+            rxs.push(
+                self.issue(READ, Enc::new().str(handle).u64(p.offset).u32(p.len).done())
+                    .await,
+            );
+        }
+
+        // Replies are reassembled in issue order, which is offset order within each
+        // request, so a short read at end of file simply ends that request's data.
+        for (p, rx) in pieces.iter().zip(rxs) {
+            let reply = match rx {
+                Ok(rx) => await_reply(rx).await,
+                Err(e) => Err(e),
+            };
+            match reply {
+                Ok(r) if r.kind == DATA => {
+                    let data = Dec::new(r.payload()).str().unwrap_or(&[]).to_vec();
+                    if let Ok(buf) = &mut out[p.req] {
+                        buf.extend_from_slice(&data);
+                    }
+                }
+                // EOF inside a requested range is not a failure: the file is simply
+                // shorter than the client asked for, and the caller sees that in the
+                // length of what comes back.
+                Ok(r) if r.kind == STATUS => {
+                    let code = Dec::new(r.payload()).u32().unwrap_or(u32::MAX);
+                    if code != STATUS_EOF {
+                        out[p.req] = Err(anyhow!("read failed with sftp status {code}"));
+                    }
+                }
+                Ok(r) => out[p.req] = Err(anyhow!("read gave reply type {}", r.kind)),
+                Err(e) => out[p.req] = Err(e),
+            }
         }
 
         for handle in handles.iter().flatten() {

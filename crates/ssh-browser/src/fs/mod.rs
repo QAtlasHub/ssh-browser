@@ -17,11 +17,25 @@ pub struct Entry {
     pub attrs: Attrs,
 }
 
+/// One byte range of one file.
+#[derive(Debug, Clone)]
+pub struct RangeReq {
+    pub path: String,
+    pub offset: u64,
+    /// Bytes wanted. Fewer may come back at end of file, which is not an error.
+    pub len: u64,
+}
+
 #[allow(async_fn_in_trait)]
 pub trait RemoteFs {
     /// Read whole files. Implementations must issue every request before awaiting
     /// any reply; doing otherwise silently reintroduces O(N) round trips.
     async fn read_batch(&self, paths: &[String]) -> Vec<Result<Vec<u8>>>;
+
+    /// Read byte ranges. Chunking is the implementation's business; what matters
+    /// here is that the whole set is issued together, so a one-megabyte range costs
+    /// one round trip rather than the thirty-two its chunks would suggest.
+    async fn read_ranges(&self, reqs: &[RangeReq]) -> Vec<Result<Vec<u8>>>;
 
     /// List several directories at once. One listing carries every entry's attrs,
     /// which is what removes per-file stat from the page path; batching the
