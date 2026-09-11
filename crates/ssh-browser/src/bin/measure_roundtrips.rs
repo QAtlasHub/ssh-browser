@@ -11,11 +11,16 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use ssh_browser::sftp::Sftp;
 use ssh_browser::sftp::wire::{
     Attrs, CLOSE, DATA, Dec, Enc, FXF_READ, HANDLE, NAME, OPEN, OPENDIR, READ, READDIR, REALPATH,
     STATUS,
 };
+use ssh_browser::sftp::{Sftp, transport};
+use tokio::io::{BufReader, BufWriter};
+use tokio::process::{ChildStdin, ChildStdout};
+
+/// The concrete session this binary drives: sftp over the system ssh client.
+type Session = Sftp<BufWriter<ChildStdin>, BufReader<ChildStdout>>;
 
 const BATCH_SIZES: [usize; 4] = [1, 8, 20, 40];
 const READ_LEN: u32 = 32 * 1024;
@@ -32,7 +37,8 @@ async fn main() -> Result<()> {
         .context("usage: measure-roundtrips <ssh-host> [remote-dir]")?;
     let dir = args.next().unwrap_or_else(|| "/usr/include".to_string());
 
-    let mut s = Sftp::connect(&host).await?;
+    let (_child, w, r) = transport::open(&host)?;
+    let mut s = Sftp::handshake(w, r).await?;
     println!("host {host}  sftp v{}", s.version());
 
     let tau = measure_tau(&mut s).await?;
@@ -102,7 +108,7 @@ fn ms(d: Duration) -> f64 {
 }
 
 /// One REALPATH is the cheapest honest round trip the protocol offers.
-async fn measure_tau(s: &mut Sftp) -> Result<Duration> {
+async fn measure_tau(s: &mut Session) -> Result<Duration> {
     let mut samples = Vec::with_capacity(TAU_REPS);
     for _ in 0..TAU_REPS {
         let id = s.alloc_id();
@@ -120,7 +126,7 @@ async fn measure_tau(s: &mut Sftp) -> Result<Duration> {
 
 /// One READDIR sweep carries every entry's attrs, which is what lets the origin
 /// layer skip per-file STAT entirely and keep invariant 1 within reach.
-async fn list(s: &mut Sftp, dir: &str) -> Result<Vec<(String, Attrs)>> {
+async fn list(s: &mut Session, dir: &str) -> Result<Vec<(String, Attrs)>> {
     let id = s.alloc_id();
     s.queue(OPENDIR, &Enc::new().u32(id).str(dir.as_bytes()).done())
         .await?;
@@ -165,7 +171,7 @@ async fn list(s: &mut Sftp, dir: &str) -> Result<Vec<(String, Attrs)>> {
     Ok(out)
 }
 
-async fn batch_open(s: &mut Sftp, paths: &[String]) -> Result<(Duration, Vec<Vec<u8>>)> {
+async fn batch_open(s: &mut Session, paths: &[String]) -> Result<(Duration, Vec<Vec<u8>>)> {
     let t = Instant::now();
     for p in paths {
         let id = s.alloc_id();
@@ -191,7 +197,7 @@ async fn batch_open(s: &mut Sftp, paths: &[String]) -> Result<(Duration, Vec<Vec
     Ok((t.elapsed(), handles))
 }
 
-async fn batch_read(s: &mut Sftp, handles: &[Vec<u8>]) -> Result<(Duration, usize)> {
+async fn batch_read(s: &mut Session, handles: &[Vec<u8>]) -> Result<(Duration, usize)> {
     let t = Instant::now();
     for h in handles {
         let id = s.alloc_id();
@@ -212,7 +218,7 @@ async fn batch_read(s: &mut Sftp, handles: &[Vec<u8>]) -> Result<(Duration, usiz
     Ok((t.elapsed(), bytes))
 }
 
-async fn batch_close(s: &mut Sftp, handles: &[Vec<u8>]) -> Result<()> {
+async fn batch_close(s: &mut Session, handles: &[Vec<u8>]) -> Result<()> {
     for h in handles {
         let id = s.alloc_id();
         s.queue(CLOSE, &Enc::new().u32(id).str(h).done()).await?;
