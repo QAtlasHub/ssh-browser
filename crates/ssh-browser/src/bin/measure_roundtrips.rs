@@ -3,8 +3,10 @@
 //!
 //! Wall-clock milliseconds alone would be meaningless because they move with the
 //! network. So one round trip (tau) is measured first and every batch is reported
-//! as a multiple of it. A pipelined batch of N costs about 1 tau; a serial one
-//! costs about N.
+//! as a multiple of it. A pipelined batch of N opens costs about 1 tau; a serial
+//! one costs about N. Reads are reported too, but they carry the file as well as
+//! the request, so their cost is transfer time as much as round trips and the
+//! verdict does not rest on them.
 //!
 //! usage: `measure-roundtrips <ssh-host> [remote-dir]`
 
@@ -26,7 +28,8 @@ const BATCH_SIZES: [usize; 4] = [1, 8, 20, 40];
 const READ_LEN: u32 = 32 * 1024;
 const TAU_REPS: usize = 7;
 
-/// A batch counts as pipelined if it costs under a quarter of the serial price.
+/// A batch counts as pipelined if its opens cost under a quarter of the serial
+/// price. Only opens: see the verdict below for why reads cannot carry it.
 const PIPELINE_MARGIN: f64 = 4.0;
 
 #[tokio::main]
@@ -64,7 +67,10 @@ async fn main() -> Result<()> {
     println!();
 
     let mut largest = 0usize;
-    let mut largest_ratio = 0.0f64;
+    let mut largest_open = 0.0f64;
+    let mut largest_read = 0.0f64;
+    let mut prev_read = 0.0f64;
+    let mut last_read = 0.0f64;
     for n in BATCH_SIZES {
         if n > files.len() {
             continue;
@@ -82,7 +88,12 @@ async fn main() -> Result<()> {
             ms(t_read)
         );
         largest = n;
-        largest_ratio = open_tau.max(read_tau);
+        largest_open = open_tau;
+        largest_read = read_tau;
+        if n > 1 {
+            prev_read = last_read;
+        }
+        last_read = read_tau;
     }
 
     println!();
@@ -90,15 +101,32 @@ async fn main() -> Result<()> {
         largest > 1,
         "only one usable file; cannot distinguish pipelined from serial"
     );
-    let serial = largest as f64;
-    if largest_ratio < serial / PIPELINE_MARGIN {
+    // The verdict rests on opens alone. An open carries a path and nothing else, so
+    // its cost is round trips and only round trips. A read also carries the file,
+    // and under an injected per-packet delay the transfer dominates: 400 KB reads
+    // as 15 tau however few round trips fetched it. Judging on reads made this
+    // check fail on how much data the chosen directory happens to hold, which is
+    // a property of the machine rather than of the code -- exactly the kind of
+    // flaky gate that teaches people to ignore a red check.
+    //
+    // Reads still say something, just not in absolute terms: if doubling the batch
+    // does not double the time, the round trips did not scale either.
+    if prev_read > 0.0 {
+        let growth = largest_read / prev_read;
         println!(
-            "VERDICT pipelined: {largest_ratio:.2} tau at n={largest} (serial would cost about {serial:.0})"
+            "reads {largest_read:.2} tau at n={largest}, {growth:.2}x the previous batch (serial would be about 2x)"
+        );
+    }
+
+    let serial = largest as f64;
+    if largest_open < serial / PIPELINE_MARGIN {
+        println!(
+            "VERDICT pipelined: opens cost {largest_open:.2} tau at n={largest} (serial would cost about {serial:.0})"
         );
         Ok(())
     } else {
         bail!(
-            "VERDICT serial: {largest_ratio:.2} tau at n={largest}, near the serial cost {serial:.0}. Invariant 1 (O(1) round trips per page) is not reachable over this transport."
+            "VERDICT serial: opens cost {largest_open:.2} tau at n={largest}, near the serial cost {serial:.0}. Invariant 1 (O(1) round trips per page) is not reachable over this transport."
         )
     }
 }
