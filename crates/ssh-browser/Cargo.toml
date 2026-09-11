@@ -3,6 +3,7 @@ name = "ssh-browser"
 description = "Open files on an SSH host as a real browser origin."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

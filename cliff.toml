@@ -1,0 +1,86 @@
+# cliff.toml -- git-cliff config for LOCAL, pre-tag changelog drafting only.
+# NOT wired into CI: there is no automated, merge-time changelog generation.
+# Draft with `git cliff --config cliff.toml <last-tag>..HEAD`, then review and
+# edit before the release commit.
+#
+# `[git] first_parent = false` is load-bearing, and was a real bug in doiget
+# before it was set: traversing first-parent only makes conventional commits
+# behind `Merge pull request #NNN` invisible, so a generated section captures a
+# merge subject and drops the actual changes. Walking all commits exposes the
+# bodies of merged branches to the parser; merge commits themselves are dropped
+# by the merge-subject `skip` rule below.
+#
+# Output style: Keep a Changelog 1.1.0 -- grouped Added / Changed / Fixed /
+# Docs / Other, SemVer.
+
+[changelog]
+# Header is intentionally empty: the script prints ONLY the new section to
+# stdout for the maintainer to splice into the existing curated CHANGELOG.md
+# (which already owns the Keep-a-Changelog preamble). We do not regenerate the
+# whole file.
+header = ""
+
+# One `## [X.Y.Z] - DATE` section, Keep-a-Changelog style, grouped. The
+# compare link mirrors the existing CHANGELOG header convention
+# (`.../compare/<prev>...<curr>`); the maintainer adds the exact endpoints
+# when editing (tags differ across the legacy per-crate vs new `v*` scheme).
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+{{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}\n
+"""
+trim = true
+footer = ""
+
+[git]
+# THE #164 FIX — walk every commit, not just first parents, so conventional
+# commits inside merged PR branches are seen by the parser.
+first_parent = false
+conventional_commits = true
+# Keep non-conventional commits but bucket them under "Other" (matches the
+# existing CHANGELOG.md which has an `### Other` group), rather than silently
+# dropping work like release-plz did.
+filter_unconventional = false
+split_commits = false
+filter_commits = true
+tag_pattern = "v[0-9]*|ssh-browser-core-v[0-9]*"
+topo_order = false
+sort_commits = "newest"
+protect_breaking_commits = false
+
+# Conventional-commit → Keep-a-Changelog group mapping. Order matters: first
+# match wins. Merge commits and pure-noise subjects are dropped (skip = true)
+# so the merge-graph (release policy) does not pollute the draft.
+commit_parsers = [
+  { message = "^Merge (pull request|branch|remote-tracking)", skip = true },
+  { message = "^chore\\(release\\):", skip = true },
+  { message = "^chore: release", skip = true },
+  { message = "^feat", group = "Added" },
+  { message = "^add", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Changed" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^change", group = "Changed" },
+  { message = "^docs", group = "Docs" },
+  { message = "^doc", group = "Docs" },
+  { message = "^test", group = "Other" },
+  { message = "^ci", group = "Other" },
+  { message = "^build", group = "Other" },
+  { message = "^chore", group = "Other" },
+  { message = "^style", group = "Other" },
+  { message = ".*", group = "Other" },
+]
+
+[bump]
+features_always_bump_minor = true
+breaking_always_bump_major = false

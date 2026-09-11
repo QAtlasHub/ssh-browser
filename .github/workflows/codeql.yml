@@ -1,0 +1,55 @@
+name: codeql
+
+on:
+  pull_request:
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/codeql.yml"
+  push:
+    branches: [main]
+  schedule:
+    # Weekly on Tuesday 07:00 UTC. Offset from audit.yml's Monday cron so the
+    # two scheduled scans do not contend for runners or stack failure noise on
+    # the same day.
+    - cron: "0 7 * * 2"
+
+# Least-privilege scopes. CodeQL needs `security-events: write`
+# to upload SARIF results and `actions: read` to read workflow metadata for
+# private repos; everything else stays read-only.
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+# Cancel in-progress runs for the same ref when a newer commit lands. Scheduled
+# runs use `github.run_id` so simultaneous cron firings (rare) do not cancel
+# each other.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: "/language:${{ matrix.language }}"

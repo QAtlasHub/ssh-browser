@@ -1,0 +1,3 @@
+# MSRV -- keeps clippy from suggesting newer-than-MSRV idioms.
+# Edition 2024 is the floor here, so this cannot go below 1.85.
+msrv = "1.85"

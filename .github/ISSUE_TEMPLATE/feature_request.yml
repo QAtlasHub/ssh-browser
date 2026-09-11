@@ -1,0 +1,54 @@
+name: "Feature request"
+description: "Propose a feature, behavior change, or enhancement."
+title: "[Feature] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ssh-browser has a deliberately narrow scope: read, annotate and edit files on a host reachable only over SSH, without installing anything on that host. No telemetry, no self-update. Out-of-scope ideas are welcome in Discussions instead.
+  - type: dropdown
+    id: phase-target
+    attributes:
+      label: "Phase target"
+      description: "Which Phase would this feature land in?"
+      options:
+        - Phase 1 (resolver/sources)
+        - Phase 2 (store)
+        - Phase 3 (MCP)
+        - Phase 4 (Tier 2)
+        - Phase 5+ (TDM)
+        - Phase 7 (optional features)
+        - unknown
+    validations:
+      required: true
+  - type: textarea
+    id: problem-statement
+    attributes:
+      label: "Problem statement"
+      description: "What problem does this solve? Whose problem?"
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: "Proposed solution"
+      description: "Describe the proposed change in enough detail that a reviewer could evaluate scope and effort."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives-considered
+    attributes:
+      label: "Alternatives considered"
+      description: "What other approaches did you consider? Why did you reject them? (Optional but encouraged.)"
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope-sanity
+    attributes:
+      label: "Scope sanity"
+      options:
+        - label: "This fits what ssh-browser is for: reading, annotating and editing files on a host reachable only over SSH"
+          required: true
+        - label: "This does not introduce telemetry / phone-home / self-update"
+          required: true

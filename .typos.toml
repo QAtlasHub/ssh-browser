@@ -1,0 +1,12 @@
+# Configuration for crate-ci/typos (.github/workflows/typos.yml).
+# Docs: https://github.com/crate-ci/typos/blob/master/docs/reference.md
+
+[default.extend-words]
+# To allow a word that typos flags as a misspelling, add an entry here:
+#   misspelling = "correction"
+# For project-specific jargon spelled this way on purpose, map the token to
+# itself. Keep the table sorted; prefer fixing the typo over adding an entry.
+
+[files]
+# Generated / vendored files where typo enforcement is not useful.
+extend-exclude = ["Cargo.lock", "*.lock"]
