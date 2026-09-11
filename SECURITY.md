@@ -40,7 +40,33 @@ sftp`, so authentication is entirely OpenSSH's: `ssh_config`, the agent, keys an
 certificates. It runs ssh with `BatchMode=yes`, so it cannot prompt and cannot
 consume an interactive credential.
 
+## The control API
+
+Writes will go through a control API. It exists now, even though nothing writes yet,
+because the boundary is easier to get right before there is something behind it than
+after. Three things keep it away from the pages this daemon serves.
+
+**It is routed only for requests whose Host is the loopback listener.** That is a
+different classification from an alias request, so a page served under an alias origin
+cannot reach it however the path is spelled -- it gets a file lookup and a 404.
+
+**It requires a token in a custom header.** A custom header is not CORS-safelisted, so a
+page attempting to send one triggers a preflight.
+
+**It refuses the preflight and emits no CORS headers at all.** A refused preflight means
+the request is never made, and no CORS headers means a response could not be read even if
+one somehow were. An extension is outside CORS by virtue of its host permissions, so none
+of this impedes it.
+
+The read side is read-only in the ordinary HTTP sense too: anything other than `GET` or
+`HEAD` on an alias origin is a `405`, rather than being quietly served as a `GET`.
+
+The token is 32 bytes of OS entropy, compared in constant time, and written to a file
+under your runtime or configuration directory with mode `0600` on Unix. Any process
+running as you can read that file. That is the limit of what a loopback listener can
+promise, and no arrangement of headers changes it.
+
 ## What does not exist yet
 
-There is no write path. Annotations and collaborative editing will add one, and the
-scope it is granted will be documented here when they do.
+Nothing writes. When annotations land, the paths they are allowed to write will be
+documented here.

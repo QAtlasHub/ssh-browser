@@ -1,6 +1,7 @@
 //! ssh-browser: open files on an SSH host as a real browser origin.
 
 use anyhow::{Context, Result, bail, ensure};
+use ssh_browser::control::Token;
 use ssh_browser::origin::{Alias, Origin, pac};
 
 const USAGE: &str = "usage:\n  ssh-browser serve [--port N] [--suffix S] <alias>=<ssh-host>:<base> ...\n  ssh-browser pac   [--port N] [--suffix S]";
@@ -62,7 +63,25 @@ async fn main() -> Result<()> {
             eprintln!("  chrome --proxy-pac-url=http://127.0.0.1:{port}/proxy.pac");
             eprintln!();
             eprintln!("or, without touching proxy settings: http://127.0.0.1:{port}/");
-            Origin::bind(aliases, suffix, port).await?.serve().await
+            eprintln!();
+
+            let token = Token::generate()?;
+            // Printed as well as written, because a first run has nowhere else to look.
+            // To stderr so that piping the daemon's output does not carry it along.
+            eprintln!("control token: {}", token.as_str());
+            match token.write_to_disk() {
+                Some(path) => eprintln!("  also written to {}", path.display()),
+                None => eprintln!("  (could not be written to disk; copy it from above)"),
+            }
+            eprintln!(
+                "  the extension sends it as {}",
+                ssh_browser::control::TOKEN_HEADER
+            );
+
+            Origin::bind(aliases, suffix, port, token)
+                .await?
+                .serve()
+                .await
         }
         other => bail!("unknown command {other:?}\n\n{USAGE}"),
     }

@@ -29,11 +29,12 @@ use hyper::header::{
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use crate::cache::{self, Cache};
+use crate::control::{self, Token};
 use crate::fs::sftp::SftpFs;
 use crate::fs::{Entry, RangeReq, RemoteFs};
 
@@ -47,6 +48,8 @@ struct Conditions {
     if_none_match: Option<String>,
     range: Option<String>,
     if_range: Option<String>,
+    /// Only ever consulted on the control path, which only a loopback request reaches.
+    control_token: Option<String>,
 }
 
 pub struct Alias {
@@ -65,12 +68,18 @@ pub struct Origin {
     port: u16,
     sessions: HashMap<String, Session>,
     cache: Cache,
+    token: Token,
 }
 
 impl Origin {
     /// Connect every alias up front, so the first page request does not also pay
     /// for an ssh handshake.
-    pub async fn bind(aliases: Vec<Alias>, suffix: String, port: u16) -> Result<Arc<Self>> {
+    pub async fn bind(
+        aliases: Vec<Alias>,
+        suffix: String,
+        port: u16,
+        token: Token,
+    ) -> Result<Arc<Self>> {
         let mut sessions = HashMap::new();
         for a in aliases {
             let fs = SftpFs::connect(&a.host)
@@ -83,6 +92,7 @@ impl Origin {
             port,
             sessions,
             cache: Cache::default(),
+            token,
         }))
     }
 
@@ -121,18 +131,45 @@ impl Origin {
             if_none_match: header(&req, IF_NONE_MATCH),
             range: header(&req, RANGE),
             if_range: header(&req, IF_RANGE),
+            control_token: req
+                .headers()
+                .get(control::TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
         };
+        let method = req.method().clone();
 
         match guard::classify(&host, &path, &self.suffix, self.port) {
             // Refusing by Host is the DNS-rebinding defence, not a malfunction, so
             // it says why rather than failing blankly.
             Err(e) => fail(StatusCode::FORBIDDEN, format!("{e:#}")),
-            Ok(guard::Target::Direct { path }) => self.direct(path, &cond).await,
-            Ok(guard::Target::Alias { alias, path }) => self.alias(alias, path, &cond).await,
+            Ok(guard::Target::Direct { path }) => self.direct(&method, path, &cond).await,
+            Ok(guard::Target::Alias { alias, path }) => {
+                self.alias(&method, alias, path, &cond).await
+            }
         }
     }
 
-    async fn direct(&self, path: &str, cond: &Conditions) -> Response<Full<Bytes>> {
+    async fn direct(
+        &self,
+        method: &Method,
+        path: &str,
+        cond: &Conditions,
+    ) -> Response<Full<Bytes>> {
+        // Reachable only from a loopback Host, which `guard::classify` has already
+        // separated from alias requests. An alias page cannot arrive here.
+        if path.starts_with(control::PATH_PREFIX) {
+            let mut aliases: Vec<String> = self.sessions.keys().cloned().collect();
+            aliases.sort();
+            return control::handle(
+                method,
+                path,
+                cond.control_token.as_deref(),
+                &self.token,
+                &aliases,
+            );
+        }
+
         if path == "/proxy.pac" {
             return match pac::script(&self.suffix, self.port) {
                 Ok(body) => plain_ok("application/x-ns-proxy-autoconfig", Bytes::from(body)),
@@ -146,10 +183,27 @@ impl Origin {
         }
 
         let (alias, sub) = rest.split_once('/').unwrap_or((rest, ""));
-        self.alias(alias, &format!("/{sub}"), cond).await
+        self.alias(method, alias, &format!("/{sub}"), cond).await
     }
 
-    async fn alias(&self, alias: &str, path: &str, cond: &Conditions) -> Response<Full<Bytes>> {
+    async fn alias(
+        &self,
+        method: &Method,
+        alias: &str,
+        path: &str,
+        cond: &Conditions,
+    ) -> Response<Full<Bytes>> {
+        // The alias origin is read-only, and says so rather than quietly serving a POST
+        // as if it were a GET. The shape of this answer is part of the boundary: there
+        // is no write path on this origin and there will not be one. Writes go through
+        // the control API, which a page served from here cannot reach.
+        if !matches!(*method, Method::GET | Method::HEAD) {
+            return fail(
+                StatusCode::METHOD_NOT_ALLOWED,
+                format!("{method} is not allowed: this origin is read-only"),
+            );
+        }
+
         let Some(session) = self.sessions.get(alias) else {
             return fail(StatusCode::NOT_FOUND, format!("no alias named {alias:?}"));
         };
@@ -579,12 +633,23 @@ mod tests {
     use crate::testing::{FakeRemote, dir_attrs, file_attrs, symlink_attrs};
     use http_body_util::{BodyExt, Empty};
 
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     async fn body_of(res: Response<Full<Bytes>>) -> Bytes {
         res.into_body()
             .collect()
             .await
             .expect("a Full body always collects")
             .to_bytes()
+    }
+
+    /// A request arriving by address rather than through the PAC.
+    fn loopback(path: &str, token: Option<&str>) -> Request<Empty<Bytes>> {
+        let mut b = Request::builder().uri(path).header(HOST, "127.0.0.1:7391");
+        if let Some(t) = token {
+            b = b.header(control::TOKEN_HEADER, t);
+        }
+        b.body(Empty::<Bytes>::new()).expect("request builds")
     }
 
     fn ranged(path: &str, range: &str) -> Request<Empty<Bytes>> {
@@ -613,6 +678,7 @@ mod tests {
             port: 7391,
             sessions,
             cache: Cache::default(),
+            token: Token::from_hex(TEST_TOKEN),
         }
     }
 
@@ -1018,5 +1084,98 @@ mod tests {
             trips(&origin) > after,
             "a file over the threshold must not be held"
         );
+    }
+
+    /// The boundary, from the side that matters. A page served under an alias origin
+    /// names the control path and gets a file lookup, not the control router: the 404
+    /// proves it was never routed there. A 401 would mean the router saw it.
+    #[tokio::test]
+    async fn an_alias_origin_has_no_control_api_on_it() {
+        let origin = origin_with(one_page()).await;
+        let res = origin.handle(get("/_control/hello", None)).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_ne!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "a 401 would mean the control router was reached from an alias origin"
+        );
+    }
+
+    /// Even with the right token in hand, an alias origin must not route to control.
+    /// This is the case a compromised page would actually try.
+    #[tokio::test]
+    async fn an_alias_origin_with_a_valid_token_still_has_no_control_api() {
+        let origin = origin_with(one_page()).await;
+        let req = Request::builder()
+            .uri("http://docs.ssh-browser/_control/hello")
+            .header(HOST, "docs.ssh-browser")
+            .header(control::TOKEN_HEADER, TEST_TOKEN)
+            .body(Empty::<Bytes>::new())
+            .expect("request builds");
+        assert_eq!(origin.handle(req).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// There is no write path on the read side, and a POST is told so rather than being
+    /// quietly served as a GET.
+    #[tokio::test]
+    async fn the_alias_origin_refuses_writes() {
+        let origin = origin_with(one_page()).await;
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            let req = Request::builder()
+                .method(method.clone())
+                .uri("http://docs.ssh-browser/a.html")
+                .header(HOST, "docs.ssh-browser")
+                .body(Empty::<Bytes>::new())
+                .expect("request builds");
+            assert_eq!(
+                origin.handle(req).await.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} should be refused on the read-only origin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_control_api_answers_on_loopback_with_the_token() {
+        let origin = origin_with(one_page()).await;
+        let res = origin
+            .handle(loopback("/_control/hello", Some(TEST_TOKEN)))
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_of(res).await;
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("\"protocol\""),
+            "hello must negotiate: {text}"
+        );
+        assert!(text.contains("\"docs\""), "hello must list aliases: {text}");
+    }
+
+    #[tokio::test]
+    async fn the_control_api_refuses_loopback_without_the_token() {
+        let origin = origin_with(one_page()).await;
+        assert_eq!(
+            origin
+                .handle(loopback("/_control/hello", None))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            origin
+                .handle(loopback("/_control/hello", Some("wrong")))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// The direct browsing path still works alongside the control prefix.
+    #[tokio::test]
+    async fn the_loopback_path_still_serves_files() {
+        let origin = origin_with(one_page()).await;
+        let res = origin.handle(loopback("/docs/a.html", None)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(&body_of(res).await[..], b"hello");
     }
 }
