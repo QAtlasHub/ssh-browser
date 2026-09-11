@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo test --all-targets
+
+  roundtrips:
+    # Invariant 1 as a required check: round trips for a batch of N must not grow
+    # with N. measure-roundtrips exits non-zero on a serial verdict, so a
+    # regression that only costs latency — the kind no unit test notices — fails
+    # here instead of shipping.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Local sshd
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/authorized_keys
+          sudo systemctl start ssh || sudo service ssh start
+          ssh-keyscan -H localhost >> ~/.ssh/known_hosts
+
+      - name: Inject a realistic RTT
+        # Over raw loopback tau collapses into scheduler noise and the
+        # pipelined-versus-serial ratio stops being measurable at all. 10 ms each
+        # way puts tau near what a real host costs.
+        run: |
+          sudo tc qdisc add dev lo root netem delay 10ms
+          tc qdisc show dev lo
+
+      - run: cargo build --release --bin measure-roundtrips
+
+      - name: Round trips stay flat as the batch grows
+        run: ./target/release/measure-roundtrips localhost /usr/include
