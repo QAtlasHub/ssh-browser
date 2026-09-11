@@ -66,7 +66,32 @@ under your runtime or configuration directory with mode `0600` on Unix. Any proc
 running as you can read that file. That is the limit of what a loopback listener can
 promise, and no arrangement of headers changes it.
 
-## What does not exist yet
+## What the control API writes
 
-Nothing writes. When annotations land, the paths they are allowed to write will be
-documented here.
+Exactly one shape of path:
+
+```
+<dir>/.ssh-browser/<filename>/ann/<author>.jsonl
+```
+
+Nothing else. The path is computed from the document rather than taken from the request,
+so a caller cannot name a destination at all. The document is resolved through the same
+guards the read path uses — normalised after percent-decoding, and refused if any
+component is a symlink — and the symlink rule matters more here than on the read side,
+because a write that reached through a symlinked directory could place a file outside the
+alias base entirely.
+
+**The author is this daemon's configuration, not the request's.** A caller cannot write as
+somebody else however it words the request. The id of a new annotation is minted by the
+daemon and carries the author within it, and the timestamp is the daemon's clock: a caller
+able to choose either could name someone else or reorder their log.
+
+Writes are appends. A log has exactly one writer by construction, which is the only
+arrangement that is safe without a lock, and it is why the format is per-author logs
+rather than one shared file.
+
+What is **not** checked yet: that the configured author is the remote account actually
+doing the writing. The SFTP transport never runs a shell, so the remote account name is
+not something this process can ask for, and inferring it from a home directory path would
+be a guess presented as a fact. A later version will compare it against the uid a listing
+reports; until then it is the operator's word.

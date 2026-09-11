@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ssh_browser::control::Token;
 use ssh_browser::origin::{Alias, Origin, pac};
 
-const USAGE: &str = "usage:\n  ssh-browser serve [--port N] [--suffix S] <alias>=<ssh-host>:<base> ...\n  ssh-browser pac   [--port N] [--suffix S]";
+const USAGE: &str = "usage:\n  ssh-browser serve [--port N] [--suffix S] [--author NAME] <alias>=<ssh-host>:<base> ...\n  ssh-browser pac   [--port N] [--suffix S]";
 
 const DEFAULT_PORT: u16 = 7391;
 const DEFAULT_SUFFIX: &str = "ssh-browser";
@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
 
     let mut port = DEFAULT_PORT;
     let mut suffix = DEFAULT_SUFFIX.to_string();
+    let mut author = default_author();
     let mut aliases = Vec::new();
 
     let mut i = 0;
@@ -33,6 +34,10 @@ async fn main() -> Result<()> {
             }
             "--suffix" => {
                 suffix = rest.get(i + 1).context("--suffix needs a value")?.clone();
+                i += 2;
+            }
+            "--author" => {
+                author = rest.get(i + 1).context("--author needs a value")?.clone();
                 i += 2;
             }
             spec => {
@@ -78,13 +83,27 @@ async fn main() -> Result<()> {
                 ssh_browser::control::TOKEN_HEADER
             );
 
-            Origin::bind(aliases, suffix, port, token)
+            eprintln!("  annotations are written as {author}");
+
+            Origin::bind(aliases, suffix, port, token, author)
                 .await?
                 .serve()
                 .await
         }
         other => bail!("unknown command {other:?}\n\n{USAGE}"),
     }
+}
+
+/// Who annotations are written as, unless `--author` says otherwise.
+///
+/// The local account name, which is a guess at the remote one. The SFTP transport never
+/// runs a shell, so the remote account is not something this process can ask for, and
+/// inferring it from a home directory path would be a guess presented as a fact. Naming it
+/// explicitly is the honest default until a listing's uid can be checked against it.
+fn default_author() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Parse `<alias>=<ssh-host>:<absolute-base>`.
