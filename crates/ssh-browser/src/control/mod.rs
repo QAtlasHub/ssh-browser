@@ -152,53 +152,51 @@ struct Hello<'a> {
     aliases: &'a [String],
 }
 
-/// Route one control request.
+/// Check the two things that must hold before any control route runs, returning the
+/// refusal if there is one.
 ///
-/// Takes the presented token rather than the whole request, so the rules here can be
-/// tested without constructing HTTP.
-pub fn handle(
+/// Separated from routing so that a caller cannot reach a route without going through it:
+/// there is no path to the annotation handlers that does not pass this function first.
+pub fn gate(
     method: &Method,
-    path: &str,
     presented: Option<&str>,
     token: &Token,
-    aliases: &[String],
-) -> Response<Full<Bytes>> {
-    // Refusing the preflight is what keeps an alias page from ever reaching the rest of
-    // this function. Answering it, even with a restrictive allow-list, would move the
-    // decision into the browser's hands rather than ours.
+) -> Option<Response<Full<Bytes>>> {
+    // Refusing the preflight is what keeps an alias page from ever reaching a route.
+    // Answering it, even with a restrictive allow-list, would move the decision into the
+    // browser's hands rather than ours.
     if method == Method::OPTIONS {
-        return text(
+        return Some(text(
             StatusCode::METHOD_NOT_ALLOWED,
             "the control API does not participate in CORS",
-        );
+        ));
     }
 
     match presented {
-        Some(p) if token.matches(p) => {}
-        // The same answer either way: distinguishing "no token" from "wrong token"
-        // would tell a caller which half it got right.
-        _ => return text(StatusCode::UNAUTHORIZED, "control token required"),
-    }
-
-    let route = path.strip_prefix(PATH_PREFIX).unwrap_or("");
-    match (method, route) {
-        (&Method::GET, "hello") => json(&Hello {
-            daemon: env!("CARGO_PKG_VERSION"),
-            protocol: Protocol {
-                min: PROTOCOL_MIN,
-                max: PROTOCOL_MAX,
-            },
-            aliases,
-        }),
-        (&Method::GET, _) => text(StatusCode::NOT_FOUND, format!("no control route {route:?}")),
-        _ => text(
-            StatusCode::METHOD_NOT_ALLOWED,
-            format!("{method} is not allowed on {route:?}"),
-        ),
+        Some(p) if token.matches(p) => None,
+        // The same answer either way: distinguishing "no token" from "wrong token" would
+        // tell a caller which half it got right.
+        _ => Some(text(StatusCode::UNAUTHORIZED, "control token required")),
     }
 }
 
-fn json<T: Serialize>(value: &T) -> Response<Full<Bytes>> {
+/// The route name within the control namespace, e.g. `hello`.
+pub fn route_of(path: &str) -> &str {
+    path.strip_prefix(PATH_PREFIX).unwrap_or("")
+}
+
+pub fn hello(aliases: &[String]) -> Response<Full<Bytes>> {
+    json(&Hello {
+        daemon: env!("CARGO_PKG_VERSION"),
+        protocol: Protocol {
+            min: PROTOCOL_MIN,
+            max: PROTOCOL_MAX,
+        },
+        aliases,
+    })
+}
+
+pub fn json<T: Serialize>(value: &T) -> Response<Full<Bytes>> {
     match serde_json::to_vec(value) {
         Ok(body) => Response::builder()
             .status(StatusCode::OK)
@@ -212,7 +210,7 @@ fn json<T: Serialize>(value: &T) -> Response<Full<Bytes>> {
     }
 }
 
-fn text(status: StatusCode, detail: impl Into<String>) -> Response<Full<Bytes>> {
+pub fn text(status: StatusCode, detail: impl Into<String>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -226,16 +224,6 @@ mod tests {
 
     fn token() -> Token {
         Token::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-    }
-
-    fn hello(presented: Option<&str>) -> Response<Full<Bytes>> {
-        handle(
-            &Method::GET,
-            "/_control/hello",
-            presented,
-            &token(),
-            &["docs".to_string()],
-        )
     }
 
     #[test]
@@ -252,52 +240,36 @@ mod tests {
     }
 
     #[test]
-    fn the_right_token_gets_in() {
-        assert_eq!(hello(Some(token().as_str())).status(), StatusCode::OK);
+    fn the_right_token_passes_the_gate() {
+        assert!(gate(&Method::GET, Some(token().as_str()), &token()).is_none());
     }
 
     #[test]
     fn a_missing_or_wrong_token_is_refused_identically() {
-        assert_eq!(hello(None).status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(hello(Some("")).status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(hello(Some("wrong")).status(), StatusCode::UNAUTHORIZED);
-        // A prefix of the real token must not be accepted.
-        assert_eq!(
-            hello(Some(&token().as_str()[..10])).status(),
-            StatusCode::UNAUTHORIZED
-        );
+        for presented in [None, Some(""), Some("wrong"), Some(&token().as_str()[..10])] {
+            let refusal = gate(&Method::GET, presented, &token()).expect("refused");
+            assert_eq!(refusal.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
-    /// The boundary. If this ever answers, an untrusted page can start negotiating with
-    /// the control API instead of being stopped at the preflight.
+    /// The boundary. If a preflight ever passes, an untrusted page can start negotiating
+    /// with the control API instead of being stopped before the request is even made.
     #[test]
     fn a_preflight_is_refused_even_with_a_valid_token() {
-        let res = handle(
-            &Method::OPTIONS,
-            "/_control/hello",
-            Some(token().as_str()),
-            &token(),
-            &[],
-        );
-        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let refusal = gate(&Method::OPTIONS, Some(token().as_str()), &token()).expect("refused");
+        assert_eq!(refusal.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     /// Nothing here may emit CORS headers: that is what stops a page reading a response
     /// even if it somehow manages to send the request.
     #[test]
     fn no_response_carries_cors_headers() {
-        for res in [
-            hello(Some(token().as_str())),
-            hello(None),
-            handle(&Method::OPTIONS, "/_control/hello", None, &token(), &[]),
-            handle(
-                &Method::GET,
-                "/_control/nope",
-                Some(token().as_str()),
-                &token(),
-                &[],
-            ),
-        ] {
+        let mut responses = vec![hello(&["docs".to_string()])];
+        responses.extend(gate(&Method::OPTIONS, None, &token()));
+        responses.extend(gate(&Method::GET, None, &token()));
+        responses.push(text(StatusCode::NOT_FOUND, "nope"));
+
+        for res in responses {
             for name in res.headers().keys() {
                 let lowered = name.as_str().to_ascii_lowercase();
                 assert!(
@@ -326,26 +298,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_route_is_a_404_not_a_401() {
-        let res = handle(
-            &Method::GET,
-            "/_control/nope",
-            Some(token().as_str()),
-            &token(),
-            &[],
-        );
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn a_write_method_is_refused_until_there_is_something_to_write() {
-        let res = handle(
-            &Method::POST,
-            "/_control/hello",
-            Some(token().as_str()),
-            &token(),
-            &[],
-        );
-        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    fn routes_are_named_after_the_prefix() {
+        assert_eq!(route_of("/_control/hello"), "hello");
+        assert_eq!(route_of("/_control/annotations"), "annotations");
+        assert_eq!(route_of("/not-control"), "");
     }
 }

@@ -102,7 +102,15 @@ cached, so a seek does not pull the whole file and does not evict the page bodie
 make revisits free. `If-Range` is never honoured, because the only validator on offer
 is weak and the whole representation is the specified answer to that.
 
-Not there yet: annotations, collaborative editing.
+Annotations work through the control API, though nothing draws them yet — that is the
+extension's job. They are per-author append-only logs beside the document, so two people
+annotating one page write to different files and neither can lose the other's work.
+
+```
+curl -H "x-ssh-browser-token: $TOKEN" -X POST   --data '{"doc":"docs/index.html","op":"add","body":"a note"}'   http://127.0.0.1:7391/_control/annotations
+```
+
+Not there yet: the extension, collaborative editing of documents themselves.
 
 ```
 cargo run --bin measure-roundtrips -- <ssh-host> [remote-dir]

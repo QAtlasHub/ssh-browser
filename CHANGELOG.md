@@ -30,6 +30,14 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- `GET` and `POST /_control/annotations`, which is the first write path in the product.
+  The author is the daemon's configuration rather than the request's, the id of a new
+  annotation is minted by the daemon, and the timestamp is the daemon's clock — a caller
+  able to choose any of the three could write as somebody else or reorder their log.
+  `--author NAME` sets it, defaulting to the local account name.
+- The symlink walk is now shared between the read and write paths, so the two cannot drift
+  apart. A write reaching through a symlinked directory could place a file outside the
+  alias base, which is worse than reading through one.
 - Annotations as per-author append-only logs, at
   `<dir>/.ssh-browser/<file>/ann/<author>.jsonl`. Merging is a set union of lines, so it is
   commutative, idempotent and needs no lock; an id carries its author, so a log touching
