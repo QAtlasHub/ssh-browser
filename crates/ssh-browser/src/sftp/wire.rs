@@ -17,6 +17,10 @@ pub const ATTRS: u8 = 105;
 
 pub const FXF_READ: u32 = 0x0000_0001;
 
+/// A read ending in SSH_FX_EOF is a normal end of file. Any other status is a
+/// real failure, and conflating the two turns a directory into an empty 200.
+pub const STATUS_EOF: u32 = 1;
+
 const A_SIZE: u32 = 0x0000_0001;
 const A_UIDGID: u32 = 0x0000_0002;
 const A_PERM: u32 = 0x0000_0004;

@@ -19,6 +19,7 @@ use super::{Entry, RemoteFs};
 use crate::sftp::transport::{self, SshChild};
 use crate::sftp::wire::{
     Attrs, CLOSE, DATA, Dec, Enc, FXF_READ, HANDLE, NAME, OPEN, OPENDIR, READ, READDIR, STATUS,
+    STATUS_EOF,
 };
 use crate::sftp::{Reply, Rx, Sftp, Tx};
 
@@ -185,8 +186,17 @@ impl RemoteFs for SftpFs {
                             still_live.push(i);
                         }
                     }
-                    // A STATUS here is EOF, the normal end of a file.
-                    Ok(_) => {}
+                    // A STATUS is EOF only when it says so. Treating every
+                    // STATUS as end-of-file hands back an empty success for a
+                    // directory, whose open succeeds and whose read fails --
+                    // exactly the silent success invariant 4 forbids.
+                    Ok(r) if r.kind == STATUS => {
+                        let code = Dec::new(r.payload()).u32().unwrap_or(u32::MAX);
+                        if code != STATUS_EOF {
+                            out[i] = Err(anyhow!("read failed with sftp status {code}"));
+                        }
+                    }
+                    Ok(r) => out[i] = Err(anyhow!("read gave reply type {}", r.kind)),
                     Err(e) => out[i] = Err(e),
                 }
             }
@@ -299,7 +309,7 @@ mod tests {
 
     /// Just enough sftp server to answer the calls `read_batch` makes. Every file
     /// has the same body.
-    async fn fake_server<R, W>(mut r: R, mut w: W, body: Vec<u8>)
+    async fn fake_server<R, W>(mut r: R, mut w: W, body: Vec<u8>, fail_read: bool)
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -319,7 +329,18 @@ mod tests {
                 READ => {
                     d.str().expect("handle");
                     let offset = d.u64().expect("offset") as usize;
-                    if offset >= body.len() {
+                    if fail_read {
+                        // SSH_FX_FAILURE, which is what reading a directory gives.
+                        (
+                            STATUS,
+                            Enc::new()
+                                .u32(id)
+                                .u32(4)
+                                .str(b"is a directory")
+                                .str(b"")
+                                .done(),
+                        )
+                    } else if offset >= body.len() {
                         (
                             STATUS,
                             Enc::new().u32(id).u32(1).str(b"eof").str(b"").done(),
@@ -344,7 +365,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(1 << 20);
         let (cr, cw) = tokio::io::split(client);
         let (sr, sw) = tokio::io::split(server);
-        tokio::spawn(fake_server(sr, sw, b"hello".to_vec()));
+        tokio::spawn(fake_server(sr, sw, b"hello".to_vec(), false));
 
         let fs = SftpFs::over(cw, cr).await.expect("handshake");
         let paths: Vec<String> = (0..40).map(|i| format!("/f{i}")).collect();
@@ -361,6 +382,30 @@ mod tests {
         // number that must not move is that it does not scale with 40.
         let trips = fs.round_trips();
         assert!(trips <= 6, "forty files cost {trips} round trips");
+    }
+
+    /// Regression: found on a real host, not in a test. A directory's open
+    /// succeeds and its read fails, and treating that STATUS as EOF returned an
+    /// empty 200 instead of letting the caller fall through to a listing.
+    #[tokio::test]
+    async fn a_failed_read_is_not_reported_as_an_empty_success() {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (cr, cw) = tokio::io::split(client);
+        let (sr, sw) = tokio::io::split(server);
+        tokio::spawn(fake_server(sr, sw, b"unused".to_vec(), true));
+
+        let fs = SftpFs::over(cw, cr).await.expect("handshake");
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            fs.read_batch(&["/a-directory".to_string()]),
+        )
+        .await
+        .expect("read_batch should not hang");
+
+        assert!(
+            out[0].is_err(),
+            "a read that failed must not look like an empty file"
+        );
     }
 
     /// Invariant 4: a session that dies must surface as an error. Hanging forever
