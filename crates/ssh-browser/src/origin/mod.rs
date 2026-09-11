@@ -400,7 +400,7 @@ impl Origin {
             (&Method::GET, "hello") => {
                 let mut aliases: Vec<String> = self.sessions.keys().cloned().collect();
                 aliases.sort();
-                control::hello(&aliases)
+                control::hello(&aliases, &self.suffix)
             }
             (&Method::GET, "annotations") => self.list_annotations(query).await,
             (&Method::POST, "annotations") => self.add_annotation(body).await,

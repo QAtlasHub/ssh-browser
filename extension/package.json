@@ -1,0 +1,16 @@
+{
+  "name": "ssh-browser-extension",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Browser half of ssh-browser: holds the control token and configures the PAC.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.29",
+    "esbuild": "^0.25.10",
+    "typescript": "^5.9.3"
+  }
+}

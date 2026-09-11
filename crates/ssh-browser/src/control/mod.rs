@@ -150,6 +150,13 @@ struct Hello<'a> {
     daemon: &'a str,
     protocol: Protocol,
     aliases: &'a [String],
+    /// The hostname suffix, so the extension can build an alias URL without being told it
+    /// separately.
+    ///
+    /// Reported rather than assumed: the suffix is configurable, and an extension that
+    /// hardcoded it would break the moment somebody changed it. Additive, so a protocol-1
+    /// client that does not read this field is unaffected and the range stays 1..=1.
+    suffix: &'a str,
 }
 
 /// Check the two things that must hold before any control route runs, returning the
@@ -185,7 +192,7 @@ pub fn route_of(path: &str) -> &str {
     path.strip_prefix(PATH_PREFIX).unwrap_or("")
 }
 
-pub fn hello(aliases: &[String]) -> Response<Full<Bytes>> {
+pub fn hello(aliases: &[String], suffix: &str) -> Response<Full<Bytes>> {
     json(&Hello {
         daemon: env!("CARGO_PKG_VERSION"),
         protocol: Protocol {
@@ -193,6 +200,7 @@ pub fn hello(aliases: &[String]) -> Response<Full<Bytes>> {
             max: PROTOCOL_MAX,
         },
         aliases,
+        suffix,
     })
 }
 
@@ -264,7 +272,7 @@ mod tests {
     /// even if it somehow manages to send the request.
     #[test]
     fn no_response_carries_cors_headers() {
-        let mut responses = vec![hello(&["docs".to_string()])];
+        let mut responses = vec![hello(&["docs".to_string()], "ssh-browser")];
         responses.extend(gate(&Method::OPTIONS, None, &token()));
         responses.extend(gate(&Method::GET, None, &token()));
         responses.push(text(StatusCode::NOT_FOUND, "nope"));
@@ -289,6 +297,7 @@ mod tests {
                 max: PROTOCOL_MAX,
             },
             aliases: &["docs".to_string()],
+            suffix: "ssh-browser",
         })
         .expect("serialises");
         assert!(body.contains("\"min\":1"));

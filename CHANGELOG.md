@@ -30,6 +30,12 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- A browser extension, so far just enough to connect: it holds the control token, asks the
+  daemon for its PAC rather than generating one, and negotiates the protocol version. The
+  token lives in the service worker and nowhere else — content scripts will ask the worker
+  to act for them rather than being handed it.
+- `hello` reports the configured suffix, so the extension can build an alias URL without
+  being told it separately. Additive, so the protocol range stays 1..=1.
 - `GET` and `POST /_control/annotations`, which is the first write path in the product.
   The author is the daemon's configuration rather than the request's, the id of a new
   annotation is minted by the daemon, and the timestamp is the daemon's clock — a caller
