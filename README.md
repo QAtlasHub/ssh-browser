@@ -45,15 +45,61 @@ VERDICT pipelined: 1.90 tau at n=40 (serial would cost about 40)
 Forty opens cost one round trip; serial would cost forty. The reads carry 400 KB, so their extra tau is
 bandwidth rather than latency. The same verdict holds across a ProxyJump hop.
 
+## URLs
+
+```
+https://<alias>.ssh-browser/<path>
+```
+
+The alias, the suffix and the scheme are all configurable. A PAC routes by hostname
+and never resolves it, so the suffix does not have to be a real TLD and **no DNS
+server or hosts-file entry is needed**. It also leaves the address bar alone,
+unlike a `declarativeNetRequest` redirect, which rewrites the URL to `127.0.0.1`
+and throws away the origin you asked for.
+
+`http` needs no certificate. `https` does, so it arrives separately and behind a CA
+whose `nameConstraints` limit it to the suffix: a leaked key then cannot
+impersonate anything else, which is not true of a stock mkcert CA.
+
+## Usage
+
+```
+ssh-browser serve panza=Panza:/usr/share/doc ohtaka=issp-ohtaka:/home/me/docs
+```
+
+That listens on 127.0.0.1:7391 and prints what to do next. Point the browser at the
+PAC the daemon serves,
+
+```
+chrome --proxy-pac-url=http://127.0.0.1:7391/proxy.pac
+```
+
+then open `http://panza.ssh-browser/`. Each alias is its own origin, so a page under
+one alias cannot fetch from another.
+
+Without touching proxy settings at all, `http://127.0.0.1:7391/panza/` serves the
+same tree. That is useful for a quick look, but it puts every alias in one origin,
+so prefer the PAC.
+
+`--port` and `--suffix` change the listener and the hostname suffix. `ssh-browser
+pac` prints the script without starting a server.
+
 ## Status
 
-Early. The SFTP transport and the measurement harness exist. The HTTP origin layer does not yet.
+Early, but usable for reading. Verified against a real host through a jump box:
+directory listings, `index.html`, MIME types correct enough that ES modules execute,
+`301` for a directory missing its trailing slash, `403` for a rebinding `Host`,
+`403` for traversal including its percent-encoded spelling.
+
+Not there yet: `Range`, conditional GET answered from a local cache, symlinks that
+point outside their alias base, annotations, collaborative editing.
 
 ```
 cargo run --bin measure-roundtrips -- <ssh-host> [remote-dir]
 ```
 
-On Git Bash, prefix with `MSYS_NO_PATHCONV=1` or the remote path is rewritten into a Windows path.
+On Git Bash, prefix commands with `MSYS_NO_PATHCONV=1` or a remote path is rewritten
+into a Windows path.
 
 ## License
 
