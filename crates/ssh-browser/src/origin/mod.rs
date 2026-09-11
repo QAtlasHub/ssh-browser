@@ -150,42 +150,71 @@ impl Origin {
         } else {
             resolved.clone()
         };
-        let (parent, name) = split_parent(&file);
 
-        // One listing of the parent settles existence, kind, symlink-ness and
-        // freshness. Everything below is either answered from it or is a single
-        // fetch; nothing here costs a round trip per path component.
-        if !self.cache.has_listing(parent) {
-            match session.fs.list_dir(parent).await {
-                Ok(entries) => self.cache.put_listing(parent, &entries),
-                // A parent that cannot be listed is not necessarily absent -- it may
-                // be unreadable -- but either way there is nothing to serve under it.
-                Err(e) => return fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}")),
+        // Every component between the alias base and the file, base first. The base
+        // itself is not checked: it is what the operator configured, and no request
+        // can change it.
+        let chain = components(&session.base, &file);
+        if chain.is_empty() {
+            return self.autoindex_of(session, path, &resolved).await;
+        }
+        let last = chain.len() - 1;
+
+        // Fetch every ancestor listing not already held, together. This is what
+        // `list_dirs` being a batch buys: checking a path of depth d costs one round
+        // trip rather than d of them, so depth cannot leak into the per-request
+        // budget. Warm, it costs none.
+        let missing: Vec<String> = chain
+            .iter()
+            .map(|(dir, _)| dir.clone())
+            .filter(|dir| !self.cache.has_listing(dir))
+            .collect();
+        if !missing.is_empty() {
+            for (dir, result) in missing.iter().zip(session.fs.list_dirs(&missing).await) {
+                // A directory that cannot be listed is diagnosed by the walk below,
+                // which can report it against the path the request actually named.
+                if let Ok(entries) = result {
+                    self.cache.put_listing(dir, &entries);
+                }
             }
         }
 
-        let Some(attrs) = self.cache.attrs_of(parent, name) else {
-            // The parent was listed and this name is not in it. For a directory
-            // request that only means there is no index.html, so fall through to a
-            // listing. Otherwise it is a 404 that cost no round trip.
-            if wants_dir {
-                return self.autoindex_of(session, path, &resolved).await;
+        let mut found_last = None;
+        for (i, (dir, name)) in chain.iter().enumerate() {
+            if !self.cache.has_listing(dir) {
+                return fail(StatusCode::NOT_FOUND, format!("{path}: cannot list {dir}"));
             }
-            return fail(StatusCode::NOT_FOUND, format!("not found: {path}"));
-        };
+            let Some(attrs) = self.cache.attrs_of(dir, name) else {
+                // Absent. For a directory request that only means there is no
+                // index.html, so fall through to a listing of the directory itself.
+                if i == last && wants_dir {
+                    return self.autoindex_of(session, path, &resolved).await;
+                }
+                return fail(StatusCode::NOT_FOUND, format!("not found: {path}"));
+            };
 
-        // A symlink inside the base may point outside it, and finding out needs a
-        // REALPATH per request. Refusing costs nothing and never lies. This covers
-        // the final component only: a symlinked *directory* higher up the path is
-        // still not caught, which SECURITY.md says plainly.
-        if attrs.is_symlink() {
-            return fail(
-                StatusCode::FORBIDDEN,
-                format!("refusing symlink: {path} (its target is not checked)"),
-            );
+            // A symlink may point outside the base, and finding out needs a REALPATH
+            // per request. Refusing costs nothing and never lies. Checking *every*
+            // component rather than only the last is what closes the hole SECURITY.md
+            // used to describe.
+            if attrs.is_symlink() {
+                return fail(
+                    StatusCode::FORBIDDEN,
+                    format!("refusing symlink at {dir}/{name} (its target is not checked)"),
+                );
+            }
+            if i < last && !attrs.is_dir() {
+                return fail(
+                    StatusCode::NOT_FOUND,
+                    format!("{path}: {dir}/{name} is not a directory"),
+                );
+            }
+            if i == last {
+                found_last = Some(attrs);
+            }
         }
+        let attrs = found_last.expect("the walk assigns on its final iteration");
 
-        // Known from the listing, so the wrong-shape cases cost nothing either.
         if attrs.is_dir() {
             if wants_dir {
                 // `<dir>/index.html` is itself a directory. Fall back to a listing.
@@ -224,7 +253,7 @@ impl Origin {
             // listing is wrong. Holding it for the rest of its TTL would repeat the
             // same wrong answer.
             Some(Err(e)) => {
-                self.cache.forget_listing(parent);
+                self.cache.forget_listing(&chain[last].0);
                 fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}"))
             }
             None => fail(
@@ -277,14 +306,25 @@ impl Origin {
     }
 }
 
-/// Split an absolute path into its directory and its final component.
-fn split_parent(path: &str) -> (&str, &str) {
-    match path.rsplit_once('/') {
-        // A file directly under the root: the parent is "/" and not "".
-        Some(("", name)) => ("/", name),
-        Some((dir, name)) => (dir, name),
-        None => ("/", path),
+/// Every step from the alias base down to the file, as `(directory to list, name to
+/// check inside it)`, base first.
+///
+/// The base is the first directory listed and is never itself a checked name: it is
+/// operator configuration, not something a request reaches.
+fn components(base: &str, file: &str) -> Vec<(String, String)> {
+    let base = base.trim_end_matches('/');
+    let relative = file
+        .strip_prefix(base)
+        .unwrap_or("")
+        .trim_start_matches('/');
+
+    let mut out = Vec::new();
+    let mut dir = base.to_string();
+    for name in relative.split('/').filter(|s| !s.is_empty()) {
+        out.push((dir.clone(), name.to_string()));
+        dir = format!("{dir}/{name}");
     }
+    out
 }
 
 fn host_of<B>(req: &Request<B>) -> Option<String> {
@@ -446,6 +486,16 @@ mod tests {
             .file("/srv/a.html", b"hello")
     }
 
+    /// The same single file, four directories down.
+    fn deep_tree() -> FakeRemote {
+        FakeRemote::new()
+            .dir("/srv", vec![("a", dir_attrs())])
+            .dir("/srv/a", vec![("b", dir_attrs())])
+            .dir("/srv/a/b", vec![("c", dir_attrs())])
+            .dir("/srv/a/b/c", vec![("d.html", file_attrs(5, 100))])
+            .file("/srv/a/b/c/d.html", b"deep!")
+    }
+
     fn entry(name: &str, dir: bool) -> Entry {
         Entry {
             name: name.to_string(),
@@ -487,10 +537,26 @@ mod tests {
     }
 
     #[test]
-    fn parents_split_correctly_including_at_the_root() {
-        assert_eq!(split_parent("/srv/docs/a.html"), ("/srv/docs", "a.html"));
-        assert_eq!(split_parent("/a.html"), ("/", "a.html"));
-        assert_eq!(split_parent("a.html"), ("/", "a.html"));
+    fn the_component_chain_walks_from_the_base_down() {
+        assert_eq!(
+            components("/srv", "/srv/a/b/c.html"),
+            vec![
+                ("/srv".to_string(), "a".to_string()),
+                ("/srv/a".to_string(), "b".to_string()),
+                ("/srv/a/b".to_string(), "c.html".to_string()),
+            ]
+        );
+        assert_eq!(
+            components("/srv", "/srv/index.html"),
+            vec![("/srv".to_string(), "index.html".to_string())]
+        );
+        // A trailing slash on the base must not produce an empty first component.
+        assert_eq!(
+            components("/srv/", "/srv/a.html"),
+            vec![("/srv".to_string(), "a.html".to_string())]
+        );
+        // The file *is* the base: nothing between them to check.
+        assert!(components("/srv", "/srv").is_empty());
     }
 
     /// Invariant 2. The listing and the body are both held, so the second request
@@ -613,6 +679,70 @@ mod tests {
             origin_with(FakeRemote::new().dir("/srv", vec![("only.txt", file_attrs(2, 1))])).await;
 
         let res = origin.handle(get("/", None)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+    }
+
+    /// The hole SECURITY.md used to describe. `/link/inside.html` names a file that
+    /// exists and is not itself a symlink, but every route to it passes through one.
+    #[tokio::test]
+    async fn a_symlinked_directory_higher_up_the_path_is_refused() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir("/srv", vec![("link", symlink_attrs())])
+                .dir("/srv/link", vec![("inside.html", file_attrs(2, 1))])
+                .file("/srv/link/inside.html", b"hi"),
+        )
+        .await;
+
+        let res = origin.handle(get("/link/inside.html", None)).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Depth must not buy itself round trips. Every ancestor listing is issued
+    /// together, so a path four deep costs what a path one deep costs.
+    #[tokio::test]
+    async fn a_deep_path_costs_what_a_shallow_one_costs() {
+        let deep = origin_with(deep_tree()).await;
+        assert_eq!(
+            deep.handle(get("/a/b/c/d.html", None)).await.status(),
+            StatusCode::OK
+        );
+
+        let shallow = origin_with(one_page()).await;
+        assert_eq!(
+            shallow.handle(get("/a.html", None)).await.status(),
+            StatusCode::OK
+        );
+
+        let (d, sh) = (trips(&deep), trips(&shallow));
+        // The slack absorbs one flush of fire-and-forget CLOSEs landing on either
+        // side of the measurement; a per-component walk would cost roughly 12 more.
+        assert!(
+            d <= sh + 2,
+            "depth 4 cost {d} round trips against depth 1's {sh}"
+        );
+    }
+
+    /// A component that exists but is not a directory.
+    #[tokio::test]
+    async fn a_file_used_as_a_directory_is_a_404() {
+        let origin = origin_with(one_page()).await;
+        let res = origin.handle(get("/a.html/b.html", None)).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A deep path is served, not merely checked: the walk must not lose the file it
+    /// was walking towards.
+    #[tokio::test]
+    async fn a_deep_path_serves_its_body() {
+        let origin = origin_with(deep_tree()).await;
+        let res = origin.handle(get("/a/b/c/d.html", None)).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             res.headers()
