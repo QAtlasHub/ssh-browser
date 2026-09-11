@@ -54,6 +54,23 @@ pub trait RemoteFs {
             .unwrap_or_else(|| Err(anyhow!("list_dirs returned no result for {path}")))
     }
 
+    /// Append bytes to a file, creating it if absent.
+    ///
+    /// Append rather than write, and single rather than batched, because that is the
+    /// only write this design needs and the only one that is safe without a lock. A log
+    /// has exactly one writer by construction, so an append cannot interleave with
+    /// anyone else's — which is precisely why the annotation format is per-author logs
+    /// and not one shared file.
+    async fn append(&self, path: &str, bytes: &[u8]) -> Result<()>;
+
+    /// Create a directory and every missing parent.
+    ///
+    /// Every level is issued at once and per-level failures are ignored: a level that
+    /// already exists reports one, and the only outcome that matters is whether the
+    /// deepest level is there afterwards. Walking down a level per round trip would
+    /// cost depth round trips for something that happens once per document.
+    async fn mkdirs(&self, path: &str) -> Result<()>;
+
     /// Flushes issued so far. One flush is one remote round trip, so this is the
     /// invariant made observable, and assertable in tests.
     fn round_trips(&self) -> u64;

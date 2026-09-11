@@ -5,9 +5,11 @@ pub const VERSION: u8 = 2;
 pub const OPEN: u8 = 3;
 pub const CLOSE: u8 = 4;
 pub const READ: u8 = 5;
+pub const WRITE: u8 = 6;
 pub const LSTAT: u8 = 7;
 pub const OPENDIR: u8 = 11;
 pub const READDIR: u8 = 12;
+pub const MKDIR: u8 = 14;
 pub const REALPATH: u8 = 16;
 pub const STATUS: u8 = 101;
 pub const HANDLE: u8 = 102;
@@ -16,10 +18,18 @@ pub const NAME: u8 = 104;
 pub const ATTRS: u8 = 105;
 
 pub const FXF_READ: u32 = 0x0000_0001;
+pub const FXF_WRITE: u32 = 0x0000_0002;
+/// In append mode the offset in each WRITE is ignored and the server places the data at
+/// the end. That is what makes a single-writer log safe without any locking.
+pub const FXF_APPEND: u32 = 0x0000_0004;
+pub const FXF_CREAT: u32 = 0x0000_0008;
 
 /// A read ending in SSH_FX_EOF is a normal end of file. Any other status is a
 /// real failure, and conflating the two turns a directory into an empty 200.
 pub const STATUS_EOF: u32 = 1;
+
+/// SSH_FX_OK, the only status a write may answer with.
+pub const STATUS_OK: u32 = 0;
 
 const A_SIZE: u32 = 0x0000_0001;
 const A_UIDGID: u32 = 0x0000_0002;
