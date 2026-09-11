@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Use [private vulnerability reporting](https://github.com/sotashimozono/ssh-browser/security/advisories/new).
+Use [private vulnerability reporting](https://github.com/QAtlasHub/ssh-browser/security/advisories/new).
 Please do not open a public issue for a vulnerability.
 
 ## What this tool exposes
