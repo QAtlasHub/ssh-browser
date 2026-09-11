@@ -6,7 +6,7 @@
 //! as a multiple of it. A pipelined batch of N costs about 1 tau; a serial one
 //! costs about N.
 //!
-//! usage: measure-roundtrips <ssh-host> [remote-dir]
+//! usage: `measure-roundtrips <ssh-host> [remote-dir]`
 
 use std::time::{Duration, Instant};
 
