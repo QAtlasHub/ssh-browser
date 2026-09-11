@@ -18,14 +18,15 @@ use tokio::sync::{mpsc, oneshot};
 use super::{Entry, RangeReq, RemoteFs};
 use crate::sftp::transport::{self, SshChild};
 use crate::sftp::wire::{
-    Attrs, CLOSE, DATA, Dec, Enc, FXF_READ, HANDLE, NAME, OPEN, OPENDIR, READ, READDIR, STATUS,
-    STATUS_EOF,
+    Attrs, CLOSE, DATA, Dec, Enc, FXF_APPEND, FXF_CREAT, FXF_READ, FXF_WRITE, HANDLE, MKDIR, NAME,
+    OPEN, OPENDIR, READ, READDIR, STATUS, STATUS_EOF, STATUS_OK, WRITE,
 };
 use crate::sftp::{Reply, Rx, Sftp, Tx};
 
 const QUEUE_DEPTH: usize = 1024;
 const MAX_BATCH: usize = 256;
 const READ_CHUNK: u32 = 32 * 1024;
+const WRITE_CHUNK: usize = 32 * 1024;
 
 /// How long the writer waits for sibling callers before committing to a flush.
 /// Against a 16 ms RTT this costs roughly 1%, and it is what collapses N
@@ -327,6 +328,101 @@ impl RemoteFs for SftpFs {
             let _ = self.issue(CLOSE, Enc::new().str(handle).done()).await;
         }
         out
+    }
+
+    async fn append(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        // WRITE | APPEND | CREAT. In append mode the server ignores the offset in each
+        // WRITE and places the data at the end, which is what makes this safe for a
+        // single writer with no lock at all. It would not be safe for two, and the
+        // annotation format is per-author logs precisely so that there are never two.
+        let opened = await_reply(
+            self.issue(
+                OPEN,
+                Enc::new()
+                    .str(path.as_bytes())
+                    .u32(FXF_WRITE | FXF_APPEND | FXF_CREAT)
+                    .u32(0)
+                    .done(),
+            )
+            .await?,
+        )
+        .await?;
+        let handle = handle_from(&opened, path)?;
+
+        // Chunked and issued together, for the same reason reads are.
+        let mut rxs = Vec::new();
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let end = at.saturating_add(WRITE_CHUNK).min(bytes.len());
+            rxs.push(
+                self.issue(
+                    WRITE,
+                    Enc::new()
+                        .str(&handle)
+                        .u64(at as u64)
+                        .str(&bytes[at..end])
+                        .done(),
+                )
+                .await?,
+            );
+            at = end;
+        }
+
+        // Every reply is drained before returning, and any failure is kept. A write that
+        // reported an error and was treated as success would lose an annotation while
+        // telling the user it was saved.
+        let mut failure = None;
+        for rx in rxs {
+            match await_reply(rx).await {
+                Ok(r) => {
+                    let code = Dec::new(r.payload()).u32().unwrap_or(u32::MAX);
+                    if r.kind != STATUS || code != STATUS_OK {
+                        failure = Some(anyhow!("writing {path} failed with sftp status {code}"));
+                    }
+                }
+                Err(e) => failure = Some(e),
+            }
+        }
+
+        let _ = self.issue(CLOSE, Enc::new().str(&handle).done()).await;
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    async fn mkdirs(&self, path: &str) -> Result<()> {
+        let mut levels = Vec::new();
+        let mut at = String::new();
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            at.push('/');
+            at.push_str(part);
+            levels.push(at.clone());
+        }
+
+        let mut rxs = Vec::with_capacity(levels.len());
+        for level in &levels {
+            rxs.push(
+                self.issue(MKDIR, Enc::new().str(level.as_bytes()).u32(0).done())
+                    .await?,
+            );
+        }
+        for rx in rxs {
+            // Ignored on purpose. "Already exists" and "created" are both acceptable
+            // outcomes here and servers do not report them distinguishably.
+            let _ = await_reply(rx).await;
+        }
+
+        // The only check worth making: is it a directory now? Trusting the mkdir replies
+        // would report success for a path that is not there, which is the failure mode
+        // this whole codebase is trying not to have.
+        let one = [path.to_string()];
+        let mut got = self.list_dirs(&one).await;
+        match got.pop() {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(e)) => Err(e.context(format!("creating {path}"))),
+            None => Err(anyhow!("list_dirs returned nothing for {path}")),
+        }
     }
 
     async fn list_dirs(&self, paths: &[String]) -> Vec<Result<Vec<Entry>>> {

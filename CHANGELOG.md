@@ -30,6 +30,14 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- Annotations as per-author append-only logs, at
+  `<dir>/.ssh-browser/<file>/ann/<author>.jsonl`. Merging is a set union of lines, so it is
+  commutative, idempotent and needs no lock; an id carries its author, so a log touching
+  someone else's record is ignored rather than obeyed. Nothing calls this yet — the control
+  route comes next.
+- `RemoteFs::append` and `RemoteFs::mkdirs`, the first writes in the codebase. Append
+  rather than write, because a log has exactly one writer by construction and that is the
+  only arrangement safe without a lock.
 - A control API on the loopback path, with a 32-byte token compared in constant time,
   protocol version negotiation, and no CORS participation at all. Nothing writes through
   it yet; it exists so the boundary is settled before there is something behind it.

@@ -13,7 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::fs::Entry;
 use crate::fs::sftp::SftpFs;
 use crate::sftp::wire::{
-    Attrs, CLOSE, DATA, Dec, Enc, HANDLE, INIT, NAME, OPEN, OPENDIR, READ, READDIR, STATUS, VERSION,
+    Attrs, CLOSE, DATA, Dec, Enc, FXF_CREAT, HANDLE, INIT, MKDIR, NAME, OPEN, OPENDIR, READ,
+    READDIR, STATUS, VERSION, WRITE,
 };
 use crate::sftp::{read_frame, write_frame};
 
@@ -107,7 +108,7 @@ fn path_of(handle: &[u8]) -> Option<String> {
     Some(path.to_string())
 }
 
-async fn serve<R, W>(remote: FakeRemote, mut r: R, mut w: W)
+async fn serve<R, W>(mut remote: FakeRemote, mut r: R, mut w: W)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -156,6 +157,13 @@ where
             }
             OPEN => {
                 let path = utf8(d.str().expect("open path"));
+                let flags = d.u32().expect("open flags");
+                // A create flag makes the file exist, as it does on a real server. Without
+                // this an append could never write a log that did not already exist.
+                let creating = flags & FXF_CREAT != 0;
+                if creating {
+                    remote.files.entry(path.clone()).or_default();
+                }
                 if remote.files.contains_key(&path) {
                     serial += 1;
                     (
@@ -184,6 +192,40 @@ where
                     let end = offset.saturating_add(want).min(body.len());
                     (DATA, Enc::new().u32(id).str(&body[offset..end]).done())
                 }
+            }
+            WRITE => {
+                let handle = d.str().expect("write handle").to_vec();
+                let path = path_of(&handle).expect("write handle shape");
+                // The offset is read and ignored: the client opened in append mode, and a
+                // real server places the data at the end regardless of what it says.
+                d.u64().expect("write offset");
+                let data = d.str().expect("write data").to_vec();
+                remote
+                    .files
+                    .entry(path.clone())
+                    .or_default()
+                    .extend_from_slice(&data);
+
+                // Made visible to a listing too, because a listing is how the reader finds
+                // the file at all. A fake that wrote without listing would let a broken
+                // reader pass.
+                if let Some((parent, name)) = path.rsplit_once('/') {
+                    let size = remote.files.get(&path).map_or(0, Vec::len) as u64;
+                    let entries = remote.dirs.entry(parent.to_string()).or_default();
+                    match entries.iter_mut().find(|e| e.name == name) {
+                        Some(e) => e.attrs.size = Some(size),
+                        None => entries.push(Entry {
+                            name: name.to_string(),
+                            attrs: file_attrs(size, 1),
+                        }),
+                    }
+                }
+                (STATUS, status(id, SSH_FX_OK, "ok"))
+            }
+            MKDIR => {
+                let path = utf8(d.str().expect("mkdir path"));
+                remote.dirs.entry(path).or_default();
+                (STATUS, status(id, SSH_FX_OK, "ok"))
             }
             CLOSE => {
                 d.str().expect("close handle");
