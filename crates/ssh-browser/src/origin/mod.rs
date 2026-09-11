@@ -419,26 +419,20 @@ impl Origin {
     /// Runs the same guards the read path runs, and the symlink one matters more here: a
     /// write that reached through a symlinked directory could place a file outside the
     /// alias base entirely.
-    async fn resolve_doc(&self, doc: &str) -> Result<(&Session, String), Response<Full<Bytes>>> {
+    async fn resolve_doc(&self, doc: &str) -> Result<(&Session, String), (StatusCode, String)> {
         let (alias, rest) = doc.split_once('/').unwrap_or((doc, ""));
         let Some(session) = self.sessions.get(alias) else {
-            return Err(control::text(
-                StatusCode::NOT_FOUND,
-                format!("no alias named {alias:?}"),
-            ));
+            return Err((StatusCode::NOT_FOUND, format!("no alias named {alias:?}")));
         };
         let resolved = match guard::resolve(&session.base, &format!("/{rest}")) {
             Ok(p) => p,
-            Err(e) => return Err(control::text(StatusCode::FORBIDDEN, format!("{e:#}"))),
+            Err(e) => return Err((StatusCode::FORBIDDEN, format!("{e:#}"))),
         };
 
         let chain = components(&session.base, &resolved);
         self.warm_ancestor_listings(session, &chain).await;
         if let Some(at) = self.first_symlink(&chain) {
-            return Err(control::text(
-                StatusCode::FORBIDDEN,
-                format!("refusing symlink at {at}"),
-            ));
+            return Err((StatusCode::FORBIDDEN, format!("refusing symlink at {at}")));
         }
         Ok((session, resolved))
     }
@@ -453,7 +447,7 @@ impl Origin {
         };
         let (session, resolved) = match self.resolve_doc(doc).await {
             Ok(v) => v,
-            Err(refusal) => return refusal,
+            Err((status, detail)) => return control::text(status, detail),
         };
 
         match annot::Store::new(&session.fs).load(&resolved).await {
@@ -480,7 +474,7 @@ impl Origin {
 
         let (session, resolved) = match self.resolve_doc(&request.doc).await {
             Ok(v) => v,
-            Err(refusal) => return refusal,
+            Err((status, detail)) => return control::text(status, detail),
         };
 
         // The id is minted here when adding, rather than accepted, so it cannot name an
