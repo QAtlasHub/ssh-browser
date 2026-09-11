@@ -101,15 +101,28 @@ impl SftpFs {
             .map_err(|_| anyhow!("sftp session is gone"))?;
         Ok(rx)
     }
-
-    async fn one(&self, kind: u8, body: Vec<u8>) -> Result<Reply> {
-        await_reply(self.issue(kind, body).await?).await
-    }
 }
 
 async fn await_reply(rx: oneshot::Receiver<Reply>) -> Result<Reply> {
     rx.await
         .map_err(|_| anyhow!("sftp session closed before replying"))
+}
+
+/// Decode one SSH_FXP_NAME page.
+fn decode_names(payload: &[u8]) -> Result<Vec<Entry>> {
+    let mut d = Dec::new(payload);
+    let count = d.u32().context("readdir count")?;
+    // A count is a length prefix from the far end, so it is not trusted enough to
+    // size an allocation with.
+    ensure!(count <= 1 << 16, "implausible readdir count {count}");
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let name = String::from_utf8_lossy(d.str().context("filename")?).into_owned();
+        d.str().context("longname")?;
+        let attrs = Attrs::decode(&mut d).context("attrs")?;
+        out.push(Entry { name, attrs });
+    }
+    Ok(out)
 }
 
 fn handle_from(r: &Reply, what: &str) -> Result<Vec<u8>> {
@@ -209,31 +222,86 @@ impl RemoteFs for SftpFs {
         out
     }
 
-    async fn list_dir(&self, path: &str) -> Result<Vec<Entry>> {
-        let r = self
-            .one(OPENDIR, Enc::new().str(path.as_bytes()).done())
-            .await?;
-        let handle = handle_from(&r, path)?;
+    async fn list_dirs(&self, paths: &[String]) -> Vec<Result<Vec<Entry>>> {
+        // Every opendir goes out before any reply is awaited, for the same reason
+        // read_batch does it. A symlink check walks a whole path, and one round
+        // trip per component would put that walk back inside the per-request
+        // budget the origin layer cannot afford.
+        let mut opens = Vec::with_capacity(paths.len());
+        for p in paths {
+            opens.push(
+                self.issue(OPENDIR, Enc::new().str(p.as_bytes()).done())
+                    .await,
+            );
+        }
 
-        let mut out = Vec::new();
-        loop {
-            let r = self.one(READDIR, Enc::new().str(&handle).done()).await?;
-            if r.kind == STATUS {
-                break;
-            }
-            ensure!(r.kind == NAME, "readdir gave reply type {}", r.kind);
-            let mut d = Dec::new(r.payload());
-            let count = d.u32().context("readdir count")?;
-            for _ in 0..count {
-                let name = String::from_utf8_lossy(d.str().context("filename")?).into_owned();
-                d.str().context("longname")?;
-                let attrs = Attrs::decode(&mut d).context("attrs")?;
-                out.push(Entry { name, attrs });
+        let mut handles: Vec<Option<Vec<u8>>> = Vec::with_capacity(paths.len());
+        let mut out: Vec<Result<Vec<Entry>>> = Vec::with_capacity(paths.len());
+        for (rx, path) in opens.into_iter().zip(paths) {
+            let opened = match rx {
+                Ok(rx) => await_reply(rx).await.and_then(|r| handle_from(&r, path)),
+                Err(e) => Err(e),
+            };
+            match opened {
+                Ok(h) => {
+                    handles.push(Some(h));
+                    out.push(Ok(Vec::new()));
+                }
+                Err(e) => {
+                    handles.push(None);
+                    out.push(Err(e));
+                }
             }
         }
 
-        let _ = self.issue(CLOSE, Enc::new().str(&handle).done()).await;
-        Ok(out)
+        // A readdir returns one page at a time, so page k for every still-open
+        // directory is issued together: one round trip per page index rather than
+        // one per directory.
+        let mut live: Vec<usize> = (0..paths.len()).filter(|&i| handles[i].is_some()).collect();
+        while !live.is_empty() {
+            let mut rxs = Vec::with_capacity(live.len());
+            for &i in &live {
+                let handle = handles[i].as_ref().expect("live implies a handle");
+                rxs.push(self.issue(READDIR, Enc::new().str(handle).done()).await);
+            }
+
+            let mut still_live = Vec::new();
+            for (&i, rx) in live.iter().zip(rxs) {
+                let page = match rx {
+                    Ok(rx) => await_reply(rx).await,
+                    Err(e) => Err(e),
+                };
+                match page {
+                    Ok(r) if r.kind == NAME => match decode_names(r.payload()) {
+                        Ok(entries) => {
+                            if let Ok(acc) = &mut out[i] {
+                                acc.extend(entries);
+                            }
+                            still_live.push(i);
+                        }
+                        Err(e) => out[i] = Err(e),
+                    },
+                    // A STATUS ends the listing only when it says EOF. Accepting
+                    // any status as the end returns a short listing as a success,
+                    // which is the same silent success read_batch had: a directory
+                    // we were refused would read as an empty directory.
+                    Ok(r) if r.kind == STATUS => {
+                        let code = Dec::new(r.payload()).u32().unwrap_or(u32::MAX);
+                        if code != STATUS_EOF {
+                            out[i] = Err(anyhow!("readdir failed with sftp status {code}"));
+                        }
+                    }
+                    Ok(r) => out[i] = Err(anyhow!("readdir gave reply type {}", r.kind)),
+                    Err(e) => out[i] = Err(e),
+                }
+            }
+            live = still_live;
+        }
+
+        for handle in handles.iter().flatten() {
+            let _ = self.issue(CLOSE, Enc::new().str(handle).done()).await;
+        }
+        out
     }
 
     fn round_trips(&self) -> u64 {

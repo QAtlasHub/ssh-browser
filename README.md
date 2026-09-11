@@ -89,10 +89,15 @@ pac` prints the script without starting a server.
 Early, but usable for reading. Verified against a real host through a jump box:
 directory listings, `index.html`, MIME types correct enough that ES modules execute,
 `301` for a directory missing its trailing slash, `403` for a rebinding `Host`,
-`403` for traversal including its percent-encoded spelling.
+`403` for traversal including its percent-encoded spelling, `403` for a symlink.
 
-Not there yet: `Range`, conditional GET answered from a local cache, symlinks that
-point outside their alias base, annotations, collaborative editing.
+Revisits are free. A listing of the parent directory answers existence, kind,
+symlink-ness and the validator, so a second request for the same page is served
+without touching the remote, and a browser holding the current copy gets a `304`
+decided inside this process. Against a host at 18 ms RTT: 184 ms cold, 1.6 ms warm.
+
+Not there yet: `Range`, a symlinked *directory* higher up a path (the final
+component is checked), annotations, collaborative editing.
 
 ```
 cargo run --bin measure-roundtrips -- <ssh-host> [remote-dir]

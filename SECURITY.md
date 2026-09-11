@@ -21,12 +21,16 @@ refusing its `Host` does. Requests are accepted for `<alias>.<suffix>` and for t
 listener's own address and port, and for nothing else. If you touch that code, keep
 the check.
 
-**Path resolution is string-only today.** Requests are percent-decoded and then
-normalised, so neither `..` nor `%2e%2e` can leave an alias base. A symlink *inside*
-the base that points outside it is not yet caught, because checking it would need a
-REALPATH per request and that breaks the round-trip invariant the project is built
-on. The listing cache will close this. Until it lands, treat an alias base that
-contains symlinks you do not control as readable in full.
+**Path resolution is string-only, and the symlink check is partial.** Requests are
+percent-decoded and then normalised, so neither `..` nor `%2e%2e` can leave an alias
+base. The listing cache also refuses a request whose final component is a symlink,
+and it does so without paying a REALPATH per request.
+
+What is still open is a symlinked *directory* higher up a path. In `/a/b.html` the
+`b.html` component is checked, but if `/a` is itself a symlink pointing outside the
+base, that is not caught. Batched listings make the full walk affordable and it is
+the next thing to land here. Until then, treat an alias base whose directories you
+do not control as readable in full.
 
 ## Credentials
 
