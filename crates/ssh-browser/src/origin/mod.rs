@@ -721,8 +721,9 @@ mod tests {
         );
 
         let (d, sh) = (trips(&deep), trips(&shallow));
-        // The slack absorbs one flush of fire-and-forget CLOSEs landing on either
-        // side of the measurement; a per-component walk would cost roughly 12 more.
+        // The slack absorbs one flush of fire-and-forget CLOSE requests landing on
+        // either side of the measurement. A walk that listed one ancestor at a time
+        // would cost about three times as many at this depth, and worse deeper.
         assert!(
             d <= sh + 2,
             "depth 4 cost {d} round trips against depth 1's {sh}"
