@@ -1,0 +1,23 @@
+name: "Question (use Discussions instead)"
+description: "Have a question? Please open a Discussion rather than filing an issue."
+title: "[Question] "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Please consider opening a Discussion
+
+        For general questions, design conversations, and brainstorming, the right place is **Discussions**, not Issues:
+
+        https://github.com/sotashimozono/ssh-browser/discussions
+
+        Issues are tracked as defects or actionable change requests. If you fill out this form anyway, the maintainer will likely convert it to a Discussion.
+  - type: input
+    id: question-title
+    attributes:
+      label: "If you really must file here, give a one-line summary"
+      description: "A short summary of what you want to ask."
+      placeholder: "e.g., How does ssh-browser handle proxies?"
+    validations:
+      required: false

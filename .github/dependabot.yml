@@ -1,0 +1,66 @@
+# Dependabot configuration. Ported from doiget.
+#
+# Policy:
+#   - Weekly cadence, Monday 07:00 UTC (aligned with audit.yml cron).
+#   - Auto-merge is intentionally NOT configured: each Dependabot PR must be
+#     reviewed and merged by hand.
+#   - Cargo minor + patch updates are grouped into a single PR per week to
+#     reduce review noise. Major bumps and security advisories land in
+#     individual PRs (Dependabot's default for ungrouped updates).
+#   - GitHub Actions SHAs are bumped as a separate ecosystem; every third-party
+#     action in this repo is pinned by SHA, so this is how those pins move.
+
+version: 2
+
+updates:
+  # ------------------------------------------------------------------
+  # Rust crates
+  # ------------------------------------------------------------------
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+    labels:
+      - dependencies
+      - rust
+      - automated
+    groups:
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch
+    # Security updates are excluded from grouping by default and land as
+    # individual PRs; that is the desired behavior here.
+
+  # ------------------------------------------------------------------
+  # GitHub Actions (workflow SHA pins)
+  # ------------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: UTC
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(ci)"
+      include: scope
+    labels:
+      - dependencies
+      - github-actions
+      - automated
+    groups:
+      actions-minor-and-patch:
+        patterns: ["*"]
+        update-types:
+          - minor
+          - patch

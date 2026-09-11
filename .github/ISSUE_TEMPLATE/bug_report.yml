@@ -1,0 +1,73 @@
+name: "Bug report"
+description: "Report a defect in ssh-browser (daemon or extension)."
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please complete the form below; if you've hit a security issue, see `SECURITY.md` instead — do NOT report it here.
+  - type: dropdown
+    id: component
+    attributes:
+      label: "Component"
+      description: "Which part of ssh-browser is affected?"
+      options:
+        - daemon (ssh-browser)
+        - browser extension
+        - docs
+        - CI/build
+        - other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "Version / commit"
+      description: "Which version or commit of ssh-browser are you running?"
+      placeholder: "e.g., 0.1.0 or commit abc1234"
+    validations:
+      required: true
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: "Steps to reproduce"
+      description: "Exact commands or input sequence to reproduce the bug."
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: "Expected behavior"
+      description: "What did you expect to happen?"
+    validations:
+      required: true
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: "Actual behavior"
+      description: "What actually happened? Include error output and stack traces."
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: "Environment"
+      description: "OS, Rust toolchain, network constraints, anything else relevant."
+      placeholder: |
+        OS: macOS 14.5 / Ubuntu 22.04 / Windows 11
+        Rust: 1.85.0 (rustup show)
+        Network: behind corporate proxy, on-campus IP, etc.
+    validations:
+      required: false
+  - type: checkboxes
+    id: pre-flight
+    attributes:
+      label: "Pre-flight checks"
+      options:
+        - label: "I confirmed this is not a security issue (those go via Private Vulnerability Reporting per `SECURITY.md`)"
+          required: true
+        - label: "I searched existing issues and Discussions and didn't find a duplicate"
+        - label: "I'm willing to test a fix"

@@ -1,0 +1,21 @@
+# CODEOWNERS for ssh-browser
+#
+# GitHub auto-assigns the matching owners as required reviewers on every PR that
+# touches the listed paths (last matching pattern wins). This file does NOT
+# enforce review -- branch protection rules do.
+
+# Default catch-all (least specific; explicit entries below override).
+*  @sotashimozono
+
+# ---- CI workflows ----
+/.github/workflows/  @sotashimozono
+
+# ---- Security posture ----
+/SECURITY.md  @sotashimozono
+
+# ---- Cargo workspace ----
+/Cargo.toml  @sotashimozono
+/Cargo.lock  @sotashimozono
+
+# ---- Crate roots ----
+/crates/ssh-browser/  @sotashimozono

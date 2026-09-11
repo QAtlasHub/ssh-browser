@@ -1,39 +1,113 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
 
 permissions:
   contents: read
 
 jobs:
-  check:
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-  test:
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - run: cargo test --all-targets
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          # rust-cache v2.9 turned `cache-bin: true` on by default, and the
+          # macOS-arm64 cache slot can capture a poisoned `~/.cargo/bin/cargo`
+          # that resolves to rustup-init, so `cargo test ...` fails with
+          # `unexpected argument 'test'`. dtolnay/rust-toolchain above already
+          # installs cargo fresh; a stale binary cache must not be restored over
+          # it. `target/` and the registry stay cached.
+          cache-bin: false
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  roundtrips:
-    # Invariant 1 as a required check: round trips for a batch of N must not grow
-    # with N. measure-roundtrips exits non-zero on a serial verdict, so a
-    # regression that only costs latency — the kind no unit test notices — fails
-    # here instead of shipping.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          # See the clippy job for the cache-bin rationale.
+          cache-bin: false
+      - run: cargo test --workspace --all-targets
+
+  msrv:
+    # MSRV is pinned in Cargo.toml / clippy.toml; the job name omits the version
+    # literal so the label cannot drift away from the pin.
+    name: msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - run: cargo build --workspace
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
+
+  roundtrips:
+    # Invariant 1 as a check rather than a claim: round trips for a batch of N
+    # must not grow with N. measure-roundtrips exits non-zero on a serial
+    # verdict, so a regression that only costs latency -- the kind no unit test
+    # notices -- fails here instead of shipping.
+    name: roundtrips
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          cache-bin: false
 
       - name: Local sshd
         run: |

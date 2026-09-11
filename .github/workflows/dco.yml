@@ -1,0 +1,109 @@
+name: dco
+
+# Is every commit signed off?
+#
+# Deliberately NOT a required status check. It blocks inside its own job, which
+# is enough to make a missing sign-off obvious on the PR before a human merges.
+#
+# Exemptions, both structural rather than discretionary:
+#   * merge commits  -- created by GitHub, not by a contributor (`--no-merges`).
+#   * bot authors    -- Dependabot and github-actions are not legal persons and
+#                       cannot grant a copyright license, so asking them to
+#                       certify one is meaningless. Matched on the `[bot]` suffix
+#                       GitHub appends to every App author name.
+#
+# Third-party Actions are SHA-pinned.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dco-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dco:
+    name: dco
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout PR head (full history so the base merge-base resolves)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the base branch
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
+      - name: Every non-bot, non-merge commit carries a Signed-off-by trailer
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          base_sha="$(git merge-base "origin/${BASE_REF}" "${HEAD_SHA}")"
+          echo "range: ${base_sha}..${HEAD_SHA}"
+          echo
+
+          # A well-formed trailer: a name, then an <addr@host> carrying no
+          # spaces. Matched case-insensitively — `Signed-Off-By` is an equally
+          # valid trailer key, and `git commit -s` is not the only way to write
+          # one. Fed by here-string, never by a pipe: `grep -q` exits on first
+          # match, and under `pipefail` a SIGPIPE'd upstream would turn a
+          # *found* trailer into a non-zero status.
+          trailer_re='^signed-off-by:[[:space:]]+[^<]+[[:space:]]+<[^[:space:]@<>]+@[^[:space:]@<>]+>[[:space:]]*$'
+
+          missing=0
+          checked=0
+
+          while read -r sha; do
+            [ -n "$sha" ] || continue
+            author_name="$(git show -s --format='%an' "$sha")"
+            subject="$(git show -s --format='%s' "$sha")"
+            short="${sha:0:8}"
+
+            case "$author_name" in
+              *'[bot]')
+                echo "skip  ${short}  ${subject}  (bot author: ${author_name})"
+                continue
+                ;;
+            esac
+
+            checked=$((checked + 1))
+            body="$(git show -s --format='%B' "$sha" | tr -d '\r')"
+
+            if grep -qiE "$trailer_re" <<< "$body"; then
+              echo "ok    ${short}  ${subject}"
+            else
+              echo "FAIL  ${short}  ${subject}"
+              echo "::error::dco: commit ${short} has no well-formed Signed-off-by trailer"
+              missing=$((missing + 1))
+            fi
+          done < <(git rev-list --no-merges "${base_sha}..${HEAD_SHA}")
+
+          echo
+          echo "checked ${checked} commit(s); ${missing} missing a sign-off."
+
+          if [ "$missing" -gt 0 ]; then
+            cat >&2 <<'EOF'
+
+          Every commit must carry a Signed-off-by trailer (see
+          CONTRIBUTING.md). To add one to the commits already on this branch:
+
+              git rebase --signoff origin/<base branch>
+              git push --force-with-lease
+
+          and use `git commit -s` from here on.
+          EOF
+            exit 1
+          fi

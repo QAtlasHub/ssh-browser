@@ -1,0 +1,70 @@
+# cargo-deny configuration
+# Run: cargo deny check
+# Schema: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+
+[advisories]
+db-urls    = ["https://github.com/rustsec/advisory-db"]
+yanked     = "deny"
+ignore     = []
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    # Community Data License Agreement -- Permissive 2.0. Used by transitive
+    # data-bearing crates (webpki-roots / public-suffix in the rustls stack).
+    # Permissive and compatible with MIT distribution.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# ----------------------------------------------------------------------
+# Banned crates.
+#
+# Ported from doiget, minus its HTTP-server bans. doiget forbids axum, warp and
+# friends because its only transport is stdio; here an HTTP server IS the
+# product, so that class of ban would forbid the thing being built. The rest of
+# doiget's reasoning carries over unchanged and matters more here, not less: this
+# daemon reads files off other people's machines, so it must not phone home, must
+# not update itself, and must not grow a second TLS stack.
+# ----------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards         = "deny"
+
+deny = [
+    # Telemetry / phone-home. A tool holding a view of a remote filesystem has
+    # no business reporting anything anywhere.
+    { name = "sentry" },
+    { name = "sentry-anyhow" },
+    { name = "sentry-tracing" },
+    { name = "posthog" },
+    { name = "google-analytics" },
+
+    # Self-update: the daemon is invoked from a shell and must not rewrite its
+    # own binary behind the user.
+    { name = "self_update" },
+    { name = "self-update" },
+
+    # OpenSSL family. When the https mode lands its TLS will be rustls; a second
+    # stack pulled in transitively would widen the attack surface silently.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
