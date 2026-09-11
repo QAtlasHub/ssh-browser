@@ -14,6 +14,7 @@
 pub mod guard;
 pub mod mime;
 pub mod pac;
+pub mod range;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,7 +23,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH, LOCATION};
+use hyper::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_RANGE, CONTENT_TYPE, ETAG, HOST, HeaderName,
+    IF_NONE_MATCH, IF_RANGE, LOCATION, RANGE,
+};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -31,7 +35,19 @@ use tokio::net::TcpListener;
 
 use crate::cache::{self, Cache};
 use crate::fs::sftp::SftpFs;
-use crate::fs::{Entry, RemoteFs};
+use crate::fs::{Entry, RangeReq, RemoteFs};
+
+/// A file worth holding whole. Anything larger is served by range and not cached: a
+/// seek into a video must not pull the entire file, and holding one would evict every
+/// page body that makes a revisit free.
+const CACHE_WHOLE_MAX: u64 = 8 * 1024 * 1024;
+
+/// The request headers that change what is served rather than what is found.
+struct Conditions {
+    if_none_match: Option<String>,
+    range: Option<String>,
+    if_range: Option<String>,
+}
 
 pub struct Alias {
     pub name: String,
@@ -101,24 +117,22 @@ impl Origin {
             return fail(StatusCode::BAD_REQUEST, "request carries no Host");
         };
         let path = req.uri().path().to_string();
-        let inm = req
-            .headers()
-            .get(IF_NONE_MATCH)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let cond = Conditions {
+            if_none_match: header(&req, IF_NONE_MATCH),
+            range: header(&req, RANGE),
+            if_range: header(&req, IF_RANGE),
+        };
 
         match guard::classify(&host, &path, &self.suffix, self.port) {
             // Refusing by Host is the DNS-rebinding defence, not a malfunction, so
             // it says why rather than failing blankly.
             Err(e) => fail(StatusCode::FORBIDDEN, format!("{e:#}")),
-            Ok(guard::Target::Direct { path }) => self.direct(path, inm.as_deref()).await,
-            Ok(guard::Target::Alias { alias, path }) => {
-                self.alias(alias, path, inm.as_deref()).await
-            }
+            Ok(guard::Target::Direct { path }) => self.direct(path, &cond).await,
+            Ok(guard::Target::Alias { alias, path }) => self.alias(alias, path, &cond).await,
         }
     }
 
-    async fn direct(&self, path: &str, inm: Option<&str>) -> Response<Full<Bytes>> {
+    async fn direct(&self, path: &str, cond: &Conditions) -> Response<Full<Bytes>> {
         if path == "/proxy.pac" {
             return match pac::script(&self.suffix, self.port) {
                 Ok(body) => plain_ok("application/x-ns-proxy-autoconfig", Bytes::from(body)),
@@ -132,10 +146,10 @@ impl Origin {
         }
 
         let (alias, sub) = rest.split_once('/').unwrap_or((rest, ""));
-        self.alias(alias, &format!("/{sub}"), inm).await
+        self.alias(alias, &format!("/{sub}"), cond).await
     }
 
-    async fn alias(&self, alias: &str, path: &str, inm: Option<&str>) -> Response<Full<Bytes>> {
+    async fn alias(&self, alias: &str, path: &str, cond: &Conditions) -> Response<Full<Bytes>> {
         let Some(session) = self.sessions.get(alias) else {
             return fail(StatusCode::NOT_FOUND, format!("no alias named {alias:?}"));
         };
@@ -230,16 +244,61 @@ impl Origin {
         // The conditional GET never leaves this process: the validator came from the
         // cached listing, so a browser already holding the current copy is answered
         // with zero remote round trips. That is invariant 2.
-        // Nested rather than written as a let-chain: those stabilised in 1.88 and
-        // the declared MSRV here is 1.85.
-        if let (Some(tag), Some(header)) = (tag.as_deref(), inm) {
+        //
+        // Nested rather than written as a let-chain: those stabilised in 1.88 and the
+        // declared MSRV here is 1.85.
+        if let (Some(tag), Some(header)) = (tag.as_deref(), cond.if_none_match.as_deref()) {
             if cache::etag_matches(header, tag) {
                 return not_modified(tag);
             }
         }
 
+        // Size comes from the listing, which is what makes a range answerable without
+        // first fetching the file to discover how long it is.
+        let size = attrs.size.unwrap_or(0);
+        let wanted = match cond.range.as_deref() {
+            Some(header) => range::resolve(header, cond.if_range.as_deref(), size),
+            None => range::Resolved::Whole,
+        };
+        if wanted == range::Resolved::Unsatisfiable {
+            return unsatisfiable(size);
+        }
+
+        // A body already held answers a range by slicing, with no round trip at all.
         if let Some(body) = self.cache.body(&file, &attrs) {
-            return served(mime::guess(&file), body, tag.as_deref());
+            return respond(&file, body, tag.as_deref(), &wanted, size);
+        }
+
+        // Too large to hold: fetch only what was asked for. This branch is what makes
+        // seeking in a video possible. Without it a seek pulls the whole file, and
+        // holding that file would evict every page body that makes a revisit free.
+        if let range::Resolved::Part { start, end } = wanted {
+            if size > CACHE_WHOLE_MAX {
+                let req = RangeReq {
+                    path: file.clone(),
+                    offset: start,
+                    len: end - start + 1,
+                };
+                let mut got = session.fs.read_ranges(std::slice::from_ref(&req)).await;
+                return match got.pop() {
+                    Some(Ok(body)) => partial(
+                        mime::guess(&file),
+                        Bytes::from(body),
+                        tag.as_deref(),
+                        start,
+                        end,
+                        size,
+                    ),
+                    Some(Err(e)) => {
+                        self.cache.forget_listing(&chain[last].0);
+                        fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}"))
+                    }
+                    None => fail(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "read_ranges returned no result",
+                    ),
+                };
+            }
         }
 
         let mut got = session.fs.read_batch(std::slice::from_ref(&file)).await;
@@ -247,11 +306,11 @@ impl Origin {
             Some(Ok(body)) => {
                 let body = Bytes::from(body);
                 self.cache.put_body(&file, &attrs, body.clone());
-                served(mime::guess(&file), body, tag.as_deref())
+                respond(&file, body, tag.as_deref(), &wanted, size)
             }
-            // The listing promised this file and the remote refused it, so the
-            // listing is wrong. Holding it for the rest of its TTL would repeat the
-            // same wrong answer.
+            // The listing promised this file and the remote refused it, so the listing
+            // is wrong. Holding it for the rest of its TTL would repeat the same wrong
+            // answer.
             Some(Err(e)) => {
                 self.cache.forget_listing(&chain[last].0);
                 fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}"))
@@ -327,6 +386,77 @@ fn components(base: &str, file: &str) -> Vec<(String, String)> {
     out
 }
 
+fn header<B>(req: &Request<B>, name: HeaderName) -> Option<String> {
+    req.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Serve a body already in hand, whole or sliced.
+fn respond(
+    file: &str,
+    body: Bytes,
+    tag: Option<&str>,
+    wanted: &range::Resolved,
+    size: u64,
+) -> Response<Full<Bytes>> {
+    match wanted {
+        range::Resolved::Part { start, end } => {
+            // Clamped against the body actually held rather than the advertised size,
+            // so a listing that disagrees with the file cannot panic the slice.
+            let lo = usize::try_from(*start)
+                .unwrap_or(usize::MAX)
+                .min(body.len());
+            let hi = usize::try_from(end.saturating_add(1))
+                .unwrap_or(usize::MAX)
+                .min(body.len())
+                .max(lo);
+            partial(
+                mime::guess(file),
+                body.slice(lo..hi),
+                tag,
+                *start,
+                *end,
+                size,
+            )
+        }
+        _ => served(mime::guess(file), body, tag),
+    }
+}
+
+fn partial(
+    content_type: &str,
+    body: Bytes,
+    tag: Option<&str>,
+    start: u64,
+    end: u64,
+    size: u64,
+) -> Response<Full<Bytes>> {
+    let mut b = Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header(CONTENT_TYPE, content_type)
+        .header(CACHE_CONTROL, "no-cache")
+        .header(ACCEPT_RANGES, "bytes")
+        .header(CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
+    if let Some(tag) = tag {
+        b = b.header(ETAG, tag);
+    }
+    b.body(Full::new(body))
+        .unwrap_or_else(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "malformed 206"))
+}
+
+/// A 416 has to carry the real size, or a client cannot work out what it should have
+/// asked for instead.
+fn unsatisfiable(size: u64) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CONTENT_RANGE, format!("bytes */{size}"))
+        .body(Full::new(Bytes::from_static(b"range not satisfiable")))
+        .unwrap_or_else(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "malformed 416"))
+}
+
 fn host_of<B>(req: &Request<B>) -> Option<String> {
     // A proxied request has an absolute-form target; a direct one only has the
     // header. Prefer the header, since that is what the browser actually sent.
@@ -344,7 +474,10 @@ fn served(content_type: &str, body: Bytes, tag: Option<&str>) -> Response<Full<B
         // `no-cache` means revalidate, not "do not store". With an ETag attached
         // that revalidation is a 304 answered from the listing cache, so the
         // browser keeps its copy and the remote is never touched.
-        .header(CACHE_CONTROL, "no-cache");
+        .header(CACHE_CONTROL, "no-cache")
+        // Advertised on every full response: a client that does not know ranges are
+        // available will never try to seek.
+        .header(ACCEPT_RANGES, "bytes");
     if let Some(tag) = tag {
         b = b.header(ETAG, tag);
     }
@@ -444,7 +577,24 @@ mod tests {
     use super::*;
     use crate::sftp::wire::Attrs;
     use crate::testing::{FakeRemote, dir_attrs, file_attrs, symlink_attrs};
-    use http_body_util::Empty;
+    use http_body_util::{BodyExt, Empty};
+
+    async fn body_of(res: Response<Full<Bytes>>) -> Bytes {
+        res.into_body()
+            .collect()
+            .await
+            .expect("a Full body always collects")
+            .to_bytes()
+    }
+
+    fn ranged(path: &str, range: &str) -> Request<Empty<Bytes>> {
+        Request::builder()
+            .uri(format!("http://docs.ssh-browser{path}"))
+            .header(HOST, "docs.ssh-browser")
+            .header(RANGE, range)
+            .body(Empty::new())
+            .expect("request builds")
+    }
 
     /// Build an origin over an in-memory remote. The session is a real `SftpFs`, so
     /// the round trips counted below are the same ones production would pay.
@@ -750,6 +900,123 @@ mod tests {
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
             Some("text/html; charset=utf-8")
+        );
+    }
+
+    /// A range out of a body already held costs nothing: the slice happens here.
+    #[tokio::test]
+    async fn a_range_is_sliced_out_of_the_cached_body() {
+        let origin = origin_with(one_page()).await;
+        assert_eq!(
+            origin.handle(get("/a.html", None)).await.status(),
+            StatusCode::OK
+        );
+        let warm = trips(&origin);
+
+        let res = origin.handle(ranged("/a.html", "bytes=1-3")).await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            res.headers()
+                .get(CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes 1-3/5")
+        );
+        assert_eq!(&body_of(res).await[..], b"ell");
+        assert_eq!(
+            trips(&origin),
+            warm,
+            "slicing a held body must cost no round trip"
+        );
+    }
+
+    /// A range on a file not yet held still works, and the file ends up held.
+    #[tokio::test]
+    async fn a_range_on_a_cold_small_file_works_and_warms_the_cache() {
+        let origin = origin_with(one_page()).await;
+
+        let res = origin.handle(ranged("/a.html", "bytes=0-1")).await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body_of(res).await[..], b"he");
+
+        let warm = trips(&origin);
+        let again = origin.handle(ranged("/a.html", "bytes=2-4")).await;
+        assert_eq!(&body_of(again).await[..], b"llo");
+        assert_eq!(
+            trips(&origin),
+            warm,
+            "a small file fetched for a range should be held whole"
+        );
+    }
+
+    /// The 416 has to name the real size, or a client cannot correct itself.
+    #[tokio::test]
+    async fn a_range_past_the_end_is_a_416_carrying_the_real_size() {
+        let origin = origin_with(one_page()).await;
+        let res = origin.handle(ranged("/a.html", "bytes=99-")).await;
+        assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            res.headers()
+                .get(CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes */5")
+        );
+    }
+
+    /// A client that is not told ranges exist will never seek.
+    #[tokio::test]
+    async fn a_full_response_advertises_ranges() {
+        let origin = origin_with(one_page()).await;
+        let res = origin.handle(get("/a.html", None)).await;
+        assert_eq!(
+            res.headers()
+                .get(ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes")
+        );
+    }
+
+    /// The validator on offer is weak, so `If-Range` cannot be honoured. The whole
+    /// representation is the specified answer, not a 412 and not a 206.
+    #[tokio::test]
+    async fn if_range_yields_the_whole_file() {
+        let origin = origin_with(one_page()).await;
+        let req = Request::builder()
+            .uri("http://docs.ssh-browser/a.html")
+            .header(HOST, "docs.ssh-browser")
+            .header(RANGE, "bytes=1-3")
+            .header(IF_RANGE, "W/\"64-5\"")
+            .body(Empty::<Bytes>::new())
+            .expect("request builds");
+
+        let res = origin.handle(req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(&body_of(res).await[..], b"hello");
+    }
+
+    /// The branch that makes a video seekable: a file too big to hold is fetched by
+    /// range and not cached, so a seek does not pull the whole thing.
+    #[tokio::test]
+    async fn a_large_file_is_served_by_range_and_not_held() {
+        let body: Vec<u8> = (0..64u8).collect();
+        let origin = origin_with(
+            FakeRemote::new()
+                // Declared far larger than the cache threshold; the body behind it is
+                // small because what is under test is the branch, not the bytes.
+                .dir("/srv", vec![("big.bin", file_attrs(9 * 1024 * 1024, 7))])
+                .file("/srv/big.bin", &body),
+        )
+        .await;
+
+        let res = origin.handle(ranged("/big.bin", "bytes=0-9")).await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body_of(res).await[..], &body[0..10]);
+
+        let after = trips(&origin);
+        let second = origin.handle(ranged("/big.bin", "bytes=10-19")).await;
+        assert_eq!(&body_of(second).await[..], &body[10..20]);
+        assert!(
+            trips(&origin) > after,
+            "a file over the threshold must not be held"
         );
     }
 }

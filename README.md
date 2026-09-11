@@ -97,7 +97,12 @@ symlink-ness and the validator, so a second request for the same page is served
 without touching the remote, and a browser holding the current copy gets a `304`
 decided inside this process. Against a host at 18 ms RTT: 184 ms cold, 1.6 ms warm.
 
-Not there yet: `Range`, annotations, collaborative editing.
+Ranges work, so video and PDF seek. A file over 8 MB is served by range and not
+cached, so a seek does not pull the whole file and does not evict the page bodies that
+make revisits free. `If-Range` is never honoured, because the only validator on offer
+is weak and the whole representation is the specified answer to that.
+
+Not there yet: annotations, collaborative editing.
 
 ```
 cargo run --bin measure-roundtrips -- <ssh-host> [remote-dir]

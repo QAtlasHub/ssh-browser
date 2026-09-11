@@ -173,11 +173,16 @@ where
                 let handle = d.str().expect("read handle").to_vec();
                 let path = path_of(&handle).expect("read handle shape");
                 let offset = d.u64().expect("read offset") as usize;
+                // The requested length is honoured, as a real server does. Returning
+                // everything from the offset would hide a caller that asked for the
+                // wrong amount.
+                let want = d.u32().expect("read length") as usize;
                 let body = remote.files.get(&path).expect("opened file exists");
                 if offset >= body.len() {
                     (STATUS, status(id, SSH_FX_EOF, "eof"))
                 } else {
-                    (DATA, Enc::new().u32(id).str(&body[offset..]).done())
+                    let end = offset.saturating_add(want).min(body.len());
+                    (DATA, Enc::new().u32(id).str(&body[offset..end]).done())
                 }
             }
             CLOSE => {
