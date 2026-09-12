@@ -39,6 +39,7 @@ use crate::cache::{self, Cache};
 use crate::control::{self, Token};
 use crate::fs::sftp::SftpFs;
 use crate::fs::{Entry, RangeReq, RemoteFs};
+use crate::prefetch;
 use crate::sftp::wire::Attrs;
 
 /// A file worth holding whole. Anything larger is served by range and not cached: a
@@ -373,6 +374,13 @@ impl Origin {
             Some(Ok(body)) => {
                 let body = Bytes::from(body);
                 self.cache.put_body(&file, &attrs, body.clone());
+                // Before answering, not after. The browser will ask for this page's
+                // subresources six at a time, and each wave it has to discover is a round
+                // trip; fetching them here costs one and makes the waves cache hits. Waiting
+                // also makes the invariant a guarantee rather than a race with the browser.
+                if mime::guess(&file).starts_with("text/html") {
+                    self.warm_subresources(session, path, &body).await;
+                }
                 respond(&file, body, tag.as_deref(), &wanted, size)
             }
             // The listing promised this file and the remote refused it, so the listing
@@ -552,17 +560,110 @@ impl Origin {
         }
     }
 
+    /// Read what an HTML page is about to ask for, in one batch.
+    ///
+    /// Two round trips at most and neither grows with the number of subresources: one to list
+    /// the directories they live in, one to read them. When they sit beside the document —
+    /// which is what a generated report looks like — the listing is already held and it is
+    /// one.
+    ///
+    /// Every reference goes through the same resolution and the same symlink rule as a real
+    /// request, on purpose. A page is untrusted input, and a prefetcher that skipped those
+    /// checks could be told to read a file the operator's configuration says is out of
+    /// bounds. Serving it would still be refused, but reading it is already the wrong act.
+    ///
+    /// Failures are dropped in silence here, which is the one place in this codebase that is
+    /// right: a reference that cannot be read is about to be requested for real, and that
+    /// request reports the failure properly. Saying anything now would be guessing at whether
+    /// the reader was going to care.
+    async fn warm_subresources(&self, session: &Session, doc_path: &str, html: &[u8]) {
+        let refs = prefetch::scan(html, prefetch::MAX_SUBRESOURCES);
+        if refs.is_empty() {
+            return;
+        }
+        // The directory the document is in, in URL terms, which is what a relative reference
+        // on the page is relative to.
+        let dir_of_doc = match doc_path.rsplit_once('/') {
+            Some((head, _)) => head,
+            None => "",
+        };
+
+        // Resolved first, so that a reference climbing out of the base is gone before it can
+        // contribute a directory to list.
+        let mut wanted: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for r in &refs {
+            let url = if r.starts_with('/') {
+                r.clone()
+            } else {
+                format!("{dir_of_doc}/{r}")
+            };
+            let Ok(resolved) = guard::resolve(&session.base, &url) else {
+                continue;
+            };
+            let chain = components(&session.base, &resolved);
+            if chain.is_empty() {
+                continue;
+            }
+            // Checked against what is already known before anything new is listed. Without
+            // this a page could get a directory behind a symlink listed purely by naming it,
+            // and the symlink rule exists precisely so that the daemon does not go there.
+            // The check runs again after the listings, for components not yet known.
+            if self.first_symlink(&chain).is_some() {
+                continue;
+            }
+            wanted.push((resolved, chain));
+        }
+
+        let all: Vec<(String, String)> = wanted.iter().flat_map(|(_, c)| c.clone()).collect();
+        self.warm_ancestor_listings(session, &all).await;
+
+        let mut to_read = Vec::new();
+        for (resolved, chain) in &wanted {
+            if self.first_symlink(chain).is_some() {
+                continue;
+            }
+            let (dir, name) = &chain[chain.len() - 1];
+            let Some(attrs) = self.cache.attrs_of(dir, name) else {
+                continue;
+            };
+            // A directory is not a subresource, and a file too large to hold would be read
+            // only to be declined by the cache and read again by the real request.
+            if attrs.is_dir() || attrs.size.unwrap_or(0) > CACHE_WHOLE_MAX {
+                continue;
+            }
+            if self.cache.body(resolved, &attrs).is_some() {
+                continue;
+            }
+            to_read.push((resolved.clone(), attrs));
+        }
+        if to_read.is_empty() {
+            return;
+        }
+
+        let paths: Vec<String> = to_read.iter().map(|(p, _)| p.clone()).collect();
+        for ((path, attrs), got) in to_read.iter().zip(session.fs.read_batch(&paths).await) {
+            if let Ok(body) = got {
+                self.cache.put_body(path, attrs, Bytes::from(body));
+            }
+        }
+    }
+
     /// Fetch every ancestor listing not already held, in one batch.
     ///
     /// One round trip regardless of depth, which is the whole reason `list_dirs` is a batch
     /// rather than a loop. A directory that cannot be listed is simply left absent from the
     /// cache; the caller diagnoses that against the path the request actually named.
     async fn warm_ancestor_listings(&self, session: &Session, chain: &[(String, String)]) {
-        let missing: Vec<String> = chain
+        let mut missing: Vec<String> = chain
             .iter()
             .map(|(dir, _)| dir.clone())
             .filter(|dir| !self.cache.has_listing(dir))
             .collect();
+        // Deduplicated because the prefetcher passes the chains of many files at once, and
+        // several of them normally share a directory. Listing one twice in a batch costs no
+        // extra round trip but it does cost the remote the work.
+        missing.sort();
+        missing.dedup();
         if missing.is_empty() {
             return;
         }
@@ -966,6 +1067,151 @@ mod tests {
         FakeRemote::new()
             .dir("/srv", vec![("a.html", file_attrs(5, 100))])
             .file("/srv/a.html", b"hello")
+    }
+
+    /// A page with subresources in a sibling directory, which is the shape a generated
+    /// report has: one HTML file and an `assets/` beside it.
+    fn page_with_subresources(n: usize) -> FakeRemote {
+        let mut html = String::from(
+            "<!doctype html><html><head><link rel=\"stylesheet\" href=\"assets/style.css\"><script src=\"assets/app.js\"></script></head><body>",
+        );
+        for i in 0..n {
+            html.push_str(&format!("<img src=\"assets/{i}.png\">"));
+        }
+        html.push_str("</body></html>");
+
+        let mut assets = vec!["style.css".to_string(), "app.js".to_string()];
+        assets.extend((0..n).map(|i| format!("{i}.png")));
+
+        let mut remote = FakeRemote::new()
+            .dir(
+                "/srv",
+                vec![
+                    ("index.html", file_attrs(html.len() as u64, 100)),
+                    ("assets", dir_attrs()),
+                ],
+            )
+            .dir(
+                "/srv/assets",
+                assets
+                    .iter()
+                    .map(|name| (name.as_str(), file_attrs(3, 1)))
+                    .collect(),
+            )
+            .file("/srv/index.html", html.as_bytes());
+        for name in &assets {
+            remote = remote.file(&format!("/srv/assets/{name}"), b"xxx");
+        }
+        remote
+    }
+
+    /// The subresource half of invariant 1, which is about the browser rather than the
+    /// remote. HTTP/1.1 allows six connections per origin, so forty subresources are seven
+    /// waves of requests and each wave the browser has to discover is a round trip.
+    ///
+    /// Asking for them one at a time is the worst case any browser can produce. If that
+    /// costs nothing, no arrangement of waves can cost anything either.
+    #[tokio::test]
+    async fn a_pages_subresources_are_already_held_when_the_browser_asks_for_them() {
+        const N: usize = 40;
+        let origin = origin_with(page_with_subresources(N)).await;
+
+        let res = origin.handle(get("/index.html", None)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let before = trips(&origin);
+        for i in 0..N {
+            let path = format!("/assets/{i}.png");
+            let res = origin.handle(get(&path, None)).await;
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            assert_eq!(&body_of(res).await[..], b"xxx", "{path}");
+        }
+        for name in ["style.css", "app.js"] {
+            let res = origin.handle(get(&format!("/assets/{name}"), None)).await;
+            assert_eq!(res.status(), StatusCode::OK, "{name}");
+        }
+
+        assert_eq!(
+            trips(&origin) - before,
+            0,
+            "reading the page's own references is what makes these free"
+        );
+    }
+
+    /// And the page itself does not get more expensive as it gains subresources: the
+    /// listings are one batch and the reads are another, whatever the count.
+    #[tokio::test]
+    async fn serving_a_page_costs_the_same_however_many_subresources_it_has() {
+        async fn cost(n: usize) -> u64 {
+            let origin = origin_with(page_with_subresources(n)).await;
+            let before = trips(&origin);
+            let res = origin.handle(get("/index.html", None)).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            trips(&origin) - before
+        }
+        assert_eq!(cost(4).await, cost(40).await);
+    }
+
+    /// One HTML page naming whatever it likes, for the two tests below. The page is
+    /// untrusted input, and prefetching is the first thing in this daemon that acts on what
+    /// a page says rather than on what the reader asked for.
+    fn page_referring_to(refs: &[&str], extra: Vec<(&'static str, Attrs)>) -> FakeRemote {
+        let mut html = String::from("<!doctype html><html><body>");
+        for r in refs {
+            html.push_str(&format!("<img src=\"{r}\">"));
+        }
+        html.push_str("</body></html>");
+
+        let mut entries = vec![("index.html", file_attrs(html.len() as u64, 100))];
+        entries.extend(extra);
+        FakeRemote::new()
+            .dir("/srv", entries)
+            .file("/srv/index.html", html.as_bytes())
+    }
+
+    async fn cost_of_serving(refs: &[&str], extra: Vec<(&'static str, Attrs)>) -> u64 {
+        let origin = origin_with(page_referring_to(refs, extra)).await;
+        let before = trips(&origin);
+        let res = origin.handle(get("/index.html", None)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        trips(&origin) - before
+    }
+
+    /// A reference that climbs out of the alias base must not be read. The check is the
+    /// same `resolve` the request path uses, not a second copy that could drift from it.
+    #[tokio::test]
+    async fn a_page_cannot_prefetch_its_way_out_of_the_alias_base() {
+        let baseline = cost_of_serving(&[], vec![]).await;
+        assert_eq!(
+            cost_of_serving(&["../../../etc/passwd", "/../../etc/shadow"], vec![]).await,
+            baseline,
+            "an escaping reference is gone before anything is listed or read"
+        );
+    }
+
+    /// Nor through a symlink — and not even as far as listing it. A page that could get the
+    /// directory a symlink points at listed would have defeated the rule by naming it.
+    #[tokio::test]
+    async fn a_page_cannot_prefetch_through_a_symlink() {
+        let link = || vec![("link", symlink_attrs())];
+        let baseline = cost_of_serving(&[], link()).await;
+        assert_eq!(
+            cost_of_serving(&["link/inside.png"], link()).await,
+            baseline,
+            "the symlink is known from the listing the page itself needed"
+        );
+
+        // And the ordinary request for it is still refused, which is the guarantee the
+        // prefetcher is being held to rather than a separate one.
+        let origin = origin_with(page_referring_to(&["link/inside.png"], link())).await;
+        assert_eq!(
+            origin.handle(get("/index.html", None)).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            origin.handle(get("/link/inside.png", None)).await.status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     /// The same single file, four directories down.

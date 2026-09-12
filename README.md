@@ -45,6 +45,18 @@ VERDICT pipelined: 1.90 tau at n=40 (serial would cost about 40)
 Forty opens cost one round trip; serial would cost forty. The reads carry 400 KB, so their extra tau is
 bandwidth rather than latency. The same verdict holds across a ProxyJump hop.
 
+That covers the remote. The other half of invariant 1 is the browser, which fetches subresources six at
+a time over HTTP/1.1: forty of them is seven waves, and each wave it has to discover is another round
+trip. So an HTML page is read for its own `<link>`, `<script>` and `<img>` references, and those are
+fetched in one batch before the page is answered. A page with forty subresources costs **87 remote round
+trips without that and 0 with it** — measured by serving every subresource one at a time, which is the
+worst case any browser can produce.
+
+A page is untrusted input, so a reference is resolved and symlink-checked exactly as a real request is,
+by the same code rather than a second copy of the rule. The scan itself is a heuristic and can only ever
+affect speed: a reference it misses is fetched normally, and one it invents is a read that fails and is
+dropped.
+
 ## URLs
 
 ```
