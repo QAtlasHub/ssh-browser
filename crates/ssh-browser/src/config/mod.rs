@@ -100,6 +100,53 @@ pub fn default_path() -> Option<PathBuf> {
     Some(base.join("ssh-browser").join("config.toml"))
 }
 
+pub const DEFAULT_PORT: u16 = 7391;
+pub const DEFAULT_SUFFIX: &str = "ssh-browser";
+
+/// What the command line said, all of it optional because anything it leaves out the file may
+/// supply and anything neither supplies has a default.
+#[derive(Debug, Default)]
+pub struct Overrides {
+    pub port: Option<u16>,
+    pub suffix: Option<String>,
+    pub author: Option<String>,
+    pub aliases: Vec<Alias>,
+}
+
+/// What the daemon will actually run with.
+#[derive(Debug)]
+pub struct Resolved {
+    pub port: u16,
+    pub suffix: String,
+    pub author: String,
+    pub aliases: Vec<Alias>,
+}
+
+/// Fold the command line over the file.
+///
+/// Lives here rather than inside `main` so that it can be tested at all: the precedence is
+/// three `or`s and an `extend`, any one of which could be turned around without a single test
+/// noticing, and the result decides which host a URL reaches.
+///
+/// The command line wins, because it is what was typed for this run. Aliases are the
+/// exception and are added rather than replacing: naming one host on the command line should
+/// not silently drop the six in the file.
+pub fn merge(cli: Overrides, file: Config, default_author: String) -> Result<Resolved> {
+    let mut aliases = file.aliases;
+    aliases.extend(cli.aliases);
+    ensure_distinct(&aliases)?;
+
+    Ok(Resolved {
+        port: cli.port.or(file.server.port).unwrap_or(DEFAULT_PORT),
+        suffix: cli
+            .suffix
+            .or(file.server.suffix)
+            .unwrap_or_else(|| DEFAULT_SUFFIX.to_string()),
+        author: cli.author.or(file.server.author).unwrap_or(default_author),
+        aliases,
+    })
+}
+
 /// Refuse two aliases with the same name.
 ///
 /// One would shadow the other in the session map, and which one survived would depend on the
@@ -211,6 +258,104 @@ base = "/home/me/public_html"
     #[test]
     fn a_missing_alias_field_is_refused() {
         assert!(parse("[[alias]]\nname = \"docs\"\nhost = \"h\"\n").is_err());
+    }
+
+    fn alias(name: &str, host: &str) -> Alias {
+        Alias::new(name, host, "/srv").expect("a valid alias")
+    }
+
+    fn file_with(server: Server, aliases: Vec<Alias>) -> Config {
+        Config { server, aliases }
+    }
+
+    /// What was typed for this run wins over what was written down for every run.
+    #[test]
+    fn the_command_line_wins_over_the_file() {
+        let file = file_with(
+            Server {
+                port: Some(1111),
+                suffix: Some("from-file".to_string()),
+                author: Some("from-file".to_string()),
+                scheme: None,
+            },
+            vec![],
+        );
+        let cli = Overrides {
+            port: Some(2222),
+            suffix: Some("from-cli".to_string()),
+            author: Some("from-cli".to_string()),
+            aliases: vec![],
+        };
+
+        let r = merge(cli, file, "fallback".to_string()).expect("merges");
+        assert_eq!(r.port, 2222);
+        assert_eq!(r.suffix, "from-cli");
+        assert_eq!(r.author, "from-cli");
+    }
+
+    #[test]
+    fn the_file_supplies_what_the_command_line_does_not() {
+        let file = file_with(
+            Server {
+                port: Some(1111),
+                suffix: Some("from-file".to_string()),
+                author: None,
+                scheme: None,
+            },
+            vec![],
+        );
+
+        let r = merge(Overrides::default(), file, "fallback".to_string()).expect("merges");
+        assert_eq!(r.port, 1111);
+        assert_eq!(r.suffix, "from-file");
+        // Neither said, so the default stands.
+        assert_eq!(r.author, "fallback");
+    }
+
+    #[test]
+    fn what_neither_supplies_falls_back() {
+        let r = merge(
+            Overrides::default(),
+            file_with(Server::default(), vec![]),
+            "fallback".to_string(),
+        )
+        .expect("merges");
+        assert_eq!(r.port, DEFAULT_PORT);
+        assert_eq!(r.suffix, DEFAULT_SUFFIX);
+    }
+
+    /// Added, not replaced. Naming one host on the command line must not drop the ones in the
+    /// file, which is the difference between an override and an amendment.
+    #[test]
+    fn aliases_from_both_places_are_kept() {
+        let r = merge(
+            Overrides {
+                aliases: vec![alias("cli", "h")],
+                ..Overrides::default()
+            },
+            file_with(Server::default(), vec![alias("file", "h")]),
+            "fallback".to_string(),
+        )
+        .expect("merges");
+
+        let names: Vec<&str> = r.aliases.iter().map(Alias::name).collect();
+        assert_eq!(names, ["file", "cli"]);
+    }
+
+    /// And a name in both places is a collision, because whichever won would depend on the
+    /// order they happened to be added in.
+    #[test]
+    fn a_name_given_in_both_places_is_refused() {
+        let e = merge(
+            Overrides {
+                aliases: vec![alias("docs", "from-cli")],
+                ..Overrides::default()
+            },
+            file_with(Server::default(), vec![alias("docs", "from-file")]),
+            "fallback".to_string(),
+        )
+        .expect_err("refused");
+        assert!(format!("{e:#}").contains("docs"), "{e:#}");
     }
 
     #[test]

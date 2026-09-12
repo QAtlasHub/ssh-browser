@@ -9,9 +9,6 @@ use ssh_browser::origin::{Alias, Origin, pac};
 
 const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--author NAME] [<alias>=<ssh-host>:<base> ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"/srv/docs\"";
 
-const DEFAULT_PORT: u16 = 7391;
-const DEFAULT_SUFFIX: &str = "ssh-browser";
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -20,41 +17,32 @@ async fn main() -> Result<()> {
     };
 
     let mut named_config: Option<PathBuf> = None;
-    let mut port: Option<u16> = None;
-    let mut suffix: Option<String> = None;
-    let mut author: Option<String> = None;
-    let mut cli_aliases = Vec::new();
+    let mut cli = config::Overrides::default();
 
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
+    // Driven by an iterator rather than an index, so the number of tokens consumed is the
+    // number actually taken. With a hand-kept counter, an arm that forgets its step silently
+    // reparses its own value as the next argument.
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
             "--config" => {
-                named_config = Some(PathBuf::from(
-                    rest.get(i + 1).context("--config needs a path")?,
-                ));
-                i += 2;
+                named_config = Some(PathBuf::from(args.next().context("--config needs a path")?));
             }
             "--port" => {
-                port = Some(
-                    rest.get(i + 1)
+                cli.port = Some(
+                    args.next()
                         .context("--port needs a value")?
                         .parse()
                         .context("--port must be a number")?,
                 );
-                i += 2;
             }
             "--suffix" => {
-                suffix = Some(rest.get(i + 1).context("--suffix needs a value")?.clone());
-                i += 2;
+                cli.suffix = Some(args.next().context("--suffix needs a value")?.clone());
             }
             "--author" => {
-                author = Some(rest.get(i + 1).context("--author needs a value")?.clone());
-                i += 2;
+                cli.author = Some(args.next().context("--author needs a value")?.clone());
             }
-            spec => {
-                cli_aliases.push(parse_alias(spec)?);
-                i += 1;
-            }
+            spec => cli.aliases.push(parse_alias(spec)?),
         }
     }
 
@@ -73,22 +61,12 @@ async fn main() -> Result<()> {
         aliases: Vec::new(),
     });
 
-    // The command line wins over the file, because it is the thing typed most recently and
-    // for this run only.
-    let port = port.or(from_file.server.port).unwrap_or(DEFAULT_PORT);
-    let suffix = suffix
-        .or(from_file.server.suffix)
-        .unwrap_or_else(|| DEFAULT_SUFFIX.to_string());
-    let author = author
-        .or(from_file.server.author)
-        .unwrap_or_else(default_author);
-
-    // Added to rather than replacing. Naming one alias on the command line should not
-    // silently drop the six in the file, and a name given in both places is a collision to
-    // report rather than a precedence to invent.
-    let mut aliases = from_file.aliases;
-    aliases.extend(cli_aliases);
-    config::ensure_distinct(&aliases)?;
+    let config::Resolved {
+        port,
+        suffix,
+        author,
+        aliases,
+    } = config::merge(cli, from_file, default_author())?;
 
     match command.as_str() {
         "pac" => {

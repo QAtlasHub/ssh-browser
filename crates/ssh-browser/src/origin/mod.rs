@@ -664,11 +664,10 @@ impl Origin {
     /// is what a generated report looks like, the listing is already held and the listing round
     /// disappears.
     ///
-    /// Not "two round trips at most", which is what this used to claim. `read_batch` polls in
-    /// 32 KiB chunks until it sees a short read, so a subresource larger than that costs one
-    /// round trip per chunk — a one-megabyte bundle is thirty-two, not one. That is independent
-    /// of how many subresources there are, which is what invariant 1 is about, but it is not
-    /// one, and saying so would be a claim about file size that nothing here supports.
+    /// Two at most, and it really is two. The reads go through `read_ranges` rather than
+    /// `read_batch` precisely so that this holds: `read_batch` has to poll in 32 KiB chunks
+    /// because it does not know how long a file is, which made a one-megabyte bundle
+    /// thirty-two round trips here. The listing already says how long each one is.
     ///
     /// Every reference goes through the same resolution and the same symlink rule as a real
     /// request, on purpose. A page is untrusted input, and a prefetcher that skipped those
@@ -740,25 +739,63 @@ impl Origin {
             let Some(attrs) = self.cache.attrs_of(dir, name) else {
                 continue;
             };
-            // A directory is not a subresource, and a file too large to hold would be read
-            // only to be declined by the cache and read again by the real request.
-            if attrs.is_dir() || attrs.size.unwrap_or(0) > CACHE_WHOLE_MAX {
+            if attrs.is_dir() {
+                continue;
+            }
+            // The size has to be known, and not merely defaulted to zero, because it is what
+            // the read below asks for. A listing that did not report one leaves nothing to
+            // ask for, and requesting zero bytes would cache an empty body for a file that
+            // has contents.
+            let Some(size) = attrs.size else {
+                continue;
+            };
+            // Nothing to warm at zero, and warming it is where a listing that lies about the
+            // size does damage: a ranged read asks for exactly what it was told, so a file
+            // reported as empty is fetched as empty and then served that way. A real empty
+            // file loses nothing by being read on request.
+            //
+            // A file too large to hold, at the other end, would be read only to be declined
+            // by the cache and read again by the real request anyway.
+            if size == 0 || size > CACHE_WHOLE_MAX {
                 continue;
             }
             if self.cache.body(resolved, &attrs).is_some() {
                 continue;
             }
-            to_read.push((resolved.clone(), attrs));
+            to_read.push((resolved.clone(), attrs, size));
         }
         if to_read.is_empty() {
             return;
         }
 
-        let paths: Vec<String> = to_read.iter().map(|(p, _)| p.clone()).collect();
-        for ((path, attrs), got) in to_read.iter().zip(session.fs.read_batch(&paths).await) {
-            if let Ok(body) = got {
-                self.cache.put_body(path, attrs, Bytes::from(body));
+        // `read_ranges` rather than `read_batch`, because the size is already known.
+        //
+        // `read_batch` cannot know how long a file is, so it polls in 32 KiB chunks until it
+        // sees a short read: one round trip per chunk index, which makes a one-megabyte
+        // bundle thirty-two of them. `read_ranges` is handed the length, so it computes every
+        // chunk before issuing any and the whole file costs one. The listing this function
+        // already depends on is what supplies the length, so nothing extra is asked for.
+        let reqs: Vec<RangeReq> = to_read
+            .iter()
+            .map(|(path, _, size)| RangeReq {
+                path: path.clone(),
+                offset: 0,
+                len: *size,
+            })
+            .collect();
+
+        for ((path, attrs, size), got) in to_read.iter().zip(session.fs.read_ranges(&reqs).await) {
+            let Ok(body) = got else {
+                continue;
+            };
+            // Short of what the listing promised means the file changed underneath us. The
+            // cache key records the old size, so holding a body that no longer matches it
+            // would serve the next reader a length the bytes do not have. Leaving it out
+            // costs one prefetch; the real request reads it afresh.
+            if body.len() as u64 != *size {
+                continue;
             }
+            self.cache.put_body(path, attrs, Bytes::from(body));
         }
     }
 
@@ -1431,6 +1468,185 @@ mod tests {
             trips(&origin) - before,
             0,
             "a subdirectory one level down must still be warmed"
+        );
+    }
+
+    /// A subresource larger than one read chunk costs the same as a small one.
+    ///
+    /// This is what `read_ranges` buys over `read_batch` here: a read whose length is known
+    /// can have all its chunks issued together, and a read whose length is not has to poll.
+    /// Before, a bundle of any real size cost one round trip per 32 KiB — invisible to every
+    /// other test, because they all use three-byte fixtures.
+    #[tokio::test]
+    async fn a_large_subresource_costs_what_a_small_one_costs() {
+        async fn cost(bytes: usize) -> u64 {
+            let html = "<!doctype html><html><body><img src=\"assets/big.bin\"></body></html>";
+            let origin = origin_with(
+                FakeRemote::new()
+                    .dir(
+                        "/srv",
+                        vec![
+                            ("index.html", file_attrs(html.len() as u64, 100)),
+                            ("assets", dir_attrs()),
+                        ],
+                    )
+                    .dir(
+                        "/srv/assets",
+                        vec![("big.bin", file_attrs(bytes as u64, 1))],
+                    )
+                    .file("/srv/index.html", html.as_bytes())
+                    .file("/srv/assets/big.bin", &vec![b'x'; bytes]),
+            )
+            .await;
+
+            let before = trips(&origin);
+            assert_eq!(
+                origin.handle(get("/index.html", None)).await.status(),
+                StatusCode::OK
+            );
+            let spent = trips(&origin) - before;
+
+            // And it really was warmed, so the comparison is between two prefetches rather
+            // than between a prefetch and a skip.
+            let at = trips(&origin);
+            let res = origin.handle(get("/assets/big.bin", None)).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(body_of(res).await.len(), bytes);
+            assert_eq!(
+                trips(&origin) - at,
+                0,
+                "{bytes} bytes should have been held"
+            );
+
+            spent
+        }
+
+        // Either side of the 32 KiB chunk, and well past it.
+        assert_eq!(cost(1024).await, cost(200 * 1024).await);
+    }
+
+    /// A listing that understates a file's length must not turn into an empty `200`.
+    ///
+    /// The prefetch reads a range, and a range is exactly as long as it was told to be. A
+    /// listing reporting zero bytes for a file that has some would therefore cache an empty
+    /// body — and the reader would be served it, because the cache is consulted first. This
+    /// is the failure mode `CONTRIBUTING.md` names, arriving through a new door.
+    ///
+    /// Caught by the fake reporting a size of zero where a size was not set, which is what a
+    /// real listing does when it is wrong rather than silent.
+    #[tokio::test]
+    async fn a_subresource_the_listing_calls_empty_is_not_prefetched() {
+        let html = "<!doctype html><html><body><img src=\"assets/x.png\"></body></html>";
+        let sizeless = Attrs {
+            permissions: Some(0o100644),
+            mtime: Some(1),
+            ..Attrs::default()
+        };
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir(
+                    "/srv",
+                    vec![
+                        ("index.html", file_attrs(html.len() as u64, 100)),
+                        ("assets", dir_attrs()),
+                    ],
+                )
+                .dir("/srv/assets", vec![("x.png", sizeless)])
+                .file("/srv/index.html", html.as_bytes())
+                .file("/srv/assets/x.png", b"xxx"),
+        )
+        .await;
+
+        assert_eq!(
+            origin.handle(get("/index.html", None)).await.status(),
+            StatusCode::OK
+        );
+        let res = origin.handle(get("/assets/x.png", None)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            &body_of(res).await[..],
+            b"xxx",
+            "the real request must still serve the whole file"
+        );
+    }
+
+    /// A subresource over the hold-whole limit is skipped rather than read and discarded.
+    #[tokio::test]
+    async fn an_oversized_subresource_is_not_prefetched() {
+        async fn cost(size: u64) -> u64 {
+            let html =
+                "<!doctype html><html><body><video src=\"assets/film.mp4\"></video></body></html>";
+            let origin = origin_with(
+                FakeRemote::new()
+                    .dir(
+                        "/srv",
+                        vec![
+                            ("index.html", file_attrs(html.len() as u64, 100)),
+                            ("assets", dir_attrs()),
+                        ],
+                    )
+                    .dir("/srv/assets", vec![("film.mp4", file_attrs(size, 1))])
+                    .file("/srv/index.html", html.as_bytes())
+                    .file("/srv/assets/film.mp4", b"xxx"),
+            )
+            .await;
+            let before = trips(&origin);
+            assert_eq!(
+                origin.handle(get("/index.html", None)).await.status(),
+                StatusCode::OK
+            );
+            trips(&origin) - before
+        }
+
+        // The listing is fetched either way; only the read differs. A film the cache would
+        // decline must not be pulled across the network first to find that out.
+        let read_it = cost(3).await;
+        let skipped = cost(CACHE_WHOLE_MAX + 1).await;
+        assert!(
+            skipped < read_it,
+            "an oversized subresource cost {skipped} against {read_it} for a small one"
+        );
+    }
+
+    /// The port is taken before any host is connected.
+    ///
+    /// This ordering is the whole of what a previous change set out to fix, and nothing
+    /// tested it: every other test here builds an `Origin` directly and never goes through
+    /// `bind` at all. A regression that put the ssh handshakes first would pass the entire
+    /// suite, and would cost a full set of connections before reporting the one failure an
+    /// operator can actually act on.
+    ///
+    /// Cheap to check without any ssh infrastructure, precisely because the port failing
+    /// first means the host is never reached: the error naming the bind and *not* naming the
+    /// host is the evidence.
+    #[tokio::test]
+    async fn the_port_is_taken_before_any_host_is_connected() {
+        let held = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a free port");
+        let port = held.local_addr().expect("its address").port();
+
+        const NOWHERE: &str = "a-host-that-cannot-resolve.invalid";
+        let result = Origin::bind(
+            vec![Alias::new("docs", NOWHERE, "/srv").expect("a valid alias")],
+            "ssh-browser".to_string(),
+            port,
+            Token::from_hex(TEST_TOKEN),
+            "souta".to_string(),
+        )
+        .await;
+
+        let Err(e) = result else {
+            panic!("binding a port that is already held must fail");
+        };
+        let text = format!("{e:#}");
+        assert!(
+            text.contains(&format!("bind 127.0.0.1:{port}")),
+            "the error should name the port, got: {text}"
+        );
+        assert!(
+            !text.contains(NOWHERE),
+            "the ssh host was reached before the port was taken: {text}"
         );
     }
 

@@ -140,6 +140,15 @@ fn find_close(html: &[u8], from: usize, name: &[u8]) -> Option<usize> {
     None
 }
 
+/// Past any run of whitespace.
+fn skip_space(html: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < html.len() && html[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
 /// Read a tag name, lowercased, and say where it ended.
 fn tag_name(html: &[u8], from: usize) -> (String, usize) {
     let mut end = from;
@@ -170,18 +179,14 @@ fn attributes(html: &[u8], from: usize) -> (Vec<(String, String)>, usize) {
         }
         let name = String::from_utf8_lossy(&html[start..i]).to_ascii_lowercase();
 
-        while i < html.len() && html[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        i = skip_space(html, i);
         if i >= html.len() || html[i] != b'=' {
             // A bare attribute such as `defer`, which carries no value.
             attrs.push((name, String::new()));
             continue;
         }
         i += 1;
-        while i < html.len() && html[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        i = skip_space(html, i);
         if i >= html.len() {
             break;
         }
