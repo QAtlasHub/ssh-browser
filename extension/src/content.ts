@@ -34,6 +34,15 @@ interface TextPositionSelector {
 
 type Selector = TextQuoteSelector | TextPositionSelector;
 
+/// What the daemon found when it checked a log's filename against the file's real owner.
+///
+/// `unchecked` is not `owned`. A remote that does not report owners legibly leaves the
+/// question open, and showing that as agreement would be the one thing this is for.
+type Attribution =
+  | { state: "owned" }
+  | { state: "mismatched"; owner: string }
+  | { state: "unchecked" };
+
 interface Annotation {
   id: string;
   author: string;
@@ -41,6 +50,9 @@ interface Annotation {
   body: string;
   selectors?: Selector[];
   reply_to?: string;
+  /// Absent when talking to a daemon from before this check existed, which reads as
+  /// unchecked — the honest answer, and the reason this is optional rather than defaulted.
+  attribution?: Attribution;
 }
 
 interface Reply {
@@ -172,6 +184,7 @@ function makePanel(): ShadowRoot {
     li { border-top: 1px solid #eee6d0; padding: 5px 0; }
     .who { color: #6b6450; }
     .orphan { color: #8a6d00; }
+    .forged { color: #a31515; font-weight: 600; }
   `;
 
   const panel = document.createElement("div");
@@ -206,11 +219,27 @@ function render(shadow: ShadowRoot, items: Placed[], skipped: number): void {
   }
 
   const unanchored = items.filter((i) => !i.anchored).length;
+  const misattributed = items.filter(
+    (i) => i.annotation.attribution?.state === "mismatched",
+  ).length;
+  const unchecked = items.filter(
+    (i) => (i.annotation.attribution?.state ?? "unchecked") === "unchecked",
+  ).length;
+
   const parts = [`${items.length} note${items.length === 1 ? "" : "s"}`];
   if (unanchored > 0) {
     // Said out loud rather than hidden. An annotation whose text has since changed is exactly
     // the case where the reader most needs to know something was written here.
     parts.push(`${unanchored} unanchored`);
+  }
+  if (misattributed > 0) {
+    parts.push(`${misattributed} misattributed`);
+  }
+  if (unchecked > 0 && misattributed === 0) {
+    // Stated once rather than per note. The alternative is showing an author name with no
+    // hint that nobody confirmed it, which is the shape of claim this whole check exists to
+    // stop the panel from making.
+    parts.push("authors not verified");
   }
   if (skipped > 0) {
     parts.push(`${skipped} unreadable`);
@@ -235,6 +264,14 @@ function render(shadow: ShadowRoot, items: Placed[], skipped: number): void {
       const flag = document.createElement("div");
       flag.className = "orphan";
       flag.textContent = "could not be placed on this page";
+      item.append(flag);
+    }
+    // Named here rather than counted only, because who wrote something is the claim in
+    // question and the answer is a different person's name.
+    if (annotation.attribution?.state === "mismatched") {
+      const flag = document.createElement("div");
+      flag.className = "forged";
+      flag.textContent = `the log says ${annotation.author}, the file belongs to ${annotation.attribution.owner}`;
       item.append(flag);
     }
     list.append(item);

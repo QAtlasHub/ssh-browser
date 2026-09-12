@@ -30,6 +30,17 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- An annotation log's filename is checked against the file's owner, which catches both a
+  daemon configured to write as an account it does not actually reach the host as, and a
+  forged log created by somebody else on a group-writable directory. The owner comes from a
+  listing's `longname`, the only place SFTP v3 carries an owner's name; the numeric `uid`
+  cannot answer this without a passwd lookup the transport cannot perform.
+- "Not checked" is reported separately from "checked and fine", so a remote that reports
+  owners in an unfamiliar shape never reads as verification. The check rides the listing a
+  load already performs, so it costs no extra round trips — pinned by a test that compares
+  the cost with and without an owner rather than against a fixed number.
+- The panel names a mismatch beside the note: the author the log claims, and the account that
+  owns the file. Records are never hidden on the strength of a parsed `ls -l` line.
 - The extension draws annotations. Anchoring uses Apache Annotator with two selectors per
   note — a quote and a position — tried in that order, because they fail in different ways and
   neither is reliable alone. A note that cannot be placed is shown as unanchored rather than

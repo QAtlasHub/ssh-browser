@@ -53,6 +53,12 @@ pub fn symlink_attrs() -> Attrs {
 pub struct FakeRemote {
     dirs: HashMap<String, Vec<Entry>>,
     files: HashMap<String, Vec<u8>>,
+    /// The account this remote is reached as, when it reports owners at all.
+    ///
+    /// A file a WRITE creates is owned by this account. That is what makes a daemon
+    /// configured with an author name the remote does not actually write as visible in a
+    /// test, which is the one situation `SECURITY.md` could not previously claim to catch.
+    reached_as: Option<String>,
 }
 
 impl FakeRemote {
@@ -61,6 +67,10 @@ impl FakeRemote {
     }
 
     /// Declare a directory and what a listing of it returns.
+    ///
+    /// Entries start with no owner, which is a remote reporting nothing legible rather than
+    /// one reporting nobody. Use [`FakeRemote::owner`] to say otherwise: a default owner
+    /// would make the ownership check pass without any test having chosen that.
     pub fn dir(mut self, path: &str, entries: Vec<(&str, Attrs)>) -> Self {
         self.dirs.insert(
             path.to_string(),
@@ -69,9 +79,31 @@ impl FakeRemote {
                 .map(|(name, attrs)| Entry {
                     name: name.to_string(),
                     attrs,
+                    owner: None,
                 })
                 .collect(),
         );
+        self
+    }
+
+    /// The account this remote is reached as, so a WRITE creates a file owned by it.
+    pub fn reached_as(mut self, who: &str) -> Self {
+        self.reached_as = Some(who.to_string());
+        self
+    }
+
+    /// Declare who a listing reports as the owner of one already-declared path.
+    ///
+    /// Panics if the path has no listing entry yet. Doing nothing instead would let a test
+    /// believe it had arranged a mismatch when it had arranged nothing at all.
+    pub fn owner(mut self, path: &str, who: &str) -> Self {
+        let (parent, name) = path.rsplit_once('/').expect("an owner needs a full path");
+        let entry = self
+            .dirs
+            .get_mut(parent)
+            .and_then(|entries| entries.iter_mut().find(|e| e.name == name))
+            .unwrap_or_else(|| panic!("no listing entry for {path}; declare it with dir() first"));
+        entry.owner = Some(who.to_string());
         self
     }
 
@@ -214,9 +246,12 @@ where
                     let entries = remote.dirs.entry(parent.to_string()).or_default();
                     match entries.iter_mut().find(|e| e.name == name) {
                         Some(e) => e.attrs.size = Some(size),
+                        // A file this remote creates belongs to the account it is reached
+                        // as, whatever the writer decided to call the file.
                         None => entries.push(Entry {
                             name: name.to_string(),
                             attrs: file_attrs(size, 1),
+                            owner: remote.reached_as.clone(),
                         }),
                     }
                 }
@@ -255,12 +290,43 @@ fn status(id: u32, code: u32, message: &str) -> Vec<u8> {
 /// SIZE | PERMISSIONS | ACMODTIME, in the order the fields are written below.
 const WRITTEN_ATTRS: u32 = 0x0000_0001 | 0x0000_0004 | 0x0000_0008;
 
+/// The `ls -l`-shaped longname a real server sends, so that the client's owner parse is
+/// exercised rather than bypassed.
+///
+/// An entry with no owner gets the bare filename instead. That is what a server reporting
+/// nothing useful looks like on the wire, and it is what the client has to decline to parse
+/// rather than read an owner out of.
+///
+/// The date is a fixed string. A real one would suggest the client reads it, and it does
+/// not: the column is ambiguous between a time and a year depending on the file's age.
+fn longname(e: &Entry) -> String {
+    match &e.owner {
+        Some(who) => format!(
+            "{} 1 {who} {who} {:>8} Jan  1 00:00 {}",
+            mode_column(&e.attrs),
+            e.attrs.size.unwrap_or(0),
+            e.name
+        ),
+        None => e.name.clone(),
+    }
+}
+
+fn mode_column(attrs: &Attrs) -> &'static str {
+    if attrs.is_dir() {
+        "drwxr-xr-x"
+    } else if attrs.is_symlink() {
+        "lrwxrwxrwx"
+    } else {
+        "-rw-r--r--"
+    }
+}
+
 fn names(id: u32, entries: &[Entry]) -> Vec<u8> {
     let mut enc = Enc::new().u32(id).u32(entries.len() as u32);
     for e in entries {
         enc = enc
             .str(e.name.as_bytes())
-            .str(e.name.as_bytes())
+            .str(longname(e).as_bytes())
             .u32(WRITTEN_ATTRS)
             .u64(e.attrs.size.unwrap_or(0))
             .u32(e.attrs.permissions.unwrap_or(0o100644))
