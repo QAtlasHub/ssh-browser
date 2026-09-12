@@ -30,6 +30,18 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- A TOML config file: `--config FILE`, or `<config dir>/ssh-browser/config.toml` if it exists,
+  with `[server]` and `[[alias]]` tables. The command line wins over the file, and aliases
+  given on the command line are added to the file's rather than replacing them — naming one
+  host should not silently drop the others. A name defined twice is an error rather than a
+  precedence, because which one survived would otherwise depend on the order they were added.
+- Unknown config keys are refused, so `suffixx = "dev"` names itself in an error instead of
+  leaving the daemon on a suffix nobody chose. `scheme = "https"` is refused for the same
+  reason: that mode is designed and not built, and quietly serving http would look like
+  success.
+- `Alias` now has private fields and a validating constructor, so the configuration file and
+  the command line cannot disagree about what a valid alias is. The rules previously lived in
+  the command-line parser, where a second entry point could not reach them.
 - `e2e/`, which opens the same bytes through the daemon and over `file://` in a real browser
   and asserts the difference. Over the daemon an ES module runs and `fetch` of a relative path
   succeeds; over `file://` neither does, while the stylesheet and image load fine in both —
