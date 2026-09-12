@@ -1,0 +1,26 @@
+# Codecov's own statuses, kept informational so that they match coverage.yml.
+#
+# coverage.yml already states that coverage must not gate a merge: an upload hiccup must
+# not redden a run whose tests all passed. The status Codecov posts back is part of that
+# promise and by default it is the opposite of it — `patch` fails whenever new lines are
+# not covered, which is a gate by another name. `informational: true` reports the number
+# and never fails.
+#
+# Coverage here is a map of what the tests reach. The useful thing is noticing a module
+# nobody exercises, not defending a percentage.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# Paths cargo-llvm-cov cannot see. Counting them as uncovered Rust would make the figure
+# mean something other than what it says: `e2e/` is a browser harness in JavaScript and
+# `extension/` is the browser half in TypeScript, and neither appears in an lcov report
+# produced by running the Rust test suite.
+ignore:
+  - "e2e/**"
+  - "extension/**"
