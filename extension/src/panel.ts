@@ -53,7 +53,25 @@ async function connect(): Promise<void> {
   const port = Number(el<HTMLInputElement>("port").value);
   const token = el<HTMLInputElement>("token").value.trim();
   el("status").textContent = "connecting…";
-  show(await send({ kind: "connect", port, token }));
+
+  const reply = await send({ kind: "connect", port, token });
+  show(reply);
+  if (!reply.ok || reply.suffix === undefined) {
+    return;
+  }
+
+  // Asked for here because a permission request needs a user gesture, and clicking Connect is
+  // the one this extension gets. Only the configured suffix is requested, never every site.
+  const origins = [`http://*.${reply.suffix}/*`];
+  const granted = await chrome.permissions.request({ origins });
+  if (!granted) {
+    el("status").textContent =
+      `${reply.detail}, but without permission for ${origins[0]} pages will not show notes`;
+    return;
+  }
+
+  const registered = await send({ kind: "register", suffix: reply.suffix });
+  el("status").textContent = `${reply.detail}; ${registered.detail}`;
 }
 
 el<HTMLButtonElement>("connect").addEventListener("click", () => {

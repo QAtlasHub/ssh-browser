@@ -4,8 +4,14 @@
   "version": "0.0.1",
   "description": "Read and annotate files on a host reachable only over SSH.",
   "minimum_chrome_version": "116",
-  "permissions": ["proxy", "storage"],
-  "host_permissions": ["http://127.0.0.1/*"],
+  "permissions": [
+    "proxy",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
@@ -13,5 +19,8 @@
   "action": {
     "default_popup": "panel.html",
     "default_title": "ssh-browser"
-  }
+  },
+  "optional_host_permissions": [
+    "http://*/*"
+  ]
 }

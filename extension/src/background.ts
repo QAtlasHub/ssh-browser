@@ -14,9 +14,19 @@ const PROTOCOL = 1;
 
 const TOKEN_HEADER = "x-ssh-browser-token";
 
+const CONTENT_SCRIPT_ID = "alias-pages";
+
+/// Which pages the content script should run in, for a given suffix.
+function matchesFor(suffix: string): string[] {
+  return [`http://*.${suffix}/*`];
+}
+
 interface Settings {
   port: number;
   token: string;
+  /// Needed to turn a page URL into a document name. Stored rather than asked for each
+  /// time, so a content script never has to know it.
+  suffix: string;
 }
 
 interface Hello {
@@ -40,17 +50,53 @@ type Request =
   | { kind: "connect"; port: number; token: string }
   | { kind: "disconnect" }
   | { kind: "status" }
-  | { kind: "annotations"; doc: string }
-  | { kind: "annotate"; doc: string; body: string; selectors?: unknown };
+  | { kind: "register"; suffix: string }
+  | { kind: "annotations"; url: string }
+  | { kind: "annotate"; url: string; body: string; selectors?: unknown };
 
 async function stored(): Promise<Settings | null> {
-  const got = await chrome.storage.local.get(["port", "token"]);
+  const got = await chrome.storage.local.get(["port", "token", "suffix"]);
   const port = got["port"];
   const token = got["token"];
-  if (typeof port !== "number" || typeof token !== "string" || token === "") {
+  const suffix = got["suffix"];
+  if (
+    typeof port !== "number" ||
+    typeof token !== "string" ||
+    token === "" ||
+    typeof suffix !== "string" ||
+    suffix === ""
+  ) {
     return null;
   }
-  return { port, token };
+  return { port, token, suffix };
+}
+
+/// `http://docs.ssh-browser/a/b.html` becomes `docs/a/b.html`.
+///
+/// Derived here rather than in the content script, so the suffix stays knowledge this worker
+/// holds. A content script that had to know the suffix would need telling again every time it
+/// changed, and the page it runs in is not somewhere to keep configuration.
+function docOfUrl(href: string, suffix: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:") {
+    return null;
+  }
+  const tail = `.${suffix}`;
+  if (!url.hostname.endsWith(tail)) {
+    return null;
+  }
+  const alias = url.hostname.slice(0, -tail.length);
+  // A single label only. `a.b.ssh-browser` is not an alias the daemon serves, and sending it
+  // one would be asking for a refusal we can predict.
+  if (alias === "" || alias.includes(".")) {
+    return null;
+  }
+  return `${alias}${url.pathname}`;
 }
 
 /// Every call to the daemon goes through here, so the token is attached in exactly one place
@@ -91,7 +137,9 @@ async function connect(port: number, token: string): Promise<Reply> {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return { ok: false, detail: `${port} is not a port` };
   }
-  const s: Settings = { port, token };
+  // The suffix is not known until `hello` answers, so this placeholder only has to be good
+  // enough to reach the daemon; the real one is stored below.
+  const s: Settings = { port, token, suffix: "" };
 
   let res: Response;
   try {
@@ -130,7 +178,7 @@ async function connect(port: number, token: string): Promise<Reply> {
     return { ok: false, detail: `connected, but the proxy could not be set: ${String(e)}` };
   }
 
-  await chrome.storage.local.set({ port, token });
+  await chrome.storage.local.set({ port, token, suffix: hello.suffix ?? "" });
   const reply: Reply = {
     ok: true,
     detail: `connected to ssh-browser ${hello.daemon}`,
@@ -148,7 +196,7 @@ async function connect(port: number, token: string): Promise<Reply> {
 /// confusingly rather than simply not existing.
 async function disconnect(): Promise<Reply> {
   await chrome.proxy.settings.clear({ scope: "regular" });
-  await chrome.storage.local.remove(["port", "token"]);
+  await chrome.storage.local.remove(["port", "token", "suffix"]);
   return { ok: true, detail: "disconnected, and the proxy setting is cleared" };
 }
 
@@ -160,10 +208,44 @@ async function status(): Promise<Reply> {
   return connect(s.port, s.token);
 }
 
-async function listAnnotations(doc: string): Promise<Reply> {
+/// Register the content script for the daemon's suffix, and only for it.
+///
+/// Registered at runtime rather than declared in the manifest, because the suffix is
+/// configurable: a manifest entry would have to match every http site in order to cover
+/// whatever suffix was chosen, and that is a permission this extension has no reason to hold.
+///
+/// The permission itself is requested from the popup, because a request needs a user gesture.
+async function registerContent(suffix: string): Promise<Reply> {
+  const matches = matchesFor(suffix);
+  if (!(await chrome.permissions.contains({ origins: matches }))) {
+    return {
+      ok: false,
+      detail: `not allowed to run on ${matches[0]} yet — grant it from the popup`,
+    };
+  }
+
+  await chrome.scripting.unregisterContentScripts({ ids: [CONTENT_SCRIPT_ID] }).catch(() => {
+    // Nothing registered yet, which is the ordinary first run.
+  });
+  await chrome.scripting.registerContentScripts([
+    {
+      id: CONTENT_SCRIPT_ID,
+      matches,
+      js: ["content.js"],
+      runAt: "document_idle",
+    },
+  ]);
+  return { ok: true, detail: `annotating pages under *.${suffix}` };
+}
+
+async function listAnnotations(url: string): Promise<Reply> {
   const s = await stored();
   if (!s) {
     return { ok: false, detail: "not connected" };
+  }
+  const doc = docOfUrl(url, s.suffix);
+  if (doc === null) {
+    return { ok: false, detail: "this page is not served by ssh-browser" };
   }
   const res = await callDaemon(s, `/_control/annotations?doc=${encodeDoc(doc)}`);
   if (!res.ok) {
@@ -183,10 +265,14 @@ async function listAnnotations(doc: string): Promise<Reply> {
   };
 }
 
-async function addAnnotation(doc: string, body: string, selectors?: unknown): Promise<Reply> {
+async function addAnnotation(url: string, body: string, selectors?: unknown): Promise<Reply> {
   const s = await stored();
   if (!s) {
     return { ok: false, detail: "not connected" };
+  }
+  const doc = docOfUrl(url, s.suffix);
+  if (doc === null) {
+    return { ok: false, detail: "this page is not served by ssh-browser" };
   }
   // No author and no id: the daemon decides both, so no caller — including this extension —
   // can write as somebody else or choose an identity.
@@ -224,10 +310,12 @@ async function dispatch(message: unknown): Promise<Reply> {
       return disconnect();
     case "status":
       return status();
+    case "register":
+      return registerContent(message.suffix);
     case "annotations":
-      return listAnnotations(message.doc);
+      return listAnnotations(message.url);
     case "annotate":
-      return addAnnotation(message.doc, message.body, message.selectors);
+      return addAnnotation(message.url, message.body, message.selectors);
   }
 }
 

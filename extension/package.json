@@ -12,5 +12,9 @@
     "@types/chrome": "^0.1.29",
     "esbuild": "^0.25.10",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@apache-annotator/dom": "^0.2.0",
+    "@apache-annotator/selector": "^0.2.0"
   }
 }
