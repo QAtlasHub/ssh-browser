@@ -20,6 +20,9 @@
     "default_popup": "panel.html",
     "default_title": "ssh-browser"
   },
+  "omnibox": {
+    "keyword": "ssh"
+  },
   "optional_host_permissions": [
     "http://*/*"
   ]

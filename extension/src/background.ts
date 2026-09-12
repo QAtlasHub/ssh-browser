@@ -27,6 +27,12 @@ interface Settings {
   /// Needed to turn a page URL into a document name. Stored rather than asked for each
   /// time, so a content script never has to know it.
   suffix: string;
+  /// What the daemon reported at connect time, for the omnibox to suggest from.
+  ///
+  /// Held here rather than fetched per keystroke: the address bar fires on every character
+  /// typed, and a request to the daemon for each one would be absurd. It is refreshed
+  /// whenever the popup opens, which re-runs `connect`.
+  aliases: string[];
 }
 
 interface Hello {
@@ -55,7 +61,7 @@ type Request =
   | { kind: "annotate"; url: string; body: string; selectors?: unknown };
 
 async function stored(): Promise<Settings | null> {
-  const got = await chrome.storage.local.get(["port", "token", "suffix"]);
+  const got = await chrome.storage.local.get(["port", "token", "suffix", "aliases"]);
   const port = got["port"];
   const token = got["token"];
   const suffix = got["suffix"];
@@ -68,7 +74,11 @@ async function stored(): Promise<Settings | null> {
   ) {
     return null;
   }
-  return { port, token, suffix };
+  // Missing aliases are an empty list rather than a refusal: they only feed the omnibox, and
+  // state written by a build from before they were stored must not stop annotations working.
+  const raw: unknown = got["aliases"];
+  const aliases = Array.isArray(raw) ? raw.filter((a): a is string => typeof a === "string") : [];
+  return { port, token, suffix, aliases };
 }
 
 /// `http://docs.ssh-browser/a/b.html` becomes `docs/a/b.html`.
@@ -137,9 +147,9 @@ async function connect(port: number, token: string): Promise<Reply> {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return { ok: false, detail: `${port} is not a port` };
   }
-  // The suffix is not known until `hello` answers, so this placeholder only has to be good
-  // enough to reach the daemon; the real one is stored below.
-  const s: Settings = { port, token, suffix: "" };
+  // Neither the suffix nor the aliases are known until `hello` answers, so these placeholders
+  // only have to be good enough to reach the daemon; the real ones are stored below.
+  const s: Settings = { port, token, suffix: "", aliases: [] };
 
   let res: Response;
   try {
@@ -178,7 +188,12 @@ async function connect(port: number, token: string): Promise<Reply> {
     return { ok: false, detail: `connected, but the proxy could not be set: ${String(e)}` };
   }
 
-  await chrome.storage.local.set({ port, token, suffix: hello.suffix ?? "" });
+  await chrome.storage.local.set({
+    port,
+    token,
+    suffix: hello.suffix ?? "",
+    aliases: hello.aliases,
+  });
   const reply: Reply = {
     ok: true,
     detail: `connected to ssh-browser ${hello.daemon}`,
@@ -196,7 +211,7 @@ async function connect(port: number, token: string): Promise<Reply> {
 /// confusingly rather than simply not existing.
 async function disconnect(): Promise<Reply> {
   await chrome.proxy.settings.clear({ scope: "regular" });
-  await chrome.storage.local.remove(["port", "token", "suffix"]);
+  await chrome.storage.local.remove(["port", "token", "suffix", "aliases"]);
   return { ok: true, detail: "disconnected, and the proxy setting is cleared" };
 }
 
@@ -318,6 +333,94 @@ async function dispatch(message: unknown): Promise<Reply> {
       return addAnnotation(message.url, message.body, message.selectors);
   }
 }
+
+/// Split `docs/a/b.html` into the alias and the rest.
+function splitTyped(text: string): { alias: string; path: string } {
+  const trimmed = text.trim();
+  const cut = trimmed.indexOf("/");
+  return cut === -1
+    ? { alias: trimmed, path: "" }
+    : { alias: trimmed.slice(0, cut), path: trimmed.slice(cut + 1) };
+}
+
+/// The omnibox renders its descriptions as markup, so anything from the address bar has to be
+/// escaped before it goes in one. An alias cannot contain these — the daemon refuses an alias
+/// that is not a hostname label — but a path is whatever was typed.
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function urlFor(alias: string, path: string, suffix: string): string {
+  return `http://${alias}.${suffix}/${encodeDoc(path)}`;
+}
+
+/// Typing the keyword in the address bar, then an alias and a path.
+///
+/// The suggestions come from the aliases the daemon reported, so they are the hosts that
+/// actually exist rather than a list this extension keeps its own copy of.
+///
+/// Deliberately adds no permission. `chrome.omnibox` needs only its manifest key, and setting
+/// a tab's URL does not need `tabs` — that is for reading a tab's URL or title. An address-bar
+/// shortcut is not worth asking a reviewer, or a reader, for the right to see their browsing.
+function installOmnibox(): void {
+  chrome.omnibox.setDefaultSuggestion({
+    description: "ssh-browser: %s",
+  });
+
+  chrome.omnibox.onInputChanged.addListener((text, suggest) => {
+    void (async () => {
+      const s = await stored();
+      if (!s) {
+        return;
+      }
+      const { alias, path } = splitTyped(text);
+      // Once a slash has been typed the alias is settled, so the only useful suggestion is
+      // the one URL. Before that, every alias the typing could still become.
+      const names = text.includes("/")
+        ? s.aliases.filter((a) => a === alias)
+        : s.aliases.filter((a) => a.startsWith(alias));
+      suggest(
+        names.map((a) => ({
+          content: path === "" ? a : `${a}/${path}`,
+          description: escapeXml(urlFor(a, path, s.suffix)),
+        })),
+      );
+    })();
+  });
+
+  chrome.omnibox.onInputEntered.addListener((text, disposition) => {
+    void (async () => {
+      const s = await stored();
+      if (!s) {
+        return;
+      }
+      const { alias, path } = splitTyped(text);
+      // An unknown alias is still navigated to. The daemon answers with a 404 naming it,
+      // which tells the reader more than this extension silently doing nothing would.
+      if (!/^[a-z0-9-]+$/.test(alias)) {
+        return;
+      }
+      const url = urlFor(alias, path, s.suffix);
+      switch (disposition) {
+        case "newForegroundTab":
+          await chrome.tabs.create({ url });
+          break;
+        case "newBackgroundTab":
+          await chrome.tabs.create({ url, active: false });
+          break;
+        default:
+          await chrome.tabs.update({ url });
+      }
+    })();
+  });
+}
+
+installOmnibox();
 
 chrome.runtime.onMessage.addListener((message, _sender, reply) => {
   dispatch(message)

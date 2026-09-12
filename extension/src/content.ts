@@ -62,9 +62,23 @@ interface Reply {
   skipped?: number;
 }
 
+/// Which of the two selectors placed a note.
+///
+/// Worth keeping rather than discarding once a range is in hand. A note that the quote could
+/// not place but the position could is a note whose text has changed since it was written:
+/// it is now sitting on whatever happens to occupy those character offsets, which may be
+/// nothing like what the author was looking at. That is the case this project meets most
+/// often, because a page of computed results changes in exactly the numbers people annotate.
+type AnchoredBy = "quote" | "position";
+
+interface Anchored {
+  range: Range;
+  by: AnchoredBy;
+}
+
 interface Placed {
   annotation: Annotation;
-  anchored: boolean;
+  anchor: Anchored | null;
 }
 
 /// TypeScript's DOM library declares `HighlightRegistry` with only `forEach`, while the spec
@@ -102,12 +116,15 @@ async function first<T>(source: AsyncIterable<T>): Promise<T | null> {
 /// Returning null rather than a guess is the point. An annotation that cannot be placed is
 /// shown as unanchored, because dropping it silently would make somebody's note vanish with no
 /// sign it ever existed.
-async function anchor(selectors: Selector[]): Promise<Range | null> {
+///
+/// Which selector won is returned along with the range, because falling through to the
+/// position is itself a finding: it says the quoted text is no longer on the page.
+async function anchor(selectors: Selector[]): Promise<Anchored | null> {
   const quote = selectors.find((s): s is TextQuoteSelector => s.type === "TextQuoteSelector");
   if (quote) {
     const found = await first(createTextQuoteSelectorMatcher(quote)(document.body));
     if (found) {
-      return found;
+      return { range: found, by: "quote" };
     }
   }
   const position = selectors.find(
@@ -116,7 +133,7 @@ async function anchor(selectors: Selector[]): Promise<Range | null> {
   if (position) {
     const found = await first(createTextPositionSelectorMatcher(position)(document.body));
     if (found) {
-      return found;
+      return { range: found, by: "position" };
     }
   }
   return null;
@@ -218,7 +235,8 @@ function render(shadow: ShadowRoot, items: Placed[], skipped: number): void {
     return;
   }
 
-  const unanchored = items.filter((i) => !i.anchored).length;
+  const unanchored = items.filter((i) => i.anchor === null).length;
+  const drifted = items.filter((i) => i.anchor?.by === "position").length;
   const misattributed = items.filter(
     (i) => i.annotation.attribution?.state === "mismatched",
   ).length;
@@ -231,6 +249,9 @@ function render(shadow: ShadowRoot, items: Placed[], skipped: number): void {
     // Said out loud rather than hidden. An annotation whose text has since changed is exactly
     // the case where the reader most needs to know something was written here.
     parts.push(`${unanchored} unanchored`);
+  }
+  if (drifted > 0) {
+    parts.push(`${drifted} drifted`);
   }
   if (misattributed > 0) {
     parts.push(`${misattributed} misattributed`);
@@ -247,7 +268,7 @@ function render(shadow: ShadowRoot, items: Placed[], skipped: number): void {
   count.textContent = parts.join(", ");
 
   list.textContent = "";
-  for (const { annotation, anchored } of items) {
+  for (const { annotation, anchor: placement } of items) {
     const item = document.createElement("li");
 
     const who = document.createElement("span");
@@ -260,10 +281,18 @@ function render(shadow: ShadowRoot, items: Placed[], skipped: number): void {
     body.textContent = annotation.body;
 
     item.append(who, body);
-    if (!anchored) {
+    if (placement === null) {
       const flag = document.createElement("div");
       flag.className = "orphan";
       flag.textContent = "could not be placed on this page";
+      item.append(flag);
+    } else if (placement.by === "position") {
+      // Placed, but not on the words it was written about. Showing it silently in its new
+      // location would be the worst outcome: the reader would take it as a comment on
+      // whatever text is there now.
+      const flag = document.createElement("div");
+      flag.className = "orphan";
+      flag.textContent = "the text it quoted has changed; placed by position instead";
       item.append(flag);
     }
     // Named here rather than counted only, because who wrote something is the claim in
@@ -294,11 +323,11 @@ async function refresh(shadow: ShadowRoot): Promise<void> {
   const placed: Placed[] = [];
   const ranges: Range[] = [];
   for (const annotation of annotations) {
-    const range = annotation.selectors ? await anchor(annotation.selectors) : null;
-    if (range) {
-      ranges.push(range);
+    const found = annotation.selectors ? await anchor(annotation.selectors) : null;
+    if (found) {
+      ranges.push(found.range);
     }
-    placed.push({ annotation, anchored: range !== null });
+    placed.push({ annotation, anchor: found });
   }
 
   draw(ranges);

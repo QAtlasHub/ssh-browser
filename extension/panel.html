@@ -42,6 +42,17 @@
         margin: 6px 0 0;
         padding-left: 18px;
       }
+      #hint {
+        color: #666;
+        margin-top: 10px;
+      }
+      kbd {
+        background: #f2f2f2;
+        border: 1px solid #ddd;
+        border-radius: 3px;
+        font: inherit;
+        padding: 0 4px;
+      }
     </style>
   </head>
   <body>
@@ -57,6 +68,11 @@
     <button id="connect">Connect</button>
     <div id="status"></div>
     <ul id="aliases"></ul>
+    <!-- An address-bar keyword nobody is told about is one nobody uses. Static text rather
+         than something panel.ts fills in, so it cannot become a sixth id that must exist. -->
+    <div id="hint">
+      In the address bar: <kbd>ssh</kbd> then Tab, then an alias and a path.
+    </div>
     <script type="module" src="panel.js"></script>
   </body>
 </html>
