@@ -30,6 +30,13 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- Which selector placed a note is kept rather than discarded. A note the quote could not place
+  but the position could is shown as drifted: the text it was written about is gone, and it is
+  now sitting on whatever occupies those character offsets. On a page of computed results that
+  is the common case, because the numbers people annotate are the numbers that change.
+- An omnibox keyword: `ssh` then Tab, then an alias and a path, with suggestions from the
+  aliases the daemon reports. It adds no permission — `chrome.omnibox` needs only its manifest
+  key, and setting a tab's URL does not require `tabs`.
 - An HTML page is read for its own `<link>`, `<script>` and `<img>` references, and those are
   fetched in one batch before the page is answered. This is the browser half of invariant 1:
   HTTP/1.1 allows six connections per origin, so forty subresources are seven waves of

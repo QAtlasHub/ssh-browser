@@ -96,6 +96,19 @@ so prefer the PAC.
 `--port` and `--suffix` change the listener and the hostname suffix. `ssh-browser
 pac` prints the script without starting a server.
 
+### The extension
+
+`extension/` builds with `npm ci && npm run build` and loads unpacked from
+`extension/dist`. Give it the port and the control token the daemon printed; it applies
+the PAC itself, so `--proxy-pac-url` is not needed as well.
+
+The control token lives in the service worker and nowhere else. A page served from an
+alias origin is untrusted code, so content scripts ask the worker to act for them rather
+than being handed the token.
+
+In the address bar, `ssh` then Tab takes an alias and a path — `ssh docs/notes.html`.
+Suggestions come from the aliases the daemon reports.
+
 ## Status
 
 Early, but usable for reading. Verified against a real host through a jump box:
@@ -114,15 +127,31 @@ cached, so a seek does not pull the whole file and does not evict the page bodie
 make revisits free. `If-Range` is never honoured, because the only validator on offer
 is weak and the whole representation is the specified answer to that.
 
-Annotations work through the control API, though nothing draws them yet — that is the
-extension's job. They are per-author append-only logs beside the document, so two people
-annotating one page write to different files and neither can lose the other's work.
+Annotations are per-author append-only logs beside the document, so two people annotating
+one page write to different files and neither can lose the other's work. They are reachable
+from the control API directly,
 
 ```
 curl -H "x-ssh-browser-token: $TOKEN" -X POST   --data '{"doc":"docs/index.html","op":"add","body":"a note"}'   http://127.0.0.1:7391/_control/annotations
 ```
 
-Not there yet: the extension, collaborative editing of documents themselves.
+and the extension draws them. Highlights use the CSS Custom Highlight API and the panel is a
+closed shadow root, so the document is never modified — no wrapper elements, no `<style>`
+node, nothing a page script can see by walking the DOM.
+
+Four things are said rather than hidden, because each one means somebody's note is not
+saying what it appears to say:
+
+- **unanchored** — neither selector could place it on this page.
+- **drifted** — the quoted text is gone and it was placed by character position instead, so
+  it is sitting on whatever occupies those offsets now.
+- **misattributed** — the log's filename claims an author the file's owner contradicts.
+- **unreadable** — a log line the daemon could not parse.
+
+The extension typechecks and bundles in CI, and has **not yet been loaded in a browser
+against a live daemon**. That step is manual and is the next thing to do.
+
+Not there yet: collaborative editing of documents themselves.
 
 ```
 cargo run --bin measure-roundtrips -- <ssh-host> [remote-dir]
