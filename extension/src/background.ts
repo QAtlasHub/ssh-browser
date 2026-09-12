@@ -106,7 +106,29 @@ function docOfUrl(href: string, suffix: string): string | null {
   if (alias === "" || alias.includes(".")) {
     return null;
   }
-  return `${alias}${url.pathname}`;
+  // Decoded here, and encoded exactly once by `encodeDoc` on the way out.
+  //
+  // `pathname` keeps its percent-escapes, and the daemon decodes what it is handed exactly
+  // once — deliberately, since decoding twice would turn a literal `%2e%2e` in a filename
+  // into a traversal. Passing the escaped form straight through meant the read path escaped
+  // it a second time and the write path did not, so a note written against
+  // `Weekly Report.html` was afterwards looked for under `Weekly%20Report.html` and never
+  // found again. Decoding first is what makes the two directions agree.
+  //
+  // Per segment, so a `%2F` stays a separator question for the daemon to answer rather than
+  // becoming one here.
+  let path: string;
+  try {
+    path = url.pathname
+      .split("/")
+      .map((segment) => decodeURIComponent(segment))
+      .join("/");
+  } catch {
+    // A malformed escape, which the daemon would refuse anyway. Saying so here beats
+    // sending it something that cannot mean anything.
+    return null;
+  }
+  return `${alias}${path}`;
 }
 
 /// Every call to the daemon goes through here, so the token is attached in exactly one place
@@ -117,9 +139,14 @@ async function callDaemon(s: Settings, path: string, init: RequestInit = {}): Pr
   return fetch(`http://127.0.0.1:${s.port}${path}`, { ...init, headers });
 }
 
-/// `encodeURIComponent` would escape the separator that divides the alias from the path, and
-/// the daemon splits on it. Encoding each segment separately keeps a filename containing `&`
-/// or `=` from breaking the query while leaving the separator alone.
+/// Escape a decoded document path exactly once, for either direction.
+///
+/// `encodeURIComponent` over the whole string would escape the separator that divides the
+/// alias from the path, and the daemon splits on it. Per segment keeps a filename containing
+/// `&` or `=` from breaking the query while leaving the separator alone.
+///
+/// The input must be decoded — see `docOfUrl`. Handing this an already-escaped path escapes
+/// it twice, and the daemon decodes once by design, so the two would never meet.
 function encodeDoc(doc: string): string {
   return doc.split("/").map(encodeURIComponent).join("/");
 }
@@ -291,7 +318,11 @@ async function addAnnotation(url: string, body: string, selectors?: unknown): Pr
   }
   // No author and no id: the daemon decides both, so no caller — including this extension —
   // can write as somebody else or choose an identity.
-  const payload: Record<string, unknown> = { doc, op: "add", body };
+  //
+  // `encodeDoc` here as well as on the read path, and for the same reason: the daemon
+  // decodes once, so both directions have to encode once. They did not, and a note written
+  // to a filename needing escapes could not be read back.
+  const payload: Record<string, unknown> = { doc: encodeDoc(doc), op: "add", body };
   if (selectors !== undefined) {
     payload["selectors"] = selectors;
   }
@@ -368,6 +399,16 @@ function urlFor(alias: string, path: string, suffix: string): string {
 /// a tab's URL does not need `tabs` — that is for reading a tab's URL or title. An address-bar
 /// shortcut is not worth asking a reviewer, or a reader, for the right to see their browsing.
 function installOmnibox(): void {
+  // Neither listener has a reply channel to fail through: a rejection here would otherwise
+  // be a suggestion list that stops appearing, or an Enter that navigates nowhere, with the
+  // reason visible only in a service-worker console nobody has open. The badge is the one
+  // surface this worker owns, so a failure gets put there rather than nowhere.
+  const complain = (what: string) => (e: unknown) => {
+    console.error(`ssh-browser: ${what} failed`, e);
+    void chrome.action.setBadgeText({ text: "!" });
+    void chrome.action.setTitle({ title: `ssh-browser: ${what} failed — ${String(e)}` });
+  };
+
   chrome.omnibox.setDefaultSuggestion({
     description: "ssh-browser: %s",
   });
@@ -390,7 +431,7 @@ function installOmnibox(): void {
           description: escapeXml(urlFor(a, path, s.suffix)),
         })),
       );
-    })();
+    })().catch(complain("omnibox suggestions"));
   });
 
   chrome.omnibox.onInputEntered.addListener((text, disposition) => {
@@ -416,7 +457,7 @@ function installOmnibox(): void {
         default:
           await chrome.tabs.update({ url });
       }
-    })();
+    })().catch(complain("omnibox navigation"));
   });
 }
 

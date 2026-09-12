@@ -10,6 +10,34 @@ stable.
 
 ## [Unreleased]
 
+### Fixed
+
+- A note written against a filename needing percent-escapes could not be read back. The
+  extension derived the document from `location.pathname`, which keeps its escapes, then
+  escaped it a second time on the read path and not on the write path; the daemon decodes
+  exactly once by design, so the two looked in different places. A note on
+  `Weekly Report.html` was saved under that name and then searched for under
+  `Weekly%20Report.html`, so it vanished from the panel the moment it was saved. The path is
+  now decoded once when it is derived and escaped once in both directions. Verified against a
+  real host for a space, an `&`, a literal `%` and non-ASCII.
+- A page could get the daemon to list a directory a symlink points at, by naming a path one
+  level below the deepest listing held. The symlink check can only see what is cached, and
+  the batch that would have revealed the symlink contained the symlink's own path — SFTP v3
+  `OPENDIR` has no `O_NOFOLLOW`, so the remote resolved it. Nothing was ever served through
+  it, but reading it is the act the alias base exists to forbid. A directory is now listed
+  only when the cache can already prove no step down to it is a symlink. Round trips could
+  not detect this, since one `list_dirs` is one flush however many directories are in it, so
+  the test asserts on what the cache ends up holding.
+- The annotation panel showed an empty shell, indistinguishable from a document with no
+  notes, whenever the extension reloaded while a page was open: `chrome.runtime.sendMessage`
+  rejects with "Extension context invalidated" and nothing caught it. It now reports losing
+  contact through the same line it uses for every other failure.
+- The omnibox listeners had no rejection handler, so a failure was a suggestion list that
+  stopped appearing or an Enter that navigated nowhere, with the reason only in a
+  service-worker console. They now report through the toolbar badge.
+- The startup banner said `connecting over ssh...` before taking the port, so a port already
+  in use produced that line directly above an error about the port. It names both now.
+
 ### Added
 
 - SFTP transport over `ssh <host> -s sftp`, so ssh_config, ProxyJump,

@@ -94,8 +94,20 @@ declare global {
 
 const HIGHLIGHT = "ssh-browser-annotation";
 
+/// Ask the worker to act, turning a dead channel into an answer rather than a throw.
+///
+/// `chrome.runtime.sendMessage` rejects whenever the worker is not there to receive it —
+/// most often "Extension context invalidated", which happens every time the extension
+/// reloads while a page is still open. Unhandled, that rejection escaped through `refresh`
+/// before it reached `render`, leaving the panel a bare shell with no count and no list:
+/// indistinguishable from a document nobody has annotated. A panel that says it lost contact
+/// is better than one that silently shows nothing, and this is the only channel it has.
 async function send(message: unknown): Promise<Reply> {
-  return (await chrome.runtime.sendMessage(message)) as Reply;
+  try {
+    return (await chrome.runtime.sendMessage(message)) as Reply;
+  } catch (e) {
+    return { ok: false, detail: `lost contact with the extension: ${String(e)}` };
+  }
 }
 
 async function first<T>(source: AsyncIterable<T>): Promise<T | null> {

@@ -681,6 +681,17 @@ impl Origin {
             if self.first_symlink(&chain).is_some() {
                 continue;
             }
+            // And every directory this reference would cause to be listed has to be one the
+            // cache can already prove is not behind a symlink. `first_symlink` alone is not
+            // enough: it sees only what is cached, so a symlink one level below the deepest
+            // listing held is invisible to it and would be opened by the very batch meant to
+            // discover it.
+            if !chain
+                .iter()
+                .all(|(dir, _)| self.listable(&session.base, dir))
+            {
+                continue;
+            }
             wanted.push((resolved, chain));
         }
 
@@ -742,6 +753,25 @@ impl Origin {
                 self.cache.put_listing(dir, &entries);
             }
         }
+    }
+
+    /// Can this directory be listed without asking the remote to walk through a symlink?
+    ///
+    /// True only when every step from the alias base down to it is already known — from a
+    /// listing already held — to be a real directory. A step that is not known yet is not
+    /// assumed safe, because SFTP v3 `OPENDIR` has no `O_NOFOLLOW`: asking the remote to
+    /// list a path *is* asking it to follow whatever symlinks are in that path, and the
+    /// answer arrives too late to un-ask. The base itself is operator configuration, not
+    /// something a request reaches, so it is the one directory taken on trust.
+    fn listable(&self, base: &str, dir: &str) -> bool {
+        if dir.trim_end_matches('/') == base.trim_end_matches('/') {
+            return true;
+        }
+        components(base, dir).iter().all(|(parent, name)| {
+            self.cache
+                .attrs_of(parent, name)
+                .is_some_and(|a| a.is_dir() && !a.is_symlink())
+        })
     }
 
     /// The first component of a chain that is a symlink, if any.
@@ -1281,6 +1311,93 @@ mod tests {
         assert_eq!(
             origin.handle(get("/link/inside.png", None)).await.status(),
             StatusCode::FORBIDDEN
+        );
+    }
+
+    /// The hole the shallow symlink test did not cover: a symlink one level below the
+    /// deepest listing the cache holds.
+    ///
+    /// `first_symlink` can only see what is cached, so at the moment the batch is assembled
+    /// it has no opinion about `assets/link` — and the batch that would tell it includes the
+    /// symlink's own path. SFTP v3 `OPENDIR` has no `O_NOFOLLOW`, so the remote resolves it
+    /// and hands back a listing of wherever it points. Nothing is ever served through it,
+    /// but the daemon has already read it, which is the act the alias base exists to forbid.
+    ///
+    /// Round trips cannot detect this — `list_dirs` is one flush however many directories
+    /// are in it — so the assertion is on what the cache ends up holding.
+    #[tokio::test]
+    async fn a_page_cannot_get_a_symlink_below_an_unlisted_directory_opened() {
+        let html = "<!doctype html><html><body><img src=\"assets/link/secret.txt\"></body></html>";
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir(
+                    "/srv",
+                    vec![
+                        ("index.html", file_attrs(html.len() as u64, 100)),
+                        ("assets", dir_attrs()),
+                    ],
+                )
+                .dir("/srv/assets", vec![("link", symlink_attrs())])
+                // What the remote returns once it has followed the symlink for us.
+                .dir("/srv/assets/link", vec![("secret.txt", file_attrs(9, 1))])
+                .file("/srv/index.html", html.as_bytes())
+                .file("/srv/assets/link/secret.txt", b"elsewhere"),
+        )
+        .await;
+
+        assert_eq!(
+            origin.handle(get("/index.html", None)).await.status(),
+            StatusCode::OK
+        );
+        assert!(
+            !origin.cache.has_listing("/srv/assets/link"),
+            "the daemon listed the directory a symlink points at"
+        );
+
+        // And the ordinary request for it is still refused, so closing the prefetch route
+        // did not quietly become the only thing stopping it.
+        assert_eq!(
+            origin
+                .handle(get("/assets/link/secret.txt", None))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// The other half: a reference one level down is still prefetched, because the listing
+    /// the page's own request already fetched proves that step is a real directory. Closing
+    /// the hole above must not turn prefetching off for the ordinary `assets/` layout.
+    #[tokio::test]
+    async fn a_reference_in_a_real_subdirectory_is_still_prefetched() {
+        let html = "<!doctype html><html><body><img src=\"assets/x.png\"></body></html>";
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir(
+                    "/srv",
+                    vec![
+                        ("index.html", file_attrs(html.len() as u64, 100)),
+                        ("assets", dir_attrs()),
+                    ],
+                )
+                .dir("/srv/assets", vec![("x.png", file_attrs(3, 1))])
+                .file("/srv/index.html", html.as_bytes())
+                .file("/srv/assets/x.png", b"xxx"),
+        )
+        .await;
+
+        assert_eq!(
+            origin.handle(get("/index.html", None)).await.status(),
+            StatusCode::OK
+        );
+        let before = trips(&origin);
+        let res = origin.handle(get("/assets/x.png", None)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(&body_of(res).await[..], b"xxx");
+        assert_eq!(
+            trips(&origin) - before,
+            0,
+            "a subdirectory one level down must still be warmed"
         );
     }
 
