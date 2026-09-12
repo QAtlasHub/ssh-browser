@@ -77,21 +77,44 @@ pub struct Origin {
     ///
     /// Configured rather than discovered. The SFTP transport never runs a shell, so the
     /// remote account name is not something this process can ask for; guessing it from a
-    /// home directory path would be a guess presented as a fact. v0.3 will check it
-    /// against the uid a listing reports, and until then it is the operator's word.
+    /// home directory path would be a guess presented as a fact. What it is checked
+    /// against is the owner a listing reports, which catches a configured name the remote
+    /// does not actually write as — see `annot::Attribution`.
     author: String,
 }
 
+/// A listening socket and the origin that will answer on it.
+///
+/// Separate from [`Origin`] so that "the port is ours" is a thing the caller holds rather
+/// than something it hopes for. A caller cannot announce that the daemon is up before it
+/// is, because it has nothing to announce until this exists.
+pub struct Bound {
+    origin: Arc<Origin>,
+    listener: TcpListener,
+}
+
 impl Origin {
-    /// Connect every alias up front, so the first page request does not also pay
-    /// for an ssh handshake.
+    /// Take the port, then connect every alias.
+    ///
+    /// The port first, deliberately. It is the thing that fails immediately and for a
+    /// reason the operator can do something about — another daemon already has it — and a
+    /// handful of ssh handshakes paid before discovering that is time spent to learn
+    /// nothing.
+    ///
+    /// The aliases are connected here rather than on first use so that the first page
+    /// request does not also pay for an ssh handshake.
     pub async fn bind(
         aliases: Vec<Alias>,
         suffix: String,
         port: u16,
         token: Token,
         author: String,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Bound> {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind {addr}"))?;
+
         let mut sessions = HashMap::new();
         for a in aliases {
             let fs = SftpFs::connect(&a.host)
@@ -99,25 +122,28 @@ impl Origin {
                 .with_context(|| format!("alias {} -> ssh host {}", a.name, a.host))?;
             sessions.insert(a.name, Session { base: a.base, fs });
         }
-        Ok(Arc::new(Self {
-            suffix,
-            port,
-            sessions,
-            cache: Cache::default(),
-            token,
-            author,
-        }))
+        Ok(Bound {
+            origin: Arc::new(Self {
+                suffix,
+                port,
+                sessions,
+                cache: Cache::default(),
+                token,
+                author,
+            }),
+            listener,
+        })
     }
+}
 
-    pub async fn serve(self: Arc<Self>) -> Result<()> {
-        let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
-        let listener = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("bind {addr}"))?;
+impl Bound {
+    pub async fn serve(self) -> Result<()> {
+        let Bound { origin, listener } = self;
+        let self_ = origin;
 
         loop {
             let (stream, _) = listener.accept().await?;
-            let me = Arc::clone(&self);
+            let me = Arc::clone(&self_);
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let me = Arc::clone(&me);
@@ -132,7 +158,9 @@ impl Origin {
             });
         }
     }
+}
 
+impl Origin {
     /// Generic over the body type so a test can drive it without constructing
     /// hyper's `Incoming`, which only a real connection can produce.
     pub async fn handle<B>(&self, req: Request<B>) -> Response<Full<Bytes>>

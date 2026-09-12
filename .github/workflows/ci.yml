@@ -110,6 +110,47 @@ jobs:
       - run: npm --prefix extension run typecheck
       - run: npm --prefix extension run build
 
+  e2e:
+    # The only check that tests the claim rather than a piece of it: that a file on a host
+    # reachable only over SSH renders in a browser as it would anywhere else. It opens the
+    # same bytes twice, once through the daemon and once over file://, and the difference
+    # between the two is the reason this project exists. No unit test can stand in for it,
+    # because the thing being claimed is about a browser.
+    name: e2e (browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          cache-bin: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Local sshd
+        # The same arrangement as the roundtrips job. The daemon only ever speaks to a host
+        # through `ssh -s sftp`, so a real sshd on loopback exercises the actual transport
+        # rather than a stand-in for it.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/authorized_keys
+          sudo systemctl start ssh || sudo service ssh start
+          ssh-keyscan -H localhost >> ~/.ssh/known_hosts
+
+      - run: cargo build --bin ssh-browser
+      - run: npm --prefix e2e ci
+      - run: npm --prefix e2e run browser
+      - run: npm --prefix e2e run e2e
+
   roundtrips:
     # Invariant 1 as a check rather than a claim: round trips for a batch of N
     # must not grow with N. measure-roundtrips exits non-zero on a serial

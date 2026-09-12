@@ -30,6 +30,17 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- `e2e/`, which opens the same bytes through the daemon and over `file://` in a real browser
+  and asserts the difference. Over the daemon an ES module runs and `fetch` of a relative path
+  succeeds; over `file://` neither does, while the stylesheet and image load fine in both —
+  so the harness states that this is about origin and not about access to files. It runs in CI
+  against a local `sshd` and can be pointed at a real host.
+- The startup banner no longer says `listening on 127.0.0.1:PORT` before the port has been
+  taken. Binding and connecting every host both happened after that line was printed, so a
+  reader who acted on it met a refused connection, and a port already in use produced the
+  announcement followed by the error contradicting it. `Origin::bind` now takes the port first
+  — the failure an operator can act on, and the one that should not cost a set of ssh
+  handshakes to discover — and returns a `Bound` that holds the listener.
 - Which selector placed a note is kept rather than discarded. A note the quote could not place
   but the position could is shown as drifted: the text it was written about is gone, and it is
   now sitting on whatever occupies those character offsets. On a page of computed results that
