@@ -52,6 +52,12 @@ fetched in one batch before the page is answered. A page with forty subresources
 trips without that and 0 with it** — measured by serving every subresource one at a time, which is the
 worst case any browser can produce.
 
+Those reads go through the ranged path rather than the polling one, because a listing already says how
+long each subresource is. Without that a file is read in 32 KB chunks until a short read arrives, which
+is a round trip per chunk: against a host at roughly 40 ms, 400 KB read that way takes **571 ms**, while
+the same 400 KB fetched as part of the page's own prefetch batch leaves the whole page — script
+included — at **368 ms**.
+
 A page is untrusted input, so a reference is resolved and symlink-checked exactly as a real request is,
 by the same code rather than a second copy of the rule. The scan itself is a heuristic and can only ever
 affect speed: a reference it misses is fetched normally, and one it invents is a read that fails and is

@@ -12,6 +12,25 @@ stable.
 
 ### Added
 
+- Prefetched subresources are read by range rather than by polling, since the listing already
+  says how long each one is. `read_batch` cannot know a length, so it asks in 32 KB chunks
+  until a short read arrives — a round trip per chunk, which made a one-megabyte bundle
+  thirty-two of them. Against a host at roughly 40 ms RTT, 400 KB read that way takes 571 ms,
+  while the same file fetched in the page's own prefetch batch leaves the whole page at 368 ms.
+- A subresource the listing calls empty is no longer prefetched. A ranged read asks for exactly
+  what it was told, so a listing that understates a length would have cached a short body and
+  served it — the empty `200` this project forbids, arriving through a new door. Nothing is
+  lost: there is nothing to warm at zero bytes.
+- Tests for three things nothing exercised: that a large subresource costs what a small one
+  costs, that an oversized one is skipped rather than pulled across and discarded, and that
+  `Origin::bind` takes the port before it connects any host — the last checkable without any
+  ssh infrastructure, because the port failing first is exactly why the host is never reached.
+- The command line and the configuration file are merged by a function rather than inside
+  `main`, so the precedence can be tested. It is three `or`s and an `extend`, any one of which
+  could be turned around without a single test noticing, and the result decides which host a
+  URL reaches.
+
+
 - The e2e harness covers the product rather than one claim of it: the PAC's routing decisions,
   every refusal `SECURITY.md` promises, conditional `GET`, ranges, directory listings and the
   trailing-slash redirect, and — for the first time — the extension itself, loaded unpacked
