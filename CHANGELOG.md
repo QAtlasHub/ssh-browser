@@ -30,6 +30,18 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- The extension draws annotations. Anchoring uses Apache Annotator with two selectors per
+  note — a quote and a position — tried in that order, because they fail in different ways and
+  neither is reliable alone. A note that cannot be placed is shown as unanchored rather than
+  dropped.
+- Highlights use the CSS Custom Highlight API and the panel lives in a closed shadow root, so
+  the document the reader came for is never modified. That also sidesteps Apache Annotator's
+  warning that editing the DOM mid-search can loop forever.
+- The content script is registered at runtime for the configured suffix only, so the extension
+  never holds permission for every http site. The permission is requested from the popup,
+  where there is a user gesture to attach it to.
+- `@apache-annotator/selector` is a direct dependency because `@apache-annotator/dom` imports
+  types from it without declaring it, which leaves `Matcher` resolving to `{}`.
 - A browser extension, so far just enough to connect: it holds the control token, asks the
   daemon for its PAC rather than generating one, and negotiates the protocol version. The
   token lives in the service worker and nowhere else — content scripts will ask the worker
