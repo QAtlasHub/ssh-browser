@@ -26,7 +26,12 @@ pub fn script(suffix: &str, port: u16) -> Result<String> {
     ))
 }
 
-fn is_suffix(s: &str) -> bool {
+/// The shape a suffix has to have.
+///
+/// Crate-visible so that `Origin::bind` holds a suffix to the same rule the PAC does.
+/// Validating it in only one of the two places meant `serve --suffix ""` started
+/// happily and then served a PAC route nothing could ever match.
+pub(crate) fn is_suffix(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with(['-', '.'])
         && !s.ends_with(['-', '.'])

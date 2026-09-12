@@ -59,11 +59,23 @@ pub struct FakeRemote {
     /// configured with an author name the remote does not actually write as visible in a
     /// test, which is the one situation `SECURITY.md` could not previously claim to catch.
     reached_as: Option<String>,
+    /// Directories this remote refuses to open, and the status it refuses with.
+    ///
+    /// Without this the only refusal a test could produce was "no such file" — the one
+    /// refusal a caller is entitled to read as an ordinary empty answer. The whole class of
+    /// failures that must *not* read as empty therefore had no way to be exercised at all.
+    refuses: HashMap<String, u32>,
 }
 
 impl FakeRemote {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Refuse to open a directory, for a reason that is not absence.
+    pub fn refuses_listing(mut self, path: &str, status: u32) -> Self {
+        self.refuses.insert(path.to_string(), status);
+        self
     }
 
     /// Declare a directory and what a listing of it returns.
@@ -163,7 +175,11 @@ where
         let (out_kind, body) = match kind {
             OPENDIR => {
                 let path = utf8(d.str().expect("opendir path"));
-                if remote.dirs.contains_key(&path) {
+                // A declared refusal wins over the tree, so a directory can be made to exist
+                // and still be refused — which is what a permission problem looks like.
+                if let Some(&code) = remote.refuses.get(&path) {
+                    (STATUS, status(id, code, "refused"))
+                } else if remote.dirs.contains_key(&path) {
                     serial += 1;
                     (
                         HANDLE,

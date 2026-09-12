@@ -96,11 +96,18 @@ pub enum Attribution {
 pub fn attribution(author: &str, owner: Option<&str>) -> Attribution {
     match owner {
         None => Attribution::Unchecked,
-        Some(who) if who == author => Attribution::Owned,
-        // A remote that could not resolve a uid to a name prints the number instead. That
-        // is no evidence about a name, so it cannot be evidence of a mismatch either — and
-        // calling it one would accuse whoever the number turns out to belong to.
+        // A remote that could not resolve a uid to a name prints the number instead. That is
+        // no evidence about a name, so it cannot be evidence of a mismatch — calling it one
+        // would accuse whoever the number turns out to belong to — and it is no evidence of
+        // agreement either.
+        //
+        // Tested before the names are compared, and that order is the whole point. An author
+        // configured as `1000`, which `is_safe_name` permits, would otherwise match an
+        // unresolved uid of 1000 and be reported as verified on the strength of two numerals
+        // coinciding. "Not checked" and "checked and fine" have to stay apart even when the
+        // strings happen to be equal.
         Some(who) if who.bytes().all(|b| b.is_ascii_digit()) => Attribution::Unchecked,
+        Some(who) if who == author => Attribution::Owned,
         Some(who) => Attribution::Mismatched {
             owner: who.to_string(),
         },
@@ -133,6 +140,7 @@ pub struct AuthorLog {
 }
 
 /// What `load` found, including what it could not read.
+#[derive(Debug)]
 pub struct Loaded {
     pub annotations: Vec<Annotation>,
     /// Lines that did not parse.
@@ -175,7 +183,7 @@ fn owns(author: &str, id: &str) -> bool {
 ///
 /// An author name becomes a filename, so a name that could climb out of its directory is
 /// a path traversal with extra steps.
-fn is_safe_name(s: &str) -> bool {
+pub(crate) fn is_safe_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && !s.starts_with('.')
@@ -295,13 +303,21 @@ impl<'a, F: RemoteFs> Store<'a, F> {
     /// Read every author's annotations for one document.
     pub async fn load(&self, doc: &str) -> Result<Loaded> {
         let dir = ann_dir(doc);
-        let Ok(entries) = self.fs.list_dir(&dir).await else {
+        let entries = match self.fs.list_dir(&dir).await {
+            Ok(entries) => entries,
             // No annotation directory means no annotations. That is the ordinary case for
             // every document nobody has annotated, so it is not an error.
-            return Ok(Loaded {
-                annotations: Vec::new(),
-                skipped: 0,
-            });
+            Err(e) if crate::fs::is_absent(&e) => {
+                return Ok(Loaded {
+                    annotations: Vec::new(),
+                    skipped: 0,
+                });
+            }
+            // Anything else is a real failure and must not read as an empty page. A dropped
+            // session or a permission problem would otherwise hide every note anybody had
+            // written — including the mismatch warnings this module exists to surface — and
+            // would look exactly like a document nobody had annotated.
+            Err(e) => return Err(e.context(format!("listing {dir}"))),
         };
 
         // The owner travels with the path because the listing already reported it. That is
@@ -717,6 +733,19 @@ mod tests {
         assert_eq!(attribution("souta", Some("1000")), Attribution::Unchecked);
     }
 
+    /// An unresolved uid is not evidence of agreement either, even when the author happens to
+    /// be spelled the same way. `is_safe_name` permits a numeric author, so this is reachable
+    /// by configuration rather than only in theory, and reporting it as verified would be the
+    /// one thing the three-valued answer exists to prevent.
+    #[test]
+    fn a_numeric_author_matching_an_unresolved_uid_is_still_unchecked() {
+        assert_eq!(attribution("1000", Some("1000")), Attribution::Unchecked);
+        assert!(
+            is_safe_name("1000"),
+            "the case is reachable by configuration"
+        );
+    }
+
     /// Free, and that is the design claim: the owner arrives on the listing `load` already
     /// spends. Measured as a comparison rather than against a fixed number, because the
     /// claim is about the difference — a later "improvement" that stat'ed each log to find
@@ -847,6 +876,42 @@ mod tests {
             Attribution::Mismatched {
                 owner: "bob".to_string()
             }
+        );
+    }
+
+    /// The one refusal that is an ordinary answer. Every document nobody has annotated has
+    /// no sidecar directory, and saying so is not an error.
+    #[tokio::test]
+    async fn a_missing_annotation_directory_is_not_an_error() {
+        let fs = store_over_empty_tree().await;
+        let loaded = Store::new(&fs).load(DOC).await.expect("load");
+        assert!(loaded.annotations.is_empty());
+    }
+
+    /// And every other refusal is. A listing that fails for any reason other than absence
+    /// must not come back as "nobody has annotated this": that hides whatever anybody wrote,
+    /// including the mismatch warnings this module exists to raise, behind a page that looks
+    /// perfectly normal. This is the failure `CONTRIBUTING.md` names, one layer up from where
+    /// it was found the first time.
+    #[tokio::test]
+    async fn a_refused_listing_is_an_error_rather_than_an_empty_page() {
+        const PERMISSION_DENIED: u32 = 3;
+        let dir = ann_dir(DOC);
+        let fs = FakeRemote::new()
+            .dir("/srv", vec![])
+            .dir(&dir, vec![("souta.jsonl", file_attrs(10, 1))])
+            .refuses_listing(&dir, PERMISSION_DENIED)
+            .spawn()
+            .await;
+
+        let e = Store::new(&fs)
+            .load(DOC)
+            .await
+            .expect_err("a refused listing must not read as an empty page");
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("permission denied"),
+            "the error has to say what the remote said, got: {text}"
         );
     }
 

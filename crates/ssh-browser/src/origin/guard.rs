@@ -66,7 +66,13 @@ fn split_host(host: &str) -> (&str, Option<u16>) {
     }
 }
 
-fn is_label(s: &str) -> bool {
+/// The shape a hostname label has to have, and the rule every request is held to.
+///
+/// Crate-visible so that `Alias::new` checks exactly this rather than a second copy of
+/// it. The copies had already drifted: `-docs` passed the constructor and was then
+/// refused by `classify` on every request, so the daemon paid for the ssh connection,
+/// printed the route and listed it as a link that could not work.
+pub(crate) fn is_label(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
         && !s.ends_with('-')

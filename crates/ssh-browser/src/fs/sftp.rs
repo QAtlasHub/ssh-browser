@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Entry, RangeReq, RemoteFs};
+use super::{Entry, RangeReq, Refused, RemoteFs};
 use crate::sftp::transport::{self, SshChild};
 use crate::sftp::wire::{
     Attrs, CLOSE, DATA, Dec, Enc, FXF_APPEND, FXF_CREAT, FXF_READ, FXF_WRITE, HANDLE, MKDIR, NAME,
@@ -130,8 +130,23 @@ fn decode_names(payload: &[u8]) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// The handle from an OPEN or OPENDIR reply, or an error carrying why the remote said no.
+///
+/// The status code is decoded rather than dropped. It is the only thing separating "there is
+/// no such directory" — the ordinary answer for every document nobody has annotated — from a
+/// permission problem or a session that has gone away. A caller handed one undifferentiated
+/// error has to guess, and the guess that looks safe turns every remote failure into an empty
+/// page.
 fn handle_from(r: &Reply, what: &str) -> Result<Vec<u8>> {
-    ensure!(r.kind == HANDLE, "{what} refused (reply type {})", r.kind);
+    if r.kind != HANDLE {
+        let why = match Dec::new(r.payload()).u32() {
+            Some(status) => anyhow::Error::new(Refused { status }),
+            // A reply that is neither a handle nor a readable status. Still an error, just
+            // one the remote did not explain.
+            None => anyhow!("unreadable reply (type {})", r.kind),
+        };
+        return Err(why.context(format!("{what} refused")));
+    }
     Ok(Dec::new(r.payload()).str().context("handle")?.to_vec())
 }
 

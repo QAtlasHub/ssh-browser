@@ -167,7 +167,12 @@ async fn main() -> Result<()> {
 /// The local account name, which is a guess at the remote one. The SFTP transport never
 /// runs a shell, so the remote account is not something this process can ask for, and
 /// inferring it from a home directory path would be a guess presented as a fact. Naming it
-/// explicitly is the honest default until a listing's uid can be checked against it.
+/// explicitly with `--author` is the honest alternative.
+///
+/// The guess does not go unchecked: what a log claims is compared against the owner a
+/// listing reports, and a mismatch is shown beside the note. See `annot::Attribution`. That
+/// comparison uses the owner's *name* out of the listing's `longname`, not the numeric uid,
+/// which cannot answer the question at all.
 fn default_author() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
