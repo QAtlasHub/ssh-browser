@@ -12,6 +12,25 @@ stable.
 
 ### Added
 
+- The extension has icons, drawn by a script rather than checked in as four blobs nobody can
+  edit. The mark is a shell prompt, because at sixteen pixels one idea is all that survives.
+  Re-running produces byte-identical files, so regenerating them puts nothing in a diff.
+- `npm --prefix extension run package` writes the zip a Chrome Web Store upload wants. The ZIP
+  is written by hand from `zlib` rather than by a dependency: this half ships to a store, and
+  every tool in its chain is one more thing a reviewer has to take on trust. Entries are
+  sorted and timestamps fixed, so the artifact is reproducible and can be checked against the
+  source instead of believed.
+- `PRIVACY.md`, which the store requires as a URL, and `extension/STORE.md`, which is every
+  field of the submission form written out where it can be reviewed rather than typed into a
+  textarea. The data disclosure names what is genuinely handled — the control token, page text
+  read for anchoring, and the notes themselves — and says in each case that the destination is
+  the reader's own machine.
+- `npm --prefix e2e run shots` photographs the product for that listing, through the same
+  harness the checks use, so a screenshot cannot show a version that never passed.
+- `measure-roundtrips` is an example rather than a binary. `cargo install` puts every `[[bin]]`
+  on the reader's PATH, and a command by that name means nothing outside this project and
+  could collide with anything. It is also, literally, a program that uses this library.
+- Crate metadata for publishing: a readme, keywords and categories.
 - Prefetched subresources are read by range rather than by polling, since the listing already
   says how long each one is. `read_batch` cannot know a length, so it asks in 32 KB chunks
   until a short read arrives — a round trip per chunk, which made a one-megabyte bundle
@@ -29,8 +48,6 @@ stable.
   `main`, so the precedence can be tested. It is three `or`s and an `extend`, any one of which
   could be turned around without a single test noticing, and the result decides which host a
   URL reaches.
-
-
 - The e2e harness covers the product rather than one claim of it: the PAC's routing decisions,
   every refusal `SECURITY.md` promises, conditional `GET`, ranges, directory listings and the
   trailing-slash redirect, and — for the first time — the extension itself, loaded unpacked
@@ -64,8 +81,6 @@ stable.
   daemon could therefore start on a suffix no URL could match, or serve pages for an hour
   before answering a reader's first note with a 500. Both are configuration and are refused
   with the rest of it.
-
-
 - A note written against a filename needing percent-escapes could not be read back. The
   extension derived the document from `location.pathname`, which keeps its escapes, then
   escaped it a second time on the read path and not on the write path; the daemon decodes

@@ -4,3 +4,10 @@ dist/
 *.log
 .DS_Store
 Thumbs.db
+*.zip
+e2e/shots/
+
+# Annotation sidecars. The e2e fixture is served as a real tree, so running the harness
+# writes notes beside it exactly as it would on a remote host — and those are test residue,
+# not something to commit.
+.ssh-browser/

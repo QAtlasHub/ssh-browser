@@ -46,7 +46,7 @@ deny:
 # Measure the round-trip invariant against a real host. CI runs the same binary
 # against a local sshd with 10 ms of injected latency.
 roundtrips host dir="/usr/include":
-    cargo run --release --bin measure-roundtrips -- {{host}} {{dir}}
+    cargo run --release --example measure-roundtrips -- {{host}} {{dir}}
 
 # Serve one alias, e.g. `just serve docs myhost /srv/docs`.
 serve alias host base:
