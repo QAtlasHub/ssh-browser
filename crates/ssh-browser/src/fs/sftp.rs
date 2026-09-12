@@ -19,7 +19,7 @@ use super::{Entry, RangeReq, RemoteFs};
 use crate::sftp::transport::{self, SshChild};
 use crate::sftp::wire::{
     Attrs, CLOSE, DATA, Dec, Enc, FXF_APPEND, FXF_CREAT, FXF_READ, FXF_WRITE, HANDLE, MKDIR, NAME,
-    OPEN, OPENDIR, READ, READDIR, STATUS, STATUS_EOF, STATUS_OK, WRITE,
+    OPEN, OPENDIR, READ, READDIR, STATUS, STATUS_EOF, STATUS_OK, WRITE, owner_of_longname,
 };
 use crate::sftp::{Reply, Rx, Sftp, Tx};
 
@@ -119,9 +119,13 @@ fn decode_names(payload: &[u8]) -> Result<Vec<Entry>> {
     let mut out = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let name = String::from_utf8_lossy(d.str().context("filename")?).into_owned();
-        d.str().context("longname")?;
+        // The longname is the only place a v3 listing carries the owner's *name*. The
+        // attrs carry a numeric uid, which cannot be compared with an account name
+        // without a passwd lookup the sftp subsystem has no way to perform.
+        let longname = String::from_utf8_lossy(d.str().context("longname")?).into_owned();
+        let owner = owner_of_longname(&longname).map(str::to_string);
         let attrs = Attrs::decode(&mut d).context("attrs")?;
-        out.push(Entry { name, attrs });
+        out.push(Entry { name, attrs, owner });
     }
     Ok(out)
 }

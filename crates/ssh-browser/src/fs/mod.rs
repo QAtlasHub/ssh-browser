@@ -15,6 +15,12 @@ pub mod sftp;
 pub struct Entry {
     pub name: String,
     pub attrs: Attrs,
+    /// The owner's account name, when the listing reported one legibly.
+    ///
+    /// `None` means the remote did not say, or said it in a shape not worth guessing at —
+    /// not that the file is unowned. Callers have to keep those two apart, because the one
+    /// thing this feeds is the check on who wrote an annotation log.
+    pub owner: Option<String>,
 }
 
 /// One byte range of one file.

@@ -985,6 +985,7 @@ mod tests {
                 permissions: Some(if dir { 0o040755 } else { 0o100644 }),
                 ..Attrs::default()
             },
+            owner: None,
         }
     }
 
@@ -1480,6 +1481,39 @@ mod tests {
         assert_eq!(annotations[0]["body"], "a note");
         assert_eq!(annotations[0]["id"], id.as_str());
         assert_eq!(annotations[0]["author"], "souta");
+        // This fixture's remote reports no owner, so the honest answer is that nobody
+        // checked. The field must be there saying so rather than absent, because an
+        // extension cannot tell an absent field from a daemon that verified and approved.
+        assert_eq!(annotations[0]["attribution"]["state"], "unchecked");
+    }
+
+    /// The wire shape the extension reads for a forged log: a tagged state and the name of
+    /// the account that actually owns the file.
+    #[tokio::test]
+    async fn a_mismatched_author_reaches_the_extension_as_json() {
+        let dir = "/srv/.ssh-browser/a.html/ann";
+        let log = b"{\"op\":\"add\",\"id\":\"alice:1\",\"at\":10,\"body\":\"is this alice?\"}\n";
+        let origin = origin_with(
+            one_page()
+                .dir(dir, vec![("alice.jsonl", file_attrs(log.len() as u64, 1))])
+                .owner(&format!("{dir}/alice.jsonl"), "bob")
+                .file(&format!("{dir}/alice.jsonl"), log),
+        )
+        .await;
+
+        let listed = origin
+            .handle(loopback(
+                "/_control/annotations?doc=docs/a.html",
+                Some(TEST_TOKEN),
+            ))
+            .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = json_of(listed).await;
+        let annotations = listed["annotations"].as_array().expect("an array");
+        assert_eq!(annotations.len(), 1, "the note is served, not censored");
+        assert_eq!(annotations[0]["author"], "alice");
+        assert_eq!(annotations[0]["attribution"]["state"], "mismatched");
+        assert_eq!(annotations[0]["attribution"]["owner"], "bob");
     }
 
     #[tokio::test]

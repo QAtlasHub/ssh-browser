@@ -68,6 +68,45 @@ pub struct Record {
     pub reply_to: Option<String>,
 }
 
+/// Whether the filesystem agrees with what a log's filename claims about its author.
+///
+/// The claim is worth checking because it is the only thing naming an author, and on a
+/// group-writable directory somebody else may get there first: a log called `alice.jsonl`
+/// that bob created lets bob write records with ids beginning `alice:`, which [`merge`] will
+/// accept and attribute to alice. Permissions are what should stop that. This is what
+/// notices when they did not.
+///
+/// Detection, not prevention. By the time a reader can see a mismatch the forged records are
+/// already on disk, so the useful thing is to say so rather than to imply otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum Attribution {
+    /// The log is owned by the account its filename names.
+    Owned,
+    /// It is owned by somebody else, who is named here.
+    Mismatched { owner: String },
+    /// Nothing was checked, because the remote did not report an owner legibly.
+    ///
+    /// Kept apart from `Owned` deliberately. The whole value of the check is lost if "not
+    /// checked" and "checked and fine" look the same to a reader.
+    Unchecked,
+}
+
+/// Judge one log's filename against the owner a listing reported.
+pub fn attribution(author: &str, owner: Option<&str>) -> Attribution {
+    match owner {
+        None => Attribution::Unchecked,
+        Some(who) if who == author => Attribution::Owned,
+        // A remote that could not resolve a uid to a name prints the number instead. That
+        // is no evidence about a name, so it cannot be evidence of a mismatch either — and
+        // calling it one would accuse whoever the number turns out to belong to.
+        Some(who) if who.bytes().all(|b| b.is_ascii_digit()) => Attribution::Unchecked,
+        Some(who) => Attribution::Mismatched {
+            owner: who.to_string(),
+        },
+    }
+}
+
 /// What a reader sees after the logs are folded together.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Annotation {
@@ -79,11 +118,18 @@ pub struct Annotation {
     pub selectors: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// Carried per annotation although the fact is per log.
+    ///
+    /// A reader renders annotations, so putting it here saves the half that ships through a
+    /// store review from having to join against a separate table of authors.
+    pub attribution: Attribution,
 }
 
 pub struct AuthorLog {
     pub author: String,
     pub records: Vec<Record>,
+    /// What the filesystem says about whether this log is really `author`'s.
+    pub attribution: Attribution,
 }
 
 /// What `load` found, including what it could not read.
@@ -179,6 +225,7 @@ pub fn merge(logs: &[AuthorLog]) -> Vec<Annotation> {
                         body: String::new(),
                         selectors: None,
                         reply_to: None,
+                        attribution: log.attribution.clone(),
                     });
                     entry.at = record.at;
                     if let Some(body) = &record.body {
@@ -257,17 +304,22 @@ impl<'a, F: RemoteFs> Store<'a, F> {
             });
         };
 
-        let paths: Vec<String> = entries
+        // The owner travels with the path because the listing already reported it. That is
+        // what makes checking who wrote a log cost nothing: it rides the round trip this
+        // load was going to spend anyway, so there is no version of this that is cheaper by
+        // skipping the check.
+        let logs_found: Vec<(String, Option<String>)> = entries
             .iter()
             .filter(|e| !e.attrs.is_dir() && e.name.ends_with(".jsonl"))
-            .map(|e| format!("{dir}/{}", e.name))
+            .map(|e| (format!("{dir}/{}", e.name), e.owner.clone()))
             .collect();
-        if paths.is_empty() {
+        if logs_found.is_empty() {
             return Ok(Loaded {
                 annotations: Vec::new(),
                 skipped: 0,
             });
         }
+        let paths: Vec<String> = logs_found.iter().map(|(p, _)| p.clone()).collect();
 
         // Every author's log in one batch, so the cost does not grow with the number of
         // people annotating.
@@ -275,12 +327,17 @@ impl<'a, F: RemoteFs> Store<'a, F> {
 
         let mut logs = Vec::new();
         let mut skipped = 0;
-        for (path, body) in paths.iter().zip(bodies) {
+        for ((path, owner), body) in logs_found.iter().zip(bodies) {
             let author = author_of(path)?;
+            let attribution = attribution(&author, owner.as_deref());
             let body = body.with_context(|| format!("reading {path}"))?;
             let (records, bad) = parse(&body);
             skipped += bad;
-            logs.push(AuthorLog { author, records });
+            logs.push(AuthorLog {
+                author,
+                records,
+                attribution,
+            });
         }
 
         Ok(Loaded {
@@ -319,7 +376,7 @@ impl<'a, F: RemoteFs> Store<'a, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::FakeRemote;
+    use crate::testing::{FakeRemote, file_attrs};
 
     const DOC: &str = "/srv/index.html";
 
@@ -342,6 +399,7 @@ mod tests {
         AuthorLog {
             author: author.to_string(),
             records,
+            attribution: Attribution::Owned,
         }
     }
 
@@ -631,6 +689,180 @@ mod tests {
             result.is_err(),
             "souta must not be able to write a record owned by alice"
         );
+    }
+
+    #[test]
+    fn a_log_owned_by_the_account_it_names_is_owned() {
+        assert_eq!(attribution("souta", Some("souta")), Attribution::Owned);
+    }
+
+    /// The forgery this exists to catch: bob got to `alice.jsonl` first, so records with
+    /// ids beginning `alice:` are bob's and would otherwise read as alice's.
+    #[test]
+    fn a_log_owned_by_somebody_else_is_a_mismatch() {
+        assert_eq!(
+            attribution("alice", Some("bob")),
+            Attribution::Mismatched {
+                owner: "bob".to_string()
+            }
+        );
+    }
+
+    /// Two different reasons to conclude nothing, and neither may be reported as agreement.
+    #[test]
+    fn no_legible_owner_means_unchecked_rather_than_fine() {
+        assert_eq!(attribution("souta", None), Attribution::Unchecked);
+        // A remote that could not resolve the uid prints the number. Calling that a mismatch
+        // would accuse whoever the number belongs to, which may well be souta.
+        assert_eq!(attribution("souta", Some("1000")), Attribution::Unchecked);
+    }
+
+    /// Free, and that is the design claim: the owner arrives on the listing `load` already
+    /// spends. Measured as a comparison rather than against a fixed number, because the
+    /// claim is about the difference — a later "improvement" that stat'ed each log to find
+    /// its owner would break this while every other test kept passing.
+    #[tokio::test]
+    async fn checking_who_wrote_each_log_costs_no_extra_round_trips() {
+        async fn cost_of_load(remote: FakeRemote) -> (u64, Attribution) {
+            let fs = remote.spawn().await;
+            let store = Store::new(&fs);
+            let id = new_id("souta").expect("entropy");
+            store
+                .append(DOC, "souta", &rec(Op::Add, &id, 100, Some("mine")))
+                .await
+                .expect("append");
+
+            let before = fs.round_trips();
+            let loaded = store.load(DOC).await.expect("load");
+            let attribution = loaded.annotations[0].attribution.clone();
+            (fs.round_trips() - before, attribution)
+        }
+
+        let (with_owner, checked) =
+            cost_of_load(FakeRemote::new().reached_as("souta").dir("/srv", vec![])).await;
+        let (without_owner, unchecked) = cost_of_load(FakeRemote::new().dir("/srv", vec![])).await;
+
+        assert_eq!(checked, Attribution::Owned, "an owner was reported");
+        assert_eq!(unchecked, Attribution::Unchecked, "none was");
+        assert_eq!(
+            with_owner, without_owner,
+            "the check rides the listing rather than adding to it"
+        );
+    }
+
+    /// Invariant 1 on the annotation path: ten authors cost what one does. This is what the
+    /// per-author format is for — reading them is one batch, not one request each.
+    #[tokio::test]
+    async fn a_document_with_ten_authors_costs_what_one_author_costs() {
+        fn tree(authors: usize) -> FakeRemote {
+            let dir = ann_dir(DOC);
+            let logs: Vec<(String, String)> = (0..authors)
+                .map(|i| {
+                    (
+                        format!("author{i}.jsonl"),
+                        format!(
+                            "{{\"op\":\"add\",\"id\":\"author{i}:1\",\"at\":10,\"body\":\"x\"}}\n"
+                        ),
+                    )
+                })
+                .collect();
+
+            let mut remote = FakeRemote::new().dir(
+                &dir,
+                logs.iter()
+                    .map(|(name, line)| (name.as_str(), file_attrs(line.len() as u64, 1)))
+                    .collect(),
+            );
+            for (name, line) in &logs {
+                remote = remote.file(&format!("{dir}/{name}"), line.as_bytes());
+            }
+            remote
+        }
+
+        async fn cost_of_load(remote: FakeRemote, expected: usize) -> u64 {
+            let fs = remote.spawn().await;
+            let before = fs.round_trips();
+            let loaded = Store::new(&fs).load(DOC).await.expect("load");
+            assert_eq!(loaded.annotations.len(), expected);
+            fs.round_trips() - before
+        }
+
+        let one = cost_of_load(tree(1), 1).await;
+        let ten = cost_of_load(tree(10), 10).await;
+        assert_eq!(
+            one, ten,
+            "the cost must not grow with the number of authors"
+        );
+    }
+
+    /// The question `SECURITY.md` used to leave open: this daemon is configured to write as
+    /// souta, but the account it actually reaches the remote as is somebody else.
+    #[tokio::test]
+    async fn a_configured_author_the_remote_does_not_write_as_is_caught() {
+        let fs = FakeRemote::new()
+            .reached_as("sshimozono")
+            .dir("/srv", vec![])
+            .spawn()
+            .await;
+        let store = Store::new(&fs);
+        let id = new_id("souta").expect("entropy");
+        store
+            .append(DOC, "souta", &rec(Op::Add, &id, 100, Some("a note")))
+            .await
+            .expect("append");
+
+        let loaded = store.load(DOC).await.expect("load");
+        assert_eq!(loaded.annotations.len(), 1, "the note is still shown");
+        assert_eq!(
+            loaded.annotations[0].attribution,
+            Attribution::Mismatched {
+                owner: "sshimozono".to_string()
+            },
+            "the log says souta, the filesystem says sshimozono"
+        );
+    }
+
+    /// A mismatch is surfaced, never censored. Dropping the records would hide somebody's
+    /// annotations on the strength of a heuristic parse of an `ls -l` line.
+    #[tokio::test]
+    async fn a_mismatched_log_still_yields_its_annotations() {
+        let body = b"{\"op\":\"add\",\"id\":\"alice:1\",\"at\":10,\"body\":\"is this alice?\"}\n";
+        let dir = ann_dir(DOC);
+        let fs = FakeRemote::new()
+            .dir(
+                &dir,
+                vec![("alice.jsonl", file_attrs(body.len() as u64, 1))],
+            )
+            .owner(&format!("{dir}/alice.jsonl"), "bob")
+            .file(&format!("{dir}/alice.jsonl"), body)
+            .spawn()
+            .await;
+
+        let loaded = Store::new(&fs).load(DOC).await.expect("load");
+        assert_eq!(loaded.annotations.len(), 1);
+        assert_eq!(loaded.annotations[0].author, "alice");
+        assert_eq!(loaded.annotations[0].body, "is this alice?");
+        assert_eq!(
+            loaded.annotations[0].attribution,
+            Attribution::Mismatched {
+                owner: "bob".to_string()
+            }
+        );
+    }
+
+    /// A remote that reports nothing legible must not make every annotation look verified.
+    #[tokio::test]
+    async fn a_remote_that_reports_no_owner_reads_as_unchecked() {
+        let fs = store_over_empty_tree().await;
+        let store = Store::new(&fs);
+        let id = new_id("souta").expect("entropy");
+        store
+            .append(DOC, "souta", &rec(Op::Add, &id, 100, Some("a note")))
+            .await
+            .expect("append");
+
+        let loaded = store.load(DOC).await.expect("load");
+        assert_eq!(loaded.annotations[0].attribution, Attribution::Unchecked);
     }
 
     #[tokio::test]
