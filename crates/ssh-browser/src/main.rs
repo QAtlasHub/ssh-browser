@@ -1,10 +1,13 @@
 //! ssh-browser: open files on an SSH host as a real browser origin.
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail, ensure};
+use ssh_browser::config;
 use ssh_browser::control::Token;
 use ssh_browser::origin::{Alias, Origin, pac};
 
-const USAGE: &str = "usage:\n  ssh-browser serve [--port N] [--suffix S] [--author NAME] <alias>=<ssh-host>:<base> ...\n  ssh-browser pac   [--port N] [--suffix S]";
+const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--author NAME] [<alias>=<ssh-host>:<base> ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"/srv/docs\"";
 
 const DEFAULT_PORT: u16 = 7391;
 const DEFAULT_SUFFIX: &str = "ssh-browser";
@@ -16,36 +19,76 @@ async fn main() -> Result<()> {
         bail!("{USAGE}");
     };
 
-    let mut port = DEFAULT_PORT;
-    let mut suffix = DEFAULT_SUFFIX.to_string();
-    let mut author = default_author();
-    let mut aliases = Vec::new();
+    let mut named_config: Option<PathBuf> = None;
+    let mut port: Option<u16> = None;
+    let mut suffix: Option<String> = None;
+    let mut author: Option<String> = None;
+    let mut cli_aliases = Vec::new();
 
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
+            "--config" => {
+                named_config = Some(PathBuf::from(
+                    rest.get(i + 1).context("--config needs a path")?,
+                ));
+                i += 2;
+            }
             "--port" => {
-                port = rest
-                    .get(i + 1)
-                    .context("--port needs a value")?
-                    .parse()
-                    .context("--port must be a number")?;
+                port = Some(
+                    rest.get(i + 1)
+                        .context("--port needs a value")?
+                        .parse()
+                        .context("--port must be a number")?,
+                );
                 i += 2;
             }
             "--suffix" => {
-                suffix = rest.get(i + 1).context("--suffix needs a value")?.clone();
+                suffix = Some(rest.get(i + 1).context("--suffix needs a value")?.clone());
                 i += 2;
             }
             "--author" => {
-                author = rest.get(i + 1).context("--author needs a value")?.clone();
+                author = Some(rest.get(i + 1).context("--author needs a value")?.clone());
                 i += 2;
             }
             spec => {
-                aliases.push(parse_alias(spec)?);
+                cli_aliases.push(parse_alias(spec)?);
                 i += 1;
             }
         }
     }
+
+    // A named file must exist. The default one need not, because not having one is the
+    // ordinary case; failing on a path the operator typed and silently skipping one they did
+    // not are both the right answer to their own question.
+    let file = match named_config {
+        Some(path) => Some(config::load(&path)?),
+        None => match config::default_path().filter(|p| p.exists()) {
+            Some(path) => Some(config::load(&path)?),
+            None => None,
+        },
+    };
+    let from_file = file.unwrap_or(config::Config {
+        server: config::Server::default(),
+        aliases: Vec::new(),
+    });
+
+    // The command line wins over the file, because it is the thing typed most recently and
+    // for this run only.
+    let port = port.or(from_file.server.port).unwrap_or(DEFAULT_PORT);
+    let suffix = suffix
+        .or(from_file.server.suffix)
+        .unwrap_or_else(|| DEFAULT_SUFFIX.to_string());
+    let author = author
+        .or(from_file.server.author)
+        .unwrap_or_else(default_author);
+
+    // Added to rather than replacing. Naming one alias on the command line should not
+    // silently drop the six in the file, and a name given in both places is a collision to
+    // report rather than a precedence to invent.
+    let mut aliases = from_file.aliases;
+    aliases.extend(cli_aliases);
+    config::ensure_distinct(&aliases)?;
 
     match command.as_str() {
         "pac" => {
@@ -55,7 +98,7 @@ async fn main() -> Result<()> {
         "serve" => {
             ensure!(
                 !aliases.is_empty(),
-                "give at least one <alias>=<ssh-host>:<base>\n\n{USAGE}"
+                "no aliases: give one as <alias>=<ssh-host>:<base>, or put them in a config file\n\n{USAGE}"
             );
             // Built before the aliases are handed over, and printed after the listener
             // exists. The old order announced "listening" first, which was a claim about
@@ -65,7 +108,14 @@ async fn main() -> Result<()> {
             // the error saying otherwise.
             let routes: Vec<String> = aliases
                 .iter()
-                .map(|a| format!("  http://{}.{suffix}/  ->  {}:{}", a.name, a.host, a.base))
+                .map(|a| {
+                    format!(
+                        "  http://{}.{suffix}/  ->  {}:{}",
+                        a.name(),
+                        a.host(),
+                        a.base()
+                    )
+                })
                 .collect();
 
             let token = Token::generate()?;
@@ -123,6 +173,10 @@ fn default_author() -> String {
 }
 
 /// Parse `<alias>=<ssh-host>:<absolute-base>`.
+///
+/// Splitting is this function's job; judging the parts is `Alias::new`'s, which is also what
+/// the configuration file goes through. The rules used to live here, where a second entry
+/// point could not reach them.
 fn parse_alias(spec: &str) -> Result<Alias> {
     let (name, rest) = spec
         .split_once('=')
@@ -130,23 +184,5 @@ fn parse_alias(spec: &str) -> Result<Alias> {
     let (host, base) = rest
         .split_once(':')
         .with_context(|| format!("expected <ssh-host>:<base> after the =, got {rest:?}"))?;
-
-    ensure!(!name.is_empty(), "alias name is empty in {spec:?}");
-    ensure!(!host.is_empty(), "ssh host is empty in {spec:?}");
-    // The alias becomes a hostname label, so it has to be able to be one.
-    ensure!(
-        name.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
-        "alias {name:?} must be lowercase letters, digits and hyphens: it becomes a hostname label"
-    );
-    ensure!(
-        base.starts_with('/'),
-        "base path must be absolute, got {base:?}"
-    );
-
-    Ok(Alias {
-        name: name.to_string(),
-        host: host.to_string(),
-        base: base.to_string(),
-    })
+    Alias::new(name, host, base).with_context(|| format!("in {spec:?}"))
 }

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::header::{
@@ -56,10 +56,52 @@ struct Conditions {
     control_token: Option<String>,
 }
 
+/// One alias, checked.
+///
+/// The fields are private and [`Alias::new`] is the only way to make one, so there is no
+/// route into the daemon that skips these checks. That matters now that aliases can come
+/// from a configuration file as well as from the command line: two entry points and one
+/// validating constructor is fine, two entry points and two copies of the rules is how the
+/// looser copy becomes the one that gets used.
+#[derive(Debug)]
 pub struct Alias {
-    pub name: String,
-    pub host: String,
-    pub base: String,
+    name: String,
+    host: String,
+    base: String,
+}
+
+impl Alias {
+    pub fn new(name: &str, host: &str, base: &str) -> Result<Self> {
+        ensure!(!name.is_empty(), "an alias has no name");
+        ensure!(!host.is_empty(), "alias {name:?} has no ssh host");
+        // The alias becomes a hostname label, so it has to be able to be one.
+        ensure!(
+            name.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "alias {name:?} must be lowercase letters, digits and hyphens: it becomes a hostname label"
+        );
+        ensure!(
+            base.starts_with('/'),
+            "alias {name:?} needs an absolute base path, got {base:?}"
+        );
+        Ok(Self {
+            name: name.to_string(),
+            host: host.to_string(),
+            base: base.to_string(),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn base(&self) -> &str {
+        &self.base
+    }
 }
 
 struct Session {

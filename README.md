@@ -96,6 +96,38 @@ so prefer the PAC.
 `--port` and `--suffix` change the listener and the hostname suffix. `ssh-browser
 pac` prints the script without starting a server.
 
+### A config file, for more than one host
+
+```toml
+[server]
+port = 7391
+suffix = "ssh-browser"
+author = "souta"
+
+[[alias]]
+name = "docs"
+host = "myhost"
+base = "/srv/docs"
+
+[[alias]]
+name = "cluster"
+host = "login-node"
+base = "/home/me/public_html"
+```
+
+`--config FILE`, or `<config dir>/ssh-browser/config.toml` if it exists. A file named on
+the command line must exist; the default one need not.
+
+The command line wins over the file, and aliases given on the command line are **added**
+to the file's rather than replacing them — naming one host should not silently drop the
+others. A name defined in both places is an error, not a precedence.
+
+**Unknown keys are refused.** A `suffixx = "dev"` that got quietly dropped would leave the
+daemon running on a suffix nobody chose and looking exactly like one that was configured;
+instead the error names the key, the line, and what was expected. `scheme = "https"` is
+refused too, for the same reason: that mode is designed and not built, and serving http to
+a file that asked for https is the one outcome that looks like success.
+
 ### The extension
 
 `extension/` builds with `npm ci && npm run build` and loads unpacked from
