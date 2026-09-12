@@ -201,8 +201,21 @@ It runs in CI against a local `sshd` and can be pointed at a real host with
 `SSH_BROWSER_E2E_HOST` and `SSH_BROWSER_E2E_BASE`. Run against one, it caught the daemon
 announcing `listening on 127.0.0.1:PORT` before it had taken the port.
 
-The **extension** is not in that harness yet: it typechecks and bundles in CI but has not
-been loaded in a browser against a live daemon. That is the next thing to do.
+The extension is in the harness too, loaded unpacked into the same browser. The popup
+connects, the content script runs on an alias page, and a note written through the control
+API comes back and anchors — on a filename with a space in it, which is where the read and
+write paths once disagreed about which document they meant.
+
+The harness covers, in one run: the PAC's routing decisions; the refusals (`403` for a
+rebinding `Host`, `403` for percent-encoded traversal, `405` for writing to an alias origin,
+`401` without a control token, `405` for a preflight, and no CORS headers anywhere); serving
+(weak validator, `304` on revisit, directory listing, `301` for a missing trailing slash,
+`206` for a byte range); the browser comparison above; and the extension.
+
+One thing it does not cover: the permission *request*. The popup asks for the alias hosts on
+the Connect click, and that raises a permission bubble, which is browser chrome a test cannot
+click. The harness grants the permission up front instead, so everything downstream of the
+grant is exercised for real and the asking is not.
 
 Not there yet: collaborative editing of documents themselves.
 
