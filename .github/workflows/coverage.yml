@@ -3,9 +3,10 @@ name: coverage
 # Workspace line coverage via `cargo-llvm-cov`, uploaded to Codecov.
 #
 # Deliberately NOT a required check: a Codecov hiccup must not block a merge, so
-# the upload runs with `fail_ci_if_error: false`. It needs a `CODECOV_TOKEN` repo
-# secret; until one is set the upload is a no-op rather than a failure, and the
-# coverage measurement itself still runs.
+# the upload runs with `fail_ci_if_error: false`. `CODECOV_TOKEN` is an
+# organisation-wide secret rather than one set per repository, so there is nothing
+# to configure here. If it is ever not visible to this repo the upload becomes a
+# no-op rather than a failure, and the coverage measurement itself still runs.
 #
 # Third-party Actions are SHA-pinned, reusing the SHAs from ci.yml where they
 # overlap.
@@ -36,6 +37,9 @@ jobs:
       - name: Upload to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
         with:
+          # Named rather than detected: auto-detection mis-routes uploads from pull
+          # requests opened from a fork.
+          slug: QAtlasHub/ssh-browser
           files: lcov.info
           fail_ci_if_error: false
         env:

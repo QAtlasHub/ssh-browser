@@ -30,6 +30,16 @@ stable.
   cold, 1.6 ms warm against a host at 18 ms RTT.
 - `RemoteFs::list_dirs`, the batch form of a listing, with `list_dir` defined as its
   n=1 case.
+- An HTML page is read for its own `<link>`, `<script>` and `<img>` references, and those are
+  fetched in one batch before the page is answered. This is the browser half of invariant 1:
+  HTTP/1.1 allows six connections per origin, so forty subresources are seven waves of
+  requests and each wave is a round trip. Measured by serving every subresource one at a
+  time — the worst case any browser can produce — a forty-subresource page costs 87 remote
+  round trips without this and 0 with it.
+- A page is untrusted input, so a scanned reference is resolved and symlink-checked by the
+  same code a real request uses. Symlinks are settled against listings already held before
+  anything new is listed, so naming one on a page cannot get the directory it points at
+  listed. The scan is capped at 64 references per document.
 - An annotation log's filename is checked against the file's owner, which catches both a
   daemon configured to write as an account it does not actually reach the host as, and a
   forged log created by somebody else on a group-writable directory. The owner comes from a

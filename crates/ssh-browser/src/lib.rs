@@ -5,6 +5,7 @@ pub mod cache;
 pub mod control;
 pub mod fs;
 pub mod origin;
+pub mod prefetch;
 pub mod sftp;
 
 #[cfg(test)]
