@@ -130,7 +130,11 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: e2e/package-lock.json
+          # Both, because this job needs the extension built as well as the harness
+          # installed. The `extension` job builds it too, but jobs do not share a workspace.
+          cache-dependency-path: |
+            e2e/package-lock.json
+            extension/package-lock.json
 
       - name: Local sshd
         # The same arrangement as the roundtrips job. The daemon only ever speaks to a host
@@ -147,6 +151,12 @@ jobs:
           ssh-keyscan -H localhost >> ~/.ssh/known_hosts
 
       - run: cargo build --bin ssh-browser
+
+      # The harness loads the extension unpacked, so it needs it built here rather than in
+      # the `extension` job, which runs in a workspace of its own.
+      - run: npm --prefix extension ci
+      - run: npm --prefix extension run build
+
       - run: npm --prefix e2e ci
       - run: npm --prefix e2e run browser
       - run: npm --prefix e2e run e2e
