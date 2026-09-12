@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ssh-browser e2e</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <!-- Every marker starts as a negative. If the script never runs, the assertions have to
+         fail rather than pass on an empty string that happens to match. -->
+    <h1 id="heading">served over ssh</h1>
+    <div id="module">module did not run</div>
+    <div id="fetched">fetch did not run</div>
+    <img id="pic" src="assets/dot.png" alt="a dot" />
+    <script type="module" src="assets/app.mjs"></script>
+  </body>
+</html>

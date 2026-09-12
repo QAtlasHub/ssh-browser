@@ -148,8 +148,29 @@ saying what it appears to say:
 - **misattributed** — the log's filename claims an author the file's owner contradicts.
 - **unreadable** — a log line the daemon could not parse.
 
-The extension typechecks and bundles in CI, and has **not yet been loaded in a browser
-against a live daemon**. That step is manual and is the next thing to do.
+### Verified in a browser
+
+`e2e/` opens the same bytes twice — once through the daemon and once over `file://` — and
+the difference is the whole reason this exists.
+
+| | through the daemon | over `file://` |
+|---|---|---|
+| origin | `http://e2e.ssh-browser` | `file://` |
+| ES module with a relative import | runs | **does not run** |
+| `fetch` of a relative path | succeeds | **refused** |
+| stylesheet | applies | applies |
+| image | decodes | decodes |
+
+The last two rows are the point: this is about **origin**, not about whether files can be
+read. A stylesheet and an image load fine from `file://`. Scripts and `fetch` are what
+break, and those are what a modern page is built out of.
+
+It runs in CI against a local `sshd` and can be pointed at a real host with
+`SSH_BROWSER_E2E_HOST` and `SSH_BROWSER_E2E_BASE`. Run against one, it caught the daemon
+announcing `listening on 127.0.0.1:PORT` before it had taken the port.
+
+The **extension** is not in that harness yet: it typechecks and bundles in CI but has not
+been loaded in a browser against a live daemon. That is the next thing to do.
 
 Not there yet: collaborative editing of documents themselves.
 

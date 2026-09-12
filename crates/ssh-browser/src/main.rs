@@ -57,18 +57,16 @@ async fn main() -> Result<()> {
                 !aliases.is_empty(),
                 "give at least one <alias>=<ssh-host>:<base>\n\n{USAGE}"
             );
-            // A PAC is not discoverable, so the startup banner says outright what
-            // to do with it rather than leaving it to be found.
-            eprintln!("listening on 127.0.0.1:{port}");
-            for a in &aliases {
-                eprintln!("  http://{}.{suffix}/  ->  {}:{}", a.name, a.host, a.base);
-            }
-            eprintln!();
-            eprintln!("point the browser at the generated PAC, for example:");
-            eprintln!("  chrome --proxy-pac-url=http://127.0.0.1:{port}/proxy.pac");
-            eprintln!();
-            eprintln!("or, without touching proxy settings: http://127.0.0.1:{port}/");
-            eprintln!();
+            // Built before the aliases are handed over, and printed after the listener
+            // exists. The old order announced "listening" first, which was a claim about
+            // something that had not happened: taking the port and connecting every host
+            // both happen inside `bind`, so a reader who acted on that line met a refused
+            // connection, and a port already in use produced the announcement followed by
+            // the error saying otherwise.
+            let routes: Vec<String> = aliases
+                .iter()
+                .map(|a| format!("  http://{}.{suffix}/  ->  {}:{}", a.name, a.host, a.base))
+                .collect();
 
             let token = Token::generate()?;
             // Printed as well as written, because a first run has nowhere else to look.
@@ -82,13 +80,31 @@ async fn main() -> Result<()> {
                 "  the extension sends it as {}",
                 ssh_browser::control::TOKEN_HEADER
             );
-
             eprintln!("  annotations are written as {author}");
+            eprintln!();
 
-            Origin::bind(aliases, suffix, port, token, author)
-                .await?
-                .serve()
-                .await
+            // Said before the wait rather than after it, so a slow handshake looks like a
+            // handshake instead of a hang.
+            match routes.len() {
+                1 => eprintln!("connecting over ssh..."),
+                n => eprintln!("connecting {n} hosts over ssh..."),
+            }
+            let bound = Origin::bind(aliases, suffix.clone(), port, token, author).await?;
+
+            // Everything from here is true by the time it is said.
+            eprintln!("listening on 127.0.0.1:{port}");
+            for route in &routes {
+                eprintln!("{route}");
+            }
+            eprintln!();
+            // A PAC is not discoverable, so the banner says outright what to do with it
+            // rather than leaving it to be found.
+            eprintln!("point the browser at the generated PAC, for example:");
+            eprintln!("  chrome --proxy-pac-url=http://127.0.0.1:{port}/proxy.pac");
+            eprintln!();
+            eprintln!("or, without touching proxy settings: http://127.0.0.1:{port}/");
+
+            bound.serve().await
         }
         other => bail!("unknown command {other:?}\n\n{USAGE}"),
     }
