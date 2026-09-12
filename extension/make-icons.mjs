@@ -7,8 +7,7 @@
 //   npm --prefix extension run icons
 //
 // Each PNG is written by hand from `zlib` and a CRC table, so this needs nothing installed.
-// The
-// alternative was taking on a dependency in order to draw two rectangles.
+// The alternative was taking on a dependency in order to draw two rectangles.
 //
 // Nothing here varies with the clock, so re-running produces byte-identical files. An icon
 // that changed every time it was regenerated would put noise in every diff that touched it.
