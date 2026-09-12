@@ -7,9 +7,50 @@
 
 use anyhow::{Result, anyhow};
 
-use crate::sftp::wire::Attrs;
+use crate::sftp::wire::{Attrs, STATUS_NO_SUCH_FILE};
 
 pub mod sftp;
+
+/// A refusal from the remote, carrying the reason it gave.
+///
+/// The reason has to survive the trip. Without it every failed listing looks alike, and a
+/// caller that wants to treat "there is no such directory" as an ordinary empty answer ends
+/// up treating a dead session and a permission problem that way too — which is how a
+/// document's annotations come to read as "nobody has annotated this".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refused {
+    pub status: u32,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self.status {
+            1 => "end of file",
+            2 => "no such file",
+            3 => "permission denied",
+            4 => "failure",
+            5 => "bad message",
+            6 => "no connection",
+            7 => "connection lost",
+            8 => "operation unsupported",
+            _ => "unrecognised status",
+        };
+        write!(f, "the remote refused: {name} ({})", self.status)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Did this failure mean "there is nothing there", as opposed to anything else at all?
+///
+/// Anything that cannot be established as absence is not treated as absence. Guessing the
+/// other way turns every transport problem into an empty answer, which is the failure this
+/// project has already shipped once.
+pub fn is_absent(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<Refused>())
+        .any(|r| r.status == STATUS_NO_SUCH_FILE)
+}
 
 #[derive(Debug, Clone)]
 pub struct Entry {

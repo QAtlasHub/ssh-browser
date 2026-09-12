@@ -72,13 +72,15 @@ pub struct Alias {
 
 impl Alias {
     pub fn new(name: &str, host: &str, base: &str) -> Result<Self> {
-        ensure!(!name.is_empty(), "an alias has no name");
         ensure!(!host.is_empty(), "alias {name:?} has no ssh host");
-        // The alias becomes a hostname label, so it has to be able to be one.
+        // The alias becomes a hostname label, and this is the very function that decides
+        // whether an arriving request's label is acceptable. Asking it, rather than writing
+        // the rule out again, is what stops the two from disagreeing — and they already had:
+        // `-docs` satisfied the copy here and was then refused by `classify` on every single
+        // request, after the daemon had paid for the ssh connection and advertised the route.
         ensure!(
-            name.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
-            "alias {name:?} must be lowercase letters, digits and hyphens: it becomes a hostname label"
+            guard::is_label(name),
+            "alias {name:?} must be lowercase letters, digits and hyphens, and may not start or end with a hyphen: it becomes a hostname label"
         );
         ensure!(
             base.starts_with('/'),
@@ -157,12 +159,37 @@ impl Origin {
             .await
             .with_context(|| format!("bind {addr}"))?;
 
+        // Held to the same rule the PAC is, and here rather than only there: a suffix the
+        // PAC would refuse is one no alias URL can ever match, so starting with it produces a
+        // daemon that listens and serves nothing.
+        ensure!(
+            pac::is_suffix(&suffix),
+            "suffix {suffix:?} must be lowercase letters, digits, hyphens and dots"
+        );
+        // The author becomes a filename, and the only check on it used to live inside the
+        // write path. A typo therefore started a daemon that read pages perfectly well and
+        // then answered the reader's first note with a 500. It is configuration, so it is
+        // refused where the rest of the configuration is.
+        ensure!(
+            annot::is_safe_name(&author),
+            "author {author:?} must be letters, digits, dots, dashes or underscores: it becomes a filename"
+        );
+
         let mut sessions = HashMap::new();
         for a in aliases {
             let fs = SftpFs::connect(&a.host)
                 .await
                 .with_context(|| format!("alias {} -> ssh host {}", a.name, a.host))?;
-            sessions.insert(a.name, Session { base: a.base, fs });
+            // Checked where the map is built, so there is no way to reach a session map with
+            // a name silently missing from it. A caller may have checked earlier and should;
+            // `insert` returning the displaced value is the check that cannot be skipped.
+            ensure!(
+                sessions
+                    .insert(a.name.clone(), Session { base: a.base, fs })
+                    .is_none(),
+                "alias {:?} is defined twice",
+                a.name
+            );
         }
         Ok(Bound {
             origin: Arc::new(Self {
@@ -632,10 +659,16 @@ impl Origin {
 
     /// Read what an HTML page is about to ask for, in one batch.
     ///
-    /// Two round trips at most and neither grows with the number of subresources: one to list
-    /// the directories they live in, one to read them. When they sit beside the document —
-    /// which is what a generated report looks like — the listing is already held and it is
-    /// one.
+    /// One round trip to list the directories they live in, then one batch of reads — and
+    /// neither grows with the number of subresources. When they sit beside the document, which
+    /// is what a generated report looks like, the listing is already held and the listing round
+    /// disappears.
+    ///
+    /// Not "two round trips at most", which is what this used to claim. `read_batch` polls in
+    /// 32 KiB chunks until it sees a short read, so a subresource larger than that costs one
+    /// round trip per chunk — a one-megabyte bundle is thirty-two, not one. That is independent
+    /// of how many subresources there are, which is what invariant 1 is about, but it is not
+    /// one, and saying so would be a claim about file size that nothing here supports.
     ///
     /// Every reference goes through the same resolution and the same symlink rule as a real
     /// request, on purpose. A page is untrusted input, and a prefetcher that skipped those

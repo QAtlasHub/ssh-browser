@@ -197,6 +197,12 @@ base = "/home/me/public_html"
             "[[alias]]\nname = \"a.b\"\nhost = \"h\"\nbase = \"/srv\"\n",
             "[[alias]]\nname = \"docs\"\nhost = \"h\"\nbase = \"relative\"\n",
             "[[alias]]\nname = \"docs\"\nhost = \"\"\nbase = \"/srv\"\n",
+            // A leading or trailing hyphen is a label `guard::classify` refuses on every
+            // request. The constructor used to accept both, so the daemon connected over ssh,
+            // printed the route, listed it as a link — and then served a 403 to anyone who
+            // followed it.
+            "[[alias]]\nname = \"-docs\"\nhost = \"h\"\nbase = \"/srv\"\n",
+            "[[alias]]\nname = \"docs-\"\nhost = \"h\"\nbase = \"/srv\"\n",
         ] {
             assert!(parse(bad).is_err(), "should have been refused:\n{bad}");
         }

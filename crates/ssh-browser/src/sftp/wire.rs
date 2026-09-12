@@ -31,6 +31,12 @@ pub const STATUS_EOF: u32 = 1;
 /// SSH_FX_OK, the only status a write may answer with.
 pub const STATUS_OK: u32 = 0;
 
+/// SSH_FX_NO_SUCH_FILE: the one refusal that means "there is nothing there" rather than
+/// "something went wrong". Everything else — a permission problem, a dead session, a server
+/// that simply failed — has to stay distinguishable from it, because the difference is the
+/// difference between an empty answer and an error.
+pub const STATUS_NO_SUCH_FILE: u32 = 2;
+
 const A_SIZE: u32 = 0x0000_0001;
 const A_UIDGID: u32 = 0x0000_0002;
 const A_PERM: u32 = 0x0000_0004;

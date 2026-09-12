@@ -280,7 +280,17 @@ async function registerContent(suffix: string): Promise<Reply> {
   return { ok: true, detail: `annotating pages under *.${suffix}` };
 }
 
-async function listAnnotations(url: string): Promise<Reply> {
+/// Settings plus the document a page URL names, or the refusal to report instead.
+///
+/// One resolution path for both annotation routes. The daemon settled the same question the
+/// same way — `resolve_doc` exists there so that reading and writing cannot disagree about
+/// what a document is — and the two copies here had already drifted once, which is how one
+/// direction came to escape the path and the other not.
+/// The failure arm pins `ok` to `false` rather than reusing `Reply`'s `boolean`, because a
+/// union only narrows on a discriminant that is a literal in each arm.
+type Resolved = { ok: true; s: Settings; doc: string } | (Reply & { ok: false });
+
+async function resolveDoc(url: string): Promise<Resolved> {
   const s = await stored();
   if (!s) {
     return { ok: false, detail: "not connected" };
@@ -289,6 +299,15 @@ async function listAnnotations(url: string): Promise<Reply> {
   if (doc === null) {
     return { ok: false, detail: "this page is not served by ssh-browser" };
   }
+  return { ok: true, s, doc };
+}
+
+async function listAnnotations(url: string): Promise<Reply> {
+  const resolved = await resolveDoc(url);
+  if (!resolved.ok) {
+    return resolved;
+  }
+  const { s, doc } = resolved;
   const res = await callDaemon(s, `/_control/annotations?doc=${encodeDoc(doc)}`);
   if (!res.ok) {
     return { ok: false, detail: `${res.status}: ${await res.text()}` };
@@ -308,14 +327,11 @@ async function listAnnotations(url: string): Promise<Reply> {
 }
 
 async function addAnnotation(url: string, body: string, selectors?: unknown): Promise<Reply> {
-  const s = await stored();
-  if (!s) {
-    return { ok: false, detail: "not connected" };
+  const resolved = await resolveDoc(url);
+  if (!resolved.ok) {
+    return resolved;
   }
-  const doc = docOfUrl(url, s.suffix);
-  if (doc === null) {
-    return { ok: false, detail: "this page is not served by ssh-browser" };
-  }
+  const { s, doc } = resolved;
   // No author and no id: the daemon decides both, so no caller — including this extension —
   // can write as somebody else or choose an identity.
   //

@@ -12,6 +12,28 @@ stable.
 
 ### Fixed
 
+- A listing that failed for any reason other than absence came back as "no annotations".
+  Every refusal — a dropped session, a permission problem — was folded into the same empty
+  answer as the ordinary case of a document nobody has annotated, hiding whatever anybody had
+  written, mismatch warnings included, behind a page that looked perfectly normal. The wire
+  layer now decodes the SFTP status instead of discarding it, and only `SSH_FX_NO_SUCH_FILE`
+  reads as absence.
+- `Alias::new` accepted a name `guard::classify` then refused on every request. `-docs` passed
+  the constructor's copy of the rule, so the daemon connected over ssh, printed the route and
+  advertised a link that answered 403. It calls `guard::is_label` now, which is the rule
+  requests are actually held to.
+- `Origin::bind` silently dropped an alias whose name was already taken, because
+  `HashMap::insert`'s return value went unread. The check is now where the map is built, so it
+  cannot be skipped by a caller that forgets the earlier one.
+- A numeric author matching an unresolved uid read as verified. `attribution` compared names
+  before noticing the owner was a number, so `author = "1000"` against a uid of 1000 reported
+  `owned` on the strength of two numerals coinciding. The number is recognised first.
+- `suffix` was validated only when generating a PAC, and `author` only at the first write. A
+  daemon could therefore start on a suffix no URL could match, or serve pages for an hour
+  before answering a reader's first note with a 500. Both are configuration and are refused
+  with the rest of it.
+
+
 - A note written against a filename needing percent-escapes could not be read back. The
   extension derived the document from `location.pathname`, which keeps its escapes, then
   escaped it a second time on the read path and not on the write path; the daemon decodes
