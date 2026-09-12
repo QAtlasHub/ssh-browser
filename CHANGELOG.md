@@ -10,6 +10,19 @@ stable.
 
 ## [Unreleased]
 
+### Added
+
+- The e2e harness covers the product rather than one claim of it: the PAC's routing decisions,
+  every refusal `SECURITY.md` promises, conditional `GET`, ranges, directory listings and the
+  trailing-slash redirect, and — for the first time — the extension itself, loaded unpacked
+  into the same browser. A note written through the control API is fetched and anchored by the
+  content script on a filename with a space in it, which is the exact shape of the read/write
+  disagreement fixed above. It also asserts that no `<style>` element appears in the document,
+  since never modifying the page is a claim and not a preference.
+- The extension half runs under `channel: "chromium"`, because an MV3 service worker does not
+  start in the old headless mode at all — the harness would have had nothing to talk to and no
+  way to say so.
+
 ### Fixed
 
 - A listing that failed for any reason other than absence came back as "no annotations".
