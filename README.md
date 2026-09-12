@@ -147,6 +147,12 @@ than being handed the token.
 In the address bar, `ssh` then Tab takes an alias and a path — `ssh docs/notes.html`.
 Suggestions come from the aliases the daemon reports.
 
+`npm run package` writes the zip a store upload wants. It is reproducible — rebuild from the
+same commit and the bytes match — so the upload can be checked against the source rather than
+taken on faith. What the listing needs is written out in [extension/STORE.md](extension/STORE.md),
+and what the extension does with data is in [PRIVACY.md](PRIVACY.md): it sends nothing anywhere
+but `127.0.0.1`, and from there to the host you already had an account on.
+
 ## Status
 
 Early, but usable for reading. Verified against a real host through a jump box:
@@ -226,7 +232,7 @@ grant is exercised for real and the asking is not.
 Not there yet: collaborative editing of documents themselves.
 
 ```
-cargo run --bin measure-roundtrips -- <ssh-host> [remote-dir]
+cargo run --example measure-roundtrips -- <ssh-host> [remote-dir]
 ```
 
 On Git Bash, prefix commands with `MSYS_NO_PATHCONV=1` or a remote path is rewritten

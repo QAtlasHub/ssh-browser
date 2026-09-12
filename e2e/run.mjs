@@ -22,33 +22,31 @@
 // instead, which is the arrangement that has found the bugs a loopback never would.
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import vm from "node:vm";
 
 import { chromium } from "playwright";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const repo = resolve(here, "..");
+import {
+  ALIAS,
+  SUFFIX,
+  TOKEN_HEADER,
+  connectThroughPopup,
+  extensionWithPermissionGranted,
+  loadExtension,
+  startDaemon,
+} from "./harness.mjs";
 
-const HOST = process.env["SSH_BROWSER_E2E_HOST"] ?? "localhost";
-const BASE = process.env["SSH_BROWSER_E2E_BASE"] ?? join(here, "tree");
-const ALIAS = "e2e";
-const SUFFIX = "ssh-browser";
+const here = join(import.meta.dirname);
+
 // Not the daemon's default: a developer running this must not have it collide with the daemon
 // they already have open on 7391.
 const PORT = Number(process.env["SSH_BROWSER_E2E_PORT"] ?? 17391);
-
-const DAEMON =
-  process.env["SSH_BROWSER_E2E_BIN"] ??
-  join(repo, "target", "debug", process.platform === "win32" ? "ssh-browser.exe" : "ssh-browser");
-
-const TOKEN_HEADER = "x-ssh-browser-token";
 
 let failures = 0;
 
@@ -66,42 +64,6 @@ function check(what, fn) {
       .join("\n");
     console.log(`  FAIL  ${what}\n${detail}`);
   }
-}
-
-/// Start the daemon and wait until it says it is listening.
-///
-/// Waiting for the line rather than sleeping: a fixed sleep is either too short on a loaded
-/// runner, which makes the suite flaky, or too long everywhere else. The line is printed only
-/// once the port has been taken and every host is connected, so it means what it says.
-async function startDaemon() {
-  const child = spawn(
-    DAEMON,
-    ["serve", "--port", String(PORT), "--suffix", SUFFIX, `${ALIAS}=${HOST}:${BASE}`],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-
-  let log = "";
-  const ready = new Promise((ok, no) => {
-    const onData = (chunk) => {
-      log += String(chunk);
-      if (log.includes(`listening on 127.0.0.1:${PORT}`)) {
-        ok();
-      }
-    };
-    child.stdout.on("data", onData);
-    child.stderr.on("data", onData);
-    child.once("exit", (code) => {
-      no(new Error(`the daemon exited with ${code} before listening:\n${log}`));
-    });
-    setTimeout(() => no(new Error(`the daemon never listened:\n${log}`)), 30_000);
-  });
-
-  await ready;
-  const token = /control token: ([0-9a-f]+)/.exec(log)?.[1];
-  if (!token) {
-    throw new Error(`the daemon printed no control token:\n${log}`);
-  }
-  return { child, token, log: () => log };
 }
 
 /// One raw HTTP request, with whatever Host and method are wanted.
@@ -173,36 +135,8 @@ async function inspect(page) {
   }));
 }
 
-/// A copy of the built extension with the alias hosts already granted.
-///
-/// The shipped manifest asks for them through `optional_host_permissions`, and the popup
-/// requests them on the Connect click. That request raises a permission bubble, which is
-/// browser chrome and not something a test can click.
-///
-/// Worth being plain about what this covers. Everything downstream of the grant is exercised
-/// for real: the worker, the token header, the content script, the annotation round trip. The
-/// act of *requesting* the permission is not, and stays a manual step.
-async function extensionWithPermissionGranted() {
-  const dist = join(repo, "extension", "dist");
-  let manifest;
-  try {
-    manifest = JSON.parse(await readFile(join(dist, "manifest.json"), "utf8"));
-  } catch {
-    throw new Error(
-      `no built extension at ${dist} — run: npm --prefix extension ci && npm --prefix extension run build`,
-    );
-  }
-
-  const dir = await mkdtemp(join(tmpdir(), "ssh-browser-ext-"));
-  await cp(dist, dir, { recursive: true });
-  manifest.host_permissions = [...(manifest.host_permissions ?? []), `http://*.${SUFFIX}/*`];
-  delete manifest.optional_host_permissions;
-  await writeFile(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2));
-  return dir;
-}
-
 async function main() {
-  const { child, token, log } = await startDaemon();
+  const { child, token, log } = await startDaemon(PORT);
   const profile = await mkdtemp(join(tmpdir(), "ssh-browser-e2e-"));
   const extension = await extensionWithPermissionGranted();
   let browser;
@@ -258,7 +192,13 @@ async function main() {
     console.log("\nserving");
     const first = await alias("/index.html");
     const etag = first.headers["etag"];
-    const revisit = await alias("/index.html", { headers: { "If-None-Match": etag } });
+    // Conditional only when there is something to be conditional on. Without this guard, a
+    // tree that is not where it was configured to be produced `Invalid value "undefined" for
+    // header "If-None-Match"` and took the whole run down — an error about the harness,
+    // standing where "the page was a 404" should have been.
+    const revisit = etag
+      ? await alias("/index.html", { headers: { "If-None-Match": etag } })
+      : { status: 0, headers: {}, body: "" };
     const listing = await alias("/assets/");
     const redirect = await alias("/assets");
     const ranged = await alias("/assets/app.mjs", { headers: { Range: "bytes=0-9" } });
@@ -291,7 +231,7 @@ async function main() {
       // page that loaded under it would prove nothing. Pointing at the daemon directly is what
       // the PAC resolves to anyway, and the PAC itself is checked above.
       proxy: { server: `http://127.0.0.1:${PORT}` },
-      args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
+      args: loadExtension(extension),
       ...(process.env["SSH_BROWSER_E2E_BROWSER"]
         ? { executablePath: process.env["SSH_BROWSER_E2E_BROWSER"] }
         : {}),
@@ -354,23 +294,7 @@ async function main() {
     );
 
     console.log("\nthe extension");
-    const worker =
-      browser.serviceWorkers()[0] ??
-      (await browser.waitForEvent("serviceworker", { timeout: 20_000 }));
-    const extensionId = new URL(worker.url()).host;
-
-    const popup = await browser.newPage();
-    await popup.goto(`chrome-extension://${extensionId}/panel.html`);
-    await popup.fill("#port", String(PORT));
-    await popup.fill("#token", token);
-    await popup.click("#connect");
-    await popup.waitForFunction(
-      () => {
-        const said = document.getElementById("status")?.textContent ?? "";
-        return said.length > 0 && !said.includes("connecting");
-      },
-      { timeout: 20_000 },
-    );
+    const { popup } = await connectThroughPopup(browser, PORT, token);
     const status = await popup.textContent("#status");
     const links = await popup.$$eval("#aliases a", (as) => as.map((a) => a.textContent));
 

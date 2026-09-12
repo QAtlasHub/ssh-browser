@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+keywords = ["ssh", "sftp", "browser", "proxy", "annotation"]
+# What it does, and what it is once installed. Both are true, and a daemon nobody starts
+# from a shell would be neither.
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
@@ -19,6 +24,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "net"] }
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 
-[[bin]]
-name = "measure-roundtrips"
-path = "src/bin/measure_roundtrips.rs"
+# `measure-roundtrips` is an example, not a binary, and the difference matters once this is
+# published: `cargo install` puts every `[[bin]]` on the reader's PATH, and a command called
+# `measure-roundtrips` means nothing outside this project and could collide with anything.
+# It is also, literally, a program that uses this library — which is what an example is.
+# Cargo finds it under `examples/`, so there is nothing to declare here.

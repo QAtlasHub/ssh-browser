@@ -196,7 +196,7 @@ jobs:
           sudo tc qdisc add dev lo root netem delay 10ms
           tc qdisc show dev lo
 
-      - run: cargo build --release --bin measure-roundtrips
+      - run: cargo build --release --example measure-roundtrips
 
       - name: Round trips stay flat as the batch grows
-        run: ./target/release/measure-roundtrips localhost /usr/include
+        run: ./target/release/examples/measure-roundtrips localhost /usr/include

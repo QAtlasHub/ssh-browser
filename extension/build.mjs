@@ -4,7 +4,7 @@
 // a smaller toolchain is a smaller thing to keep working across a store review cycle.
 
 import { build } from "esbuild";
-import { copyFileSync, mkdirSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,3 +32,10 @@ await build({
 for (const file of ["manifest.json", "panel.html"]) {
   copyFileSync(file, `dist/${file}`);
 }
+
+// The manifest names these, so a build without them is a broken extension rather than a
+// plain one. Saying so here beats a puzzle-piece icon and a console warning at load time.
+if (!existsSync("icons")) {
+  throw new Error("no icons/ — run: npm --prefix extension run icons");
+}
+cpSync("icons", "dist/icons", { recursive: true });

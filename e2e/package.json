@@ -6,7 +6,8 @@
   "description": "Opens the same bytes through the daemon and over file://, in a real browser.",
   "scripts": {
     "browser": "playwright install --with-deps chromium",
-    "e2e": "node run.mjs"
+    "e2e": "node run.mjs",
+    "shots": "node shots.mjs"
   },
   "devDependencies": {
     "playwright": "^1.56.1"
