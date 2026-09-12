@@ -134,10 +134,12 @@ async fn main() -> Result<()> {
             eprintln!();
 
             // Said before the wait rather than after it, so a slow handshake looks like a
-            // handshake instead of a hang.
+            // handshake instead of a hang. It names the port as well as the hosts because
+            // `bind` does both and either can fail: announcing only the ssh half put a
+            // "connecting over ssh" line directly above an error about the port.
             match routes.len() {
-                1 => eprintln!("connecting over ssh..."),
-                n => eprintln!("connecting {n} hosts over ssh..."),
+                1 => eprintln!("taking 127.0.0.1:{port} and connecting over ssh..."),
+                n => eprintln!("taking 127.0.0.1:{port} and connecting {n} hosts over ssh..."),
             }
             let bound = Origin::bind(aliases, suffix.clone(), port, token, author).await?;
 
