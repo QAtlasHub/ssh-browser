@@ -41,6 +41,7 @@ use crate::fs::sftp::SftpFs;
 use crate::fs::{Entry, RangeReq, RemoteFs};
 use crate::prefetch;
 use crate::sftp::wire::Attrs;
+use crate::ssh_config;
 
 /// A file worth holding whole. Anything larger is served by range and not cached: a
 /// seek into a video must not pull the entire file, and holding one would evict every
@@ -67,11 +68,17 @@ struct Conditions {
 pub struct Alias {
     name: String,
     host: String,
-    base: String,
+    /// Where this alias is rooted, or `None` for the remote's home directory.
+    ///
+    /// Deferred rather than filled in with a guess, because the answer lives on the
+    /// remote. `~` is shell syntax and this transport never runs a shell; expanding it
+    /// here would produce this machine's home directory, which is a different computer's.
+    /// It is resolved once in `bind`, by asking.
+    base: Option<String>,
 }
 
 impl Alias {
-    pub fn new(name: &str, host: &str, base: &str) -> Result<Self> {
+    pub fn new(name: &str, host: &str, base: Option<&str>) -> Result<Self> {
         ensure!(!host.is_empty(), "alias {name:?} has no ssh host");
         // The alias becomes a hostname label, and this is the very function that decides
         // whether an arriving request's label is acceptable. Asking it, rather than writing
@@ -82,14 +89,16 @@ impl Alias {
             guard::is_label(name),
             "alias {name:?} must be lowercase letters, digits and hyphens, and may not start or end with a hyphen: it becomes a hostname label"
         );
-        ensure!(
-            base.starts_with('/'),
-            "alias {name:?} needs an absolute base path, got {base:?}"
-        );
+        if let Some(base) = base {
+            ensure!(
+                is_base(base),
+                "alias {name:?} needs a base that is an absolute path, or `~`, or `~/` and a path under the home directory with no `..` in it, got {base:?}"
+            );
+        }
         Ok(Self {
             name: name.to_string(),
             host: host.to_string(),
-            base: base.to_string(),
+            base: base.map(str::to_string),
         })
     }
 
@@ -101,9 +110,91 @@ impl Alias {
         &self.host
     }
 
-    pub fn base(&self) -> &str {
-        &self.base
+    /// Where this alias is rooted, or `None` for the remote's home directory.
+    pub fn base(&self) -> Option<&str> {
+        self.base.as_deref()
     }
+}
+
+/// One line of the host list: a host ssh knows, and what this daemon is doing with it.
+#[derive(serde::Serialize)]
+struct KnownHost {
+    alias: String,
+    host: String,
+    #[serde(flatten)]
+    settings: ssh_config::Settings,
+    /// Whether this daemon has an alias for it right now.
+    ///
+    /// Named for what it is rather than "connected": what the extension needs to know is
+    /// whether a URL for this alias will answer, and that is a question about routing.
+    served: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unresolved: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct KnownHosts {
+    hosts: Vec<KnownHost>,
+    unusable: Vec<ssh_config::Unusable>,
+}
+
+/// Whether a configured base is one this daemon can resolve.
+///
+/// `~` is accepted here and nowhere else in the codebase. It is shell syntax, and this
+/// transport never runs a shell, so it is not passed through to anything: it is a
+/// stand-in for an answer only the remote has, substituted in `bind` once the session
+/// exists. Writing the home path out by hand is the alternative, and it means knowing
+/// another machine's account layout in order to name a directory you can already `cd` to.
+///
+/// `..` is refused rather than normalised. `~/..` quietly meaning the parent of the home
+/// directory is the kind of surprise that belongs in a base path least of all, since the
+/// base is the blast radius of every page served under it.
+fn is_base(base: &str) -> bool {
+    if base.starts_with('/') {
+        return true;
+    }
+    let Some(rest) = base.strip_prefix('~') else {
+        return false;
+    };
+    match rest {
+        "" => true,
+        rest => match rest.strip_prefix('/') {
+            Some(under) => {
+                !under.is_empty()
+                    && under
+                        .split('/')
+                        .all(|c| !c.is_empty() && c != "." && c != "..")
+            }
+            None => false,
+        },
+    }
+}
+
+/// The absolute base an alias is rooted at, asking the remote only when the answer needs
+/// asking.
+///
+/// Separated from `bind` because `bind` starts an ssh subprocess, which no test can, and
+/// this is the part of it with a decision in it.
+async fn resolve_base(base: Option<&str>, fs: &SftpFs) -> Result<String> {
+    let under = match base {
+        None | Some("~") => "",
+        Some(b) => match b.strip_prefix("~/") {
+            Some(under) => under,
+            // Already absolute. Nothing to ask the remote, and asking anyway would put an
+            // ssh round trip in front of every startup for no answer.
+            None => return Ok(b.to_string()),
+        },
+    };
+    let home = fs.home().await?;
+    let home = home.trim_end_matches('/');
+    // A home of `/` would otherwise produce `//work`, which is not the same path
+    // everywhere: POSIX leaves a leading double slash implementation-defined.
+    let home = if home.is_empty() { "" } else { home };
+    Ok(match under {
+        "" if home.is_empty() => "/".to_string(),
+        "" => home.to_string(),
+        under => format!("{home}/{under}"),
+    })
 }
 
 struct Session {
@@ -135,6 +226,17 @@ pub struct Origin {
 pub struct Bound {
     origin: Arc<Origin>,
     listener: TcpListener,
+    routes: Vec<String>,
+}
+
+impl Bound {
+    /// One line per alias, naming where it actually points.
+    ///
+    /// Only available once bound, which is the point: an alias rooted at the home
+    /// directory has no printable base until the remote has been asked.
+    pub fn routes(&self) -> &[String] {
+        &self.routes
+    }
 }
 
 impl Origin {
@@ -176,22 +278,43 @@ impl Origin {
         );
 
         let mut sessions = HashMap::new();
+        let mut routes = Vec::new();
         for a in aliases {
             let fs = SftpFs::connect(&a.host)
                 .await
                 .with_context(|| format!("alias {} -> ssh host {}", a.name, a.host))?;
+            // Asked here, once, rather than per request. An alias written without a base
+            // means the account's home, and only the remote knows where that is.
+            let base = resolve_base(a.base.as_deref(), &fs)
+                .await
+                .with_context(|| {
+                    format!(
+                        "alias {} -> ssh host {}: working out where {} is",
+                        a.name,
+                        a.host,
+                        a.base.as_deref().unwrap_or("the home directory")
+                    )
+                })?;
+            // Built from the resolved base, so what is announced is where requests will
+            // actually go. Formatting it from the alias beforehand would print the word
+            // "home" and leave the reader to find out which directory that was.
+            routes.push(format!(
+                "  http://{}.{suffix}/  ->  {}:{base}",
+                a.name, a.host
+            ));
             // Checked where the map is built, so there is no way to reach a session map with
             // a name silently missing from it. A caller may have checked earlier and should;
             // `insert` returning the displaced value is the check that cannot be skipped.
             ensure!(
                 sessions
-                    .insert(a.name.clone(), Session { base: a.base, fs })
+                    .insert(a.name.clone(), Session { base, fs })
                     .is_none(),
                 "alias {:?} is defined twice",
                 a.name
             );
         }
         Ok(Bound {
+            routes,
             origin: Arc::new(Self {
                 suffix,
                 port,
@@ -207,7 +330,9 @@ impl Origin {
 
 impl Bound {
     pub async fn serve(self) -> Result<()> {
-        let Bound { origin, listener } = self;
+        let Bound {
+            origin, listener, ..
+        } = self;
         let self_ = origin;
 
         loop {
@@ -517,6 +642,7 @@ impl Origin {
                 aliases.sort();
                 control::hello(&aliases, &self.suffix)
             }
+            (&Method::GET, "hosts") => self.list_hosts().await,
             (&Method::GET, "annotations") => self.list_annotations(query).await,
             (&Method::POST, "annotations") => self.add_annotation(body).await,
             (&Method::GET, route) => {
@@ -550,6 +676,63 @@ impl Origin {
             return Err((StatusCode::FORBIDDEN, format!("refusing symlink at {at}")));
         }
         Ok((session, resolved))
+    }
+
+    /// `GET /_control/hosts`
+    ///
+    /// What ssh already knows how to reach, which is the list the extension offers. It
+    /// comes from `~/.ssh/config` rather than from this daemon's own configuration,
+    /// because a host you can already `ssh` to is a host you should be able to open
+    /// without writing it down a second time.
+    ///
+    /// Answering this connects to nothing. It is a list of what could be opened, and a
+    /// daemon that opened six ssh sessions to answer a popup would make looking at the
+    /// list cost more than using it.
+    async fn list_hosts(&self) -> Response<Full<Bytes>> {
+        let found = match ssh_config::read() {
+            Ok(found) => found,
+            Err(e) => {
+                return control::text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("reading ssh_config: {e:#}"),
+                );
+            }
+        };
+
+        // Every `ssh -G` at once. One subprocess per host is cheap, but run in sequence
+        // the list would take the sum of them, and this is the request a reader waits on
+        // before they can do anything at all.
+        let described: Vec<_> = found
+            .hosts
+            .iter()
+            .map(|h| {
+                let host = h.host.clone();
+                tokio::spawn(async move { ssh_config::describe(&host).await })
+            })
+            .collect();
+
+        let mut hosts = Vec::with_capacity(found.hosts.len());
+        for (h, task) in found.hosts.iter().zip(described) {
+            // A host ssh cannot describe is still listed, with the reason attached.
+            // Dropping it would make a misconfigured host look like one that is not in
+            // the file, and those have different fixes.
+            let (settings, unresolved) = match task.await {
+                Ok(Ok(settings)) => (settings, None),
+                Ok(Err(e)) => (ssh_config::Settings::default(), Some(format!("{e:#}"))),
+                Err(e) => (ssh_config::Settings::default(), Some(e.to_string())),
+            };
+            hosts.push(KnownHost {
+                alias: h.alias.clone(),
+                host: h.host.clone(),
+                settings,
+                served: self.sessions.contains_key(&h.alias),
+                unresolved,
+            });
+        }
+        control::json(&KnownHosts {
+            hosts,
+            unusable: found.unusable,
+        })
     }
 
     /// `GET /_control/annotations?doc=<alias>/<path>`
@@ -1660,7 +1843,7 @@ mod tests {
 
         const NOWHERE: &str = "a-host-that-cannot-resolve.invalid";
         let result = Origin::bind(
-            vec![Alias::new("docs", NOWHERE, "/srv").expect("a valid alias")],
+            vec![Alias::new("docs", NOWHERE, Some("/srv")).expect("a valid alias")],
             "ssh-browser".to_string(),
             port,
             Token::from_hex(TEST_TOKEN),
@@ -2436,5 +2619,105 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let body = json_of(res).await;
         assert_eq!(body["annotations"].as_array().expect("array").len(), 0);
+    }
+
+    /// The form souta asked for: bring the home directory into the config rather than
+    /// writing out another machine's account layout by hand.
+    #[tokio::test]
+    async fn a_base_may_be_written_relative_to_the_home_directory() {
+        let fs = FakeRemote::new().home("/home/souta").spawn().await;
+        assert_eq!(
+            resolve_base(Some("~/work"), &fs).await.expect("resolves"),
+            "/home/souta/work"
+        );
+    }
+
+    /// Three spellings of the same thing, and they had better agree.
+    #[tokio::test]
+    async fn a_bare_tilde_and_no_base_are_both_the_home_directory() {
+        let fs = FakeRemote::new().home("/home/souta").spawn().await;
+        assert_eq!(
+            resolve_base(None, &fs).await.expect("resolves"),
+            "/home/souta"
+        );
+        assert_eq!(
+            resolve_base(Some("~"), &fs).await.expect("resolves"),
+            "/home/souta"
+        );
+    }
+
+    /// An absolute base is already the answer, so asking the remote would be a round trip
+    /// spent to be told something already written down.
+    #[tokio::test]
+    async fn an_absolute_base_costs_no_round_trip() {
+        let fs = FakeRemote::new().home("/home/souta").spawn().await;
+        let before = fs.round_trips();
+        assert_eq!(
+            resolve_base(Some("/srv/docs"), &fs)
+                .await
+                .expect("resolves"),
+            "/srv/docs"
+        );
+        assert_eq!(fs.round_trips(), before, "an absolute base must not ask");
+    }
+
+    /// The base is the blast radius of every page served under it, so a base that quietly
+    /// meant somewhere other than where it reads is the worst place for a surprise.
+    #[test]
+    fn a_base_that_could_climb_out_of_the_home_directory_is_refused() {
+        for bad in [
+            "~/..",
+            "~/../.ssh",
+            "~/work/../..",
+            "~/./x",
+            "~work",
+            "work",
+            "",
+        ] {
+            assert!(!is_base(bad), "should have been refused: {bad:?}");
+            assert!(
+                Alias::new("docs", "h", Some(bad)).is_err(),
+                "should have been refused: {bad:?}"
+            );
+        }
+        for good in ["/", "/srv", "~", "~/work", "~/a/b/c"] {
+            assert!(is_base(good), "should have been accepted: {good:?}");
+        }
+    }
+
+    /// A home of `/` is unusual and not impossible, and `//work` is not portably the same
+    /// path as `/work`: POSIX leaves a leading double slash implementation-defined.
+    #[tokio::test]
+    async fn a_root_home_does_not_produce_a_doubled_slash() {
+        let fs = FakeRemote::new().home("/").spawn().await;
+        assert_eq!(resolve_base(None, &fs).await.expect("resolves"), "/");
+        assert_eq!(
+            resolve_base(Some("~/work"), &fs).await.expect("resolves"),
+            "/work"
+        );
+    }
+
+    /// Deliberately asserts nothing about which hosts come back: the answer is whatever
+    /// this machine's ssh_config says, and a test that pinned it would pass on one
+    /// machine and fail on every other. What it does catch is the route not being wired
+    /// up, which is otherwise only visible by hand.
+    ///
+    /// The token is not checked here because it cannot be reached without one: the gate
+    /// runs in `handle` before any route is dispatched, so no control route can have its
+    /// own answer to that question.
+    #[tokio::test]
+    async fn the_host_list_is_a_control_route() {
+        let origin = origin_with(one_page()).await;
+        let res = origin
+            .handle(loopback("/_control/hosts", Some(TEST_TOKEN)))
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let text = String::from_utf8(body_of(res).await.to_vec()).expect("utf-8");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert!(parsed.get("hosts").is_some_and(|h| h.is_array()), "{text}");
+        assert!(
+            parsed.get("unusable").is_some_and(|u| u.is_array()),
+            "{text}"
+        );
     }
 }

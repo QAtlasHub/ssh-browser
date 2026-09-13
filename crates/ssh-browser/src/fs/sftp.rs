@@ -19,7 +19,8 @@ use super::{Entry, RangeReq, Refused, RemoteFs};
 use crate::sftp::transport::{self, SshChild};
 use crate::sftp::wire::{
     Attrs, CLOSE, DATA, Dec, Enc, FXF_APPEND, FXF_CREAT, FXF_READ, FXF_WRITE, HANDLE, MKDIR, NAME,
-    OPEN, OPENDIR, READ, READDIR, STATUS, STATUS_EOF, STATUS_OK, WRITE, owner_of_longname,
+    OPEN, OPENDIR, READ, READDIR, REALPATH, STATUS, STATUS_EOF, STATUS_OK, WRITE,
+    owner_of_longname,
 };
 use crate::sftp::{Reply, Rx, Sftp, Tx};
 
@@ -347,6 +348,37 @@ impl RemoteFs for SftpFs {
             let _ = self.issue(CLOSE, Enc::new().str(handle).done()).await;
         }
         out
+    }
+
+    async fn home(&self) -> Result<String> {
+        // REALPATH of "." rather than of "~". A tilde is shell syntax, and the sftp
+        // subsystem is not a shell: OpenSSH's own client expands it in the client, so a
+        // server handed a literal "~" answers about a directory of that name. "." is the
+        // session's starting directory, which is the home of the account ssh authenticated
+        // as — the thing actually being asked for.
+        let rx = self.issue(REALPATH, Enc::new().str(b".").done()).await?;
+        let reply = await_reply(rx).await?;
+        ensure!(
+            reply.kind == NAME,
+            "realpath answered {} rather than a name",
+            reply.kind
+        );
+        let mut d = Dec::new(reply.payload());
+        // v3 sends this as a one-entry listing. Servers agree on the count being 1, but
+        // the field is read rather than assumed, because skipping it would read the
+        // length prefix as a filename on any server that disagreed.
+        let count = d.u32().context("realpath count")?;
+        ensure!(count >= 1, "realpath answered with no name");
+        let path = String::from_utf8(d.str().context("realpath name")?.to_vec())
+            .context("home directory path is not utf-8")?;
+        // Refused rather than patched up. Everything downstream joins onto this and the
+        // guards all assume an absolute base, so a relative answer would produce paths
+        // that look fine and address nothing.
+        ensure!(
+            path.starts_with('/'),
+            "realpath answered {path:?}, which is not an absolute path"
+        );
+        Ok(path)
     }
 
     async fn append(&self, path: &str, bytes: &[u8]) -> Result<()> {
@@ -720,5 +752,30 @@ mod tests {
             .expect("a dead session must not hang the caller");
 
         assert!(out[0].is_err(), "a closed session must surface as an error");
+    }
+
+    /// The one question about the remote that no local computation can answer.
+    ///
+    /// The path is deliberately not a plausible home. A test asserting `/home/<name>`
+    /// would pass against an implementation that built the string locally instead of
+    /// asking, which is the exact mistake this method exists to avoid.
+    #[tokio::test]
+    async fn the_home_directory_is_whatever_the_remote_says_it_is() {
+        let fs = crate::testing::FakeRemote::new()
+            .home("/export/scratch/u42")
+            .spawn()
+            .await;
+        assert_eq!(fs.home().await.expect("a home"), "/export/scratch/u42");
+    }
+
+    /// Nothing downstream can work from a guess here: every path the origin serves is
+    /// joined onto this, so a wrong answer is a whole alias pointing at the wrong tree.
+    #[tokio::test]
+    async fn a_remote_that_will_not_say_where_home_is_fails_rather_than_guessing() {
+        let fs = crate::testing::FakeRemote::new().spawn().await;
+        assert!(
+            fs.home().await.is_err(),
+            "a refusal must not turn into a default path"
+        );
     }
 }

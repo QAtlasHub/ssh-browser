@@ -101,6 +101,17 @@ pub trait RemoteFs {
             .unwrap_or_else(|| Err(anyhow!("list_dirs returned no result for {path}")))
     }
 
+    /// The absolute path a fresh session starts in — the account's home directory.
+    ///
+    /// The one question about the remote that cannot be answered from a path, and the
+    /// reason an alias can be written without a base at all. `~` is shell syntax and
+    /// the transport never runs a shell, so expanding it locally would produce this
+    /// machine's home rather than the remote one.
+    ///
+    /// Asked once per alias at startup, never on a page path, so it costs no round trip
+    /// that a reader waits for.
+    async fn home(&self) -> Result<String>;
+
     /// Append bytes to a file, creating it if absent.
     ///
     /// Append rather than write, and single rather than batched, because that is the

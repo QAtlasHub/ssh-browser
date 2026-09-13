@@ -83,8 +83,12 @@ impersonate anything else, which is not true of a stock mkcert CA.
 
 ```
 cargo install ssh-browser
-ssh-browser serve docs=myhost:/srv/docs cluster=login-node:/home/me/public_html
+ssh-browser serve docs=myhost:/srv/docs cluster=login-node
 ```
+
+A host on its own means that account's home directory, which the daemon asks the remote
+for. `ssh-browser hosts` prints what your `~/.ssh/config` already knows how to reach —
+user, hostname, port and any `ProxyJump` — which is the list worth picking an alias from.
 
 That listens on 127.0.0.1:7391 and prints what to do next. Point the browser at the
 PAC the daemon serves,
@@ -119,8 +123,22 @@ base = "/srv/docs"
 [[alias]]
 name = "cluster"
 host = "login-node"
-base = "/home/me/public_html"
+base = "~/public_html"
+
+[[alias]]
+name = "home"
+host = "login-node"
 ```
+
+`base` may be an absolute path, or `~` and a path under the remote's home directory, or
+omitted for the home directory itself. The tilde is resolved by asking the remote, once,
+at startup: it is shell syntax and this transport never runs a shell, so expanding it
+locally would produce *your* home directory rather than the account's.
+
+Pointing an alias at a home directory is reasonable because **no name beginning with a dot
+is ever served**, at any depth, and they are left out of listings. An alias base is one
+origin, so a page under it can read everything else under it — see
+[SECURITY.md](SECURITY.md).
 
 `--config FILE`, or `<config dir>/ssh-browser/config.toml` if it exists. A file named on
 the command line must exist; the default one need not.
