@@ -96,13 +96,17 @@ a trusted publisher registered once on crates.io, against this repository and th
 workflow filename `release-plz.yml`. Until it is, publishing fails — which is the
 right failure, rather than falling back to something longer-lived.
 
-**The release pull request shows no checks, and that is not a fault.** Pull
-requests opened with the built-in `GITHUB_TOKEN` do not trigger workflows. It
-matters little: that pull request only moves version numbers, and the commit it
-sits on is already green. Giving it checks means a personal access token or a
-GitHub App — a credential to look after, in exchange for re-running tests on a
-diff that cannot break them.
+**The release pull request shows no checks until somebody touches it.** Events
+raised by the built-in `GITHUB_TOKEN` do not start workflows, so the pull request
+arrives without any. Pushing the two edits above is itself a push by a person, and
+CI runs from then on — which is the moment the checks are worth having anyway.
 
-`release-assets.yml` also takes a tag through `workflow_dispatch`, so a zip can be
-rebuilt and reattached without cutting a version again. It is byte-identical
-between runs by construction, so a rebuild that differs is a signal.
+The same rule is why `release-assets.yml` is *called* from `release-plz.yml`
+rather than triggered by `release: published`: the release is created with
+`GITHUB_TOKEN`, so that event starts nothing. The first version of it never ran
+once. Being called keeps it inside the same run, where the restriction does not
+apply.
+
+It also takes a tag through `workflow_dispatch`, so a zip can be rebuilt and
+reattached without cutting a version again. It is byte-identical between runs by
+construction, so a rebuild that differs is a signal.
