@@ -5,10 +5,17 @@ All notable changes to ssh-browser will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Nothing is released yet: the version in `Cargo.toml` is `0.0.1` and no surface is
-stable.
+The two halves ship through different channels, and only one of them has shipped. The daemon
+is on crates.io as [`ssh-browser`](https://crates.io/crates/ssh-browser); the extension goes
+through a browser store and has not been submitted. No surface is stable.
 
 ## [Unreleased]
+
+## [0.0.1] - 2026-09-13
+
+Published to reserve the name, which also makes it the first version anyone can install.
+Everything below is in it except the extension, which is not part of the crate: the published
+archive holds `src/`, one example and the README, and nothing from `extension/`.
 
 ### Added
 

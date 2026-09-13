@@ -82,6 +82,7 @@ impersonate anything else, which is not true of a stock mkcert CA.
 ## Usage
 
 ```
+cargo install ssh-browser
 ssh-browser serve docs=myhost:/srv/docs cluster=login-node:/home/me/public_html
 ```
 
