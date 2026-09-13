@@ -18,6 +18,9 @@ jobs:
   release:
     name: publish and tag
     runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.releases_created }}
+      tag: ${{ steps.tag.outputs.tag }}
     permissions:
       contents: write
       # crates.io Trusted Publishing. release-plz exchanges GitHub's OIDC identity for a
@@ -37,10 +40,47 @@ jobs:
         with:
           toolchain: stable
       - uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f # v0.5.136
+        id: release
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Which tag to hang the extension on: the version that was just released, spelled the
+      # way release-plz spells it. `v0.1.0` is what it produced for this workspace.
+      #
+      # That is an observation rather than a promise, so the tag has to exist before this
+      # will hand it on. If release-plz ever changes the format, releases stop with a
+      # message naming the tag it looked for — which is the failure worth having, because
+      # the alternative is quietly attaching a zip to the previous release.
+      #
+      # Not `git describe`: that answers with the nearest *reachable* tag, so on a run that
+      # released nothing it would cheerfully return the last one.
+      - name: which tag
+        id: tag
+        if: steps.release.outputs.releases_created == 'true'
+        run: |
+          git fetch --tags --force --quiet origin
+          tag="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::released, but $tag is not a tag here." \
+                 "Has release-plz changed how it names tags?"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "attaching the extension to $tag"
+
+  assets:
+    name: attach the extension
+    needs: release
+    # Only when something was actually released. Every push to main runs this workflow, and
+    # most of them release nothing.
+    if: needs.release.outputs.released == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-assets.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}
 
   release-pr:
     name: release pull request

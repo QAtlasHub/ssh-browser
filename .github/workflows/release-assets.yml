@@ -1,16 +1,24 @@
 name: Release assets
 
-# The other half of a release. `release-plz.yml` publishes the crate and creates the GitHub
-# release; this attaches the extension to it, so one tag ships both.
+# The other half of a release: the extension, attached to the release the crate got.
 #
-# Separate from that workflow rather than a step inside it, because the two fail for
-# unrelated reasons. A crates.io refusal and a broken npm install have nothing to do with
-# each other, and a release that published the crate but could not build the zip should say
-# exactly that rather than looking like a failed publish.
+# Called from `release-plz.yml` rather than triggered by `release: published`. That is the
+# whole reason this file is shaped as a reusable workflow: a release created by a workflow
+# using the built-in `GITHUB_TOKEN` does not raise events that start other workflows, so the
+# first version of this never ran at all. Being called lives inside the same run, which has
+# no such restriction.
+#
+# Still its own file, because the two halves fail for unrelated reasons. A crates.io refusal
+# and a broken npm install have nothing to do with each other, and a release that published
+# the crate but could not build the zip should say exactly that.
 on:
-  release:
-    types: [published]
-  # So the zip can be rebuilt and reattached without cutting a version again.
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag to attach the extension to
+        required: true
+        type: string
+  # So an asset can be rebuilt and reattached without cutting a version again.
   workflow_dispatch:
     inputs:
       tag:
@@ -27,11 +35,11 @@ jobs:
     permissions:
       contents: write
     env:
-      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ inputs.tag }}
           persist-credentials: false
 
       # One tag ships both halves, so both halves have to agree about what version that is.

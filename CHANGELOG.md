@@ -9,6 +9,16 @@ The two halves ship through different channels, and only one of them has shipped
 is on crates.io as [`ssh-browser`](https://crates.io/crates/ssh-browser); the extension goes
 through a browser store and has not been submitted. No surface is stable.
 
+## [Unreleased]
+
+### Fixed
+
+- The extension was never attached to a release automatically. `release-assets.yml`
+  triggered on `release: published`, and a release created by a workflow using the built-in
+  `GITHUB_TOKEN` raises no events that start other workflows — so it did not run once. It is
+  a reusable workflow now, called from `release-plz.yml`, which keeps it inside the same run
+  where that restriction does not apply. Found by shipping 0.1.0 and looking at the release.
+
 ## [0.1.0] - 2026-09-13
 
 ### Added
