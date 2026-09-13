@@ -1,0 +1,68 @@
+name: Release
+
+# Two jobs, both on main. `release-pr` keeps a pull request open that bumps the version and
+# says what would go out; `release` publishes what landed. Which of them does anything is
+# release-plz's decision, not this file's.
+#
+# The extension is not built here. It is attached to the release this produces, by
+# `release-assets.yml`, so that one tag ships both halves without this job needing to know
+# anything about npm.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: publish and tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # crates.io Trusted Publishing. release-plz exchanges GitHub's OIDC identity for a
+      # token that lives thirty minutes, so there is no CARGO_REGISTRY_TOKEN in this
+      # repository to leak, rotate, or forget about. It needs a one-time trusted-publisher
+      # entry on crates.io naming this repository and this workflow file.
+      id-token: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # release-plz reads the history to work out what changed since the last release,
+          # so a shallow clone would have it treat everything as new.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f # v0.5.136
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-pr:
+    name: release pull request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    # Never two at once: both would force-push the same branch, and the loser would leave a
+    # pull request describing a release that is not the one main is on.
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f # v0.5.136
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

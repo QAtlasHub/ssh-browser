@@ -13,6 +13,17 @@ through a browser store and has not been submitted. No surface is stable.
 
 ### Added
 
+- Releases are cut by `release-plz`. It opens a pull request on `main` that bumps the
+  version; merging it publishes to crates.io, tags, and creates the GitHub release, and
+  `release-assets.yml` attaches the extension zip and its SHA256 to that same release. One
+  tag ships both halves, and CI refuses a version where `Cargo.toml` and the extension's
+  `manifest.json` disagree.
+  crates.io Trusted Publishing rather than a stored token: `release-plz` exchanges GitHub's
+  OIDC identity for one that lives thirty minutes, so there is no `CARGO_REGISTRY_TOKEN` in
+  the repository to leak or rotate. It needs a trusted publisher registered once on
+  crates.io. The changelog stays hand-written — `changelog_update = false` — so cutting a
+  release means renaming `## [Unreleased]` in the release pull request. See CONTRIBUTING.md.
+
 - `base` may be omitted, or written as `~` or `~/path`, and means the remote account's
   home directory. Resolved by asking the remote with SFTP `REALPATH` once at startup,
   because `~` is shell syntax and this transport never runs a shell — expanding it

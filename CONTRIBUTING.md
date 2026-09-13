@@ -67,3 +67,42 @@ which `%2e%2e` walks straight out of the alias base.
 
 Say why, not what; the diff already shows what. Conventional-commit prefixes are
 used for changelog drafting (`cliff.toml`) but are not enforced.
+
+## Releasing
+
+One tag ships both halves: the crate to crates.io, and the extension as a zip on
+the GitHub release. One version on purpose — with two, "which extension goes with
+which daemon" is a question somebody has to answer by hand every time.
+
+1. Merge to `main` as usual.
+2. `release-plz` opens or updates a pull request titled `chore: release`. It bumps
+   `Cargo.toml` and says what would go out. `cargo-semver-checks` decides the size
+   of the bump when the commits do not, which is most of the time here: subjects
+   in this repository are prose, not conventional-commit prefixes.
+3. **Edit that pull request.** Two things it will not do for you:
+   - rename `## [Unreleased]` in `CHANGELOG.md` to `## [x.y.z] - YYYY-MM-DD`.
+     `changelog_update = false`, because that file is written by hand and a
+     generated one would be worse;
+   - bump `"version"` in `extension/manifest.json` to match. CI's `versions agree`
+     job fails until it does.
+4. Merge it. `release-plz` publishes, tags, and creates the release;
+   `release-assets.yml` attaches `ssh-browser-x.y.z.zip` and its `.sha256`.
+5. Upload that zip to the Chrome Web Store by hand. There is a review behind it
+   anyway.
+
+**One-time setup.** Nothing here holds a `CARGO_REGISTRY_TOKEN`: `release-plz`
+exchanges GitHub's OIDC identity for a token that lives thirty minutes. That needs
+a trusted publisher registered once on crates.io, against this repository and the
+workflow filename `release-plz.yml`. Until it is, publishing fails — which is the
+right failure, rather than falling back to something longer-lived.
+
+**The release pull request shows no checks, and that is not a fault.** Pull
+requests opened with the built-in `GITHUB_TOKEN` do not trigger workflows. It
+matters little: that pull request only moves version numbers, and the commit it
+sits on is already green. Giving it checks means a personal access token or a
+GitHub App — a credential to look after, in exchange for re-running tests on a
+diff that cannot break them.
+
+`release-assets.yml` also takes a tag through `workflow_dispatch`, so a zip can be
+rebuilt and reattached without cutting a version again. It is byte-identical
+between runs by construction, so a rebuild that differs is a signal.

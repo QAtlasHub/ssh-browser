@@ -93,6 +93,28 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --no-deps
 
+  versions:
+    # One tag ships the crate and the extension together, so the two have to agree about
+    # what version that is. Checked on every pull request rather than only at release,
+    # because the release is the worst place to find out: release-plz bumps `Cargo.toml`
+    # and knows nothing about `manifest.json`, and the Chrome Web Store refuses an upload
+    # whose version it has already seen.
+    name: versions agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - name: the crate and the extension must be the same version
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          ext=$(sed -n 's/.*"version": "\(.*\)".*/\1/p' extension/manifest.json | head -1)
+          echo "crate $crate, extension $ext"
+          test -n "$crate"
+          test -n "$ext"
+          if [ "$crate" != "$ext" ]; then
+            echo "::error::Cargo.toml is $crate but extension/manifest.json is $ext"
+            exit 1
+          fi
+
   extension:
     # The browser half typechecks and bundles here for the same reason the daemon builds
     # here: the two ship through different channels, and CI is the only place that sees

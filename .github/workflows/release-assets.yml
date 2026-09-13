@@ -1,0 +1,77 @@
+name: Release assets
+
+# The other half of a release. `release-plz.yml` publishes the crate and creates the GitHub
+# release; this attaches the extension to it, so one tag ships both.
+#
+# Separate from that workflow rather than a step inside it, because the two fail for
+# unrelated reasons. A crates.io refusal and a broken npm install have nothing to do with
+# each other, and a release that published the crate but could not build the zip should say
+# exactly that rather than looking like a failed publish.
+on:
+  release:
+    types: [published]
+  # So the zip can be rebuilt and reattached without cutting a version again.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag to attach the extension to
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  extension:
+    name: attach the extension
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      # One tag ships both halves, so both halves have to agree about what version that is.
+      # release-plz bumps `Cargo.toml` and knows nothing about `manifest.json`, so without
+      # this the zip on a v0.2.0 release would be labelled 0.1.0 — and the Chrome Web Store
+      # refuses an upload whose version it has already seen, which is a confusing way to
+      # find that out.
+      - name: the crate and the extension must be the same version
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          ext=$(sed -n 's/.*"version": "\(.*\)".*/\1/p' extension/manifest.json | head -1)
+          echo "crate $crate, extension $ext"
+          if [ "$crate" != "$ext" ]; then
+            echo "::error::Cargo.toml is $crate but extension/manifest.json is $ext." \
+                 "Bump the manifest in the release pull request."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - run: npm --prefix extension ci
+      - run: npm --prefix extension run build
+      - run: npm --prefix extension run package
+
+      # The zip is byte-identical between runs by construction: fixed DOS timestamps and
+      # sorted entries. The checksum is published so somebody can compare the one they
+      # downloaded against the one they built, which is the only thing that makes being
+      # reproducible worth anything.
+      - name: checksum
+        working-directory: extension
+        run: |
+          zip=$(ls ssh-browser-*.zip)
+          sha256sum "$zip" > "$zip.sha256"
+          cat "$zip.sha256"
+
+      - name: upload
+        working-directory: extension
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" ssh-browser-*.zip ssh-browser-*.zip.sha256 --clobber

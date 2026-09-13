@@ -1,0 +1,30 @@
+# How a release is cut.
+#
+# release-plz watches main, opens a pull request that bumps the version, and when that
+# lands it publishes to crates.io, tags, and creates the GitHub release. A second workflow
+# then attaches the extension to that release, so one tag ships both halves.
+#
+# The one thing release-plz is not allowed to touch is the changelog.
+
+[workspace]
+# CHANGELOG.md is written by hand, and it says why a change was made rather than what the
+# commits happened to be called. A generated one would be strictly worse here, and it would
+# overwrite prose somebody wrote — so release-plz leaves that file alone.
+#
+# The cost is one edit in the release pull request: rename `## [Unreleased]` to the version
+# being cut, with the date. That is written down in CONTRIBUTING.md, because a manual step
+# nobody has recorded is a manual step that gets skipped.
+changelog_update = false
+
+git_release_enable = true
+git_tag_enable = true
+
+# cargo-semver-checks decides the bump when the commits do not, which matters here because
+# the commit subjects are prose rather than conventional-commit prefixes. An API break
+# forces a major; anything else is a patch unless the release pull request is edited to say
+# otherwise — which is exactly the review this wants somebody to do.
+semver_check = true
+
+# Only when the release pull request is merged, not on every push to main. Otherwise every
+# merge would cut a version, and a version is meant to be a decision.
+release_always = false
