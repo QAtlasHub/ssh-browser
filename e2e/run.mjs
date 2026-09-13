@@ -314,6 +314,45 @@ async function main() {
       assert.equal(local.headingColour, "rgb(0, 128, 64)"),
     );
 
+    console.log("\ninvariant 2, over a real transport");
+    // The unit test for this holds a fake remote and a three-byte fixture, so it revisits
+    // instantly and can never see the freshness window at all. This is the same claim against
+    // whatever host the run is pointed at, through the real SFTP transport, in a real browser.
+    //
+    // The count comes from the daemon rather than from counting requests here: what the
+    // browser asks for and what the remote is asked for are different numbers on purpose, and
+    // counting here would measure the one that is supposed to be large.
+    const remoteTrips = async () => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/_control/hosts`, {
+        headers: { [TOKEN_HEADER]: token },
+      });
+      assert.ok(res.ok, `/_control/hosts said ${res.status}`);
+      const { open } = await res.json();
+      return open.reduce((n, o) => n + o.trips, 0);
+    };
+
+    const visit = await browser.newPage();
+    const target = `http://${ALIAS}.${SUFFIX}/index.html`;
+    await visit.goto(target, { waitUntil: "networkidle" });
+    const afterFirst = await remoteTrips();
+    // Away and back, which is a revisit. `reload()` is a different gesture — it tells the
+    // browser to re-fetch — and measuring it would not be measuring this claim.
+    await visit.goto("about:blank");
+    await visit.goto(target, { waitUntil: "networkidle" });
+    const afterSecond = await remoteTrips();
+    await visit.close();
+
+    check("the first visit costs the remote something", () =>
+      assert.ok(afterFirst > 0, `nothing was fetched at all (${afterFirst})`),
+    );
+    check("and a revisit inside the freshness window costs it nothing", () =>
+      assert.equal(
+        afterSecond,
+        afterFirst,
+        "a revisit went to the remote, so it was not answered from cache",
+      ),
+    );
+
     console.log("\nwhat an http origin does not buy");
     // Measured rather than reasoned about, and pinned in both directions, because the README
     // used to imply this fixes everything `file://` breaks. It does not: an alias origin is

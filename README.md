@@ -29,7 +29,13 @@ round trips:
 
 1. Remote round trips for one page are O(1) — independent of subresource count, directory depth and file
    count.
-2. A revisit costs zero remote round trips; conditional GET is answered inside localhost.
+2. A revisit inside the freshness window costs zero remote round trips; the conditional GET is answered
+   inside localhost. Outside it, a revisit costs one batched listing refresh and no file reads.
+
+The second used to be written without the window, and that promised something no cache can deliver:
+once a listing is not trusted, "is this still the current version?" cannot be answered without asking.
+Measured against a real host, a revisit straight after a load costs zero, and the same revisit three
+seconds later costs ten — which is the window doing its job, not the cache failing.
 
 `measure-roundtrips` times one round trip (tau) and reports each batch as a multiple of it. Against a
 host at roughly 16 ms RTT:
