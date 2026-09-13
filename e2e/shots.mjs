@@ -53,7 +53,7 @@ try {
     args: loadExtension(extension),
   });
 
-  const { popup } = await connectThroughPopup(browser, PORT, token);
+  const { popup } = await connectThroughPopup(browser, PORT);
 
   // The popup is 320px wide by design, so a raw screenshot would be a narrow strip on a wide
   // canvas. Centring it on a neutral ground is presentation rather than fiction: every pixel

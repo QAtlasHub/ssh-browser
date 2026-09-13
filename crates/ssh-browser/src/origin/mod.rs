@@ -57,6 +57,11 @@ struct Conditions {
     if_range: Option<String>,
     /// Only ever consulted on the control path, which only a loopback request reaches.
     control_token: Option<String>,
+    /// What the browser said about who started this request, if a browser started it.
+    ///
+    /// A forbidden header name, so a page can neither set it nor suppress it. See
+    /// `control::from_a_page`.
+    fetch_site: Option<String>,
 }
 
 /// One alias, checked.
@@ -134,8 +139,24 @@ struct KnownHost {
     unresolved: Option<String>,
 }
 
+/// An alias being served right now.
+///
+/// A separate list from the hosts, because it answers a different question and the two do
+/// not line up: an alias need not be named after its host, so a session opened as
+/// `docs=myhost:/srv` matches no row in ssh_config at all. Reporting only the hosts would
+/// leave it being served and visible nowhere, which is the kind of invisible live state
+/// this daemon is supposed not to have.
+#[derive(serde::Serialize)]
+struct OpenAlias {
+    alias: String,
+    host: String,
+    base: String,
+    url: String,
+}
+
 #[derive(serde::Serialize)]
 struct KnownHosts {
+    open: Vec<OpenAlias>,
     hosts: Vec<KnownHost>,
     unusable: Vec<ssh_config::Unusable>,
 }
@@ -216,6 +237,12 @@ impl Origin {
 }
 
 struct Session {
+    /// The ssh_config name this was reached by.
+    ///
+    /// Kept because an alias need not be named after its host — `docs=myhost:/srv` is one
+    /// of each — so without it the only thing that could be reported about a live session
+    /// is a name that appears nowhere in ssh_config.
+    host: String,
     base: String,
     fs: SftpFs,
 }
@@ -335,7 +362,14 @@ impl Origin {
             // `insert` returning the displaced value is the check that cannot be skipped.
             ensure!(
                 sessions
-                    .insert(a.name.clone(), Arc::new(Session { base, fs }))
+                    .insert(
+                        a.name.clone(),
+                        Arc::new(Session {
+                            host: a.host.clone(),
+                            base,
+                            fs,
+                        }),
+                    )
                     .is_none(),
                 "alias {:?} is defined twice",
                 a.name
@@ -403,6 +437,11 @@ impl Origin {
                 .get(control::TOKEN_HEADER)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
+            fetch_site: req
+                .headers()
+                .get(control::FETCH_SITE_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
         };
         let method = req.method().clone();
         let query = req.uri().query().map(str::to_string);
@@ -443,9 +482,33 @@ impl Origin {
         // Reachable only from a loopback Host, which `guard::classify` has already
         // separated from alias requests. An alias page cannot arrive here.
         if path.starts_with(control::PATH_PREFIX) {
-            // Every control route goes through the gate, and there is no way past it.
-            if let Some(refusal) = control::gate(method, cond.control_token.as_deref(), &self.token)
-            {
+            // First, and separately from the token: no page reaches this API at all,
+            // whatever it has got hold of.
+            if control::from_a_page(cond.fetch_site.as_deref()) {
+                return control::text(
+                    StatusCode::FORBIDDEN,
+                    "the control API is not reachable from a page",
+                );
+            }
+            // The handshake, and the only route that does not need the token -- it is
+            // where the token comes from. Handing it over is safe precisely because the
+            // line above has already established that nothing page-shaped is asking, and
+            // a caller that is not a browser at all could read the token file anyway.
+            //
+            // This is what removes the paste. An extension cannot read a file, so before
+            // this the first run meant copying sixty-four hex characters out of a terminal.
+            if method == Method::GET && control::route_of(path) == "token" {
+                return control::text(StatusCode::OK, self.token.as_str());
+            }
+            // Every other control route goes through the gate, and there is no way past
+            // it. The gate repeats the page check rather than trusting the branch above to
+            // have run, so that no future route can reach it having skipped one.
+            if let Some(refusal) = control::gate(
+                method,
+                cond.fetch_site.as_deref(),
+                cond.control_token.as_deref(),
+                &self.token,
+            ) {
                 return refusal;
             }
             return self.control(method, path, query, body).await;
@@ -743,7 +806,20 @@ impl Origin {
             })
             .collect();
 
-        let open = self.alias_names().await;
+        let open = {
+            let sessions = self.sessions.read().await;
+            let mut open: Vec<OpenAlias> = sessions
+                .iter()
+                .map(|(alias, s)| OpenAlias {
+                    alias: alias.clone(),
+                    host: s.host.clone(),
+                    base: s.base.clone(),
+                    url: format!("http://{alias}.{}/", self.suffix),
+                })
+                .collect();
+            open.sort_by(|a, b| a.alias.cmp(&b.alias));
+            open
+        };
         let mut hosts = Vec::with_capacity(found.hosts.len());
         for (h, task) in found.hosts.iter().zip(described) {
             // A host ssh cannot describe is still listed, with the reason attached.
@@ -758,11 +834,12 @@ impl Origin {
                 alias: h.alias.clone(),
                 host: h.host.clone(),
                 settings,
-                served: open.iter().any(|a| a == &h.alias),
+                served: open.iter().any(|o| o.alias == h.alias),
                 unresolved,
             });
         }
         control::json(&KnownHosts {
+            open,
             hosts,
             unusable: found.unusable,
         })
@@ -830,12 +907,19 @@ impl Origin {
         // would change what an origin means underneath any page already open in it,
         // which is the one thing an origin must not do.
         if let Some(open) = self.session(&known.alias).await {
+            // Asking for no base is asking for no particular one, so an alias already
+            // open is simply the answer. The popup relies on this: it opens a host by
+            // naming it, and a host the config file already roots somewhere would
+            // otherwise answer a plain click with a conflict about a base nobody asked for.
+            let Some(asked) = alias.base() else {
+                return self.opened(&known.alias, &known.host, &open.base);
+            };
             // Resolved against the session that is already there, rather than compared as
             // written. `~/work` and `/home/souta/work` are the same base, and a check that
             // could not tell would either refuse an identical request or -- worse -- accept
             // a different one, handing back a URL rooted somewhere the caller did not ask
             // for. The round trip is paid on a path that is not a page load.
-            let wanted = match resolve_base(alias.base(), &open.fs).await {
+            let wanted = match resolve_base(Some(asked), &open.fs).await {
                 Ok(base) => base,
                 Err(e) => {
                     return control::text(
@@ -885,11 +969,13 @@ impl Origin {
         // close one that requests are already going through.
         let session = {
             let mut sessions = self.sessions.write().await;
-            Arc::clone(
-                sessions
-                    .entry(known.alias.clone())
-                    .or_insert_with(|| Arc::new(Session { base, fs })),
-            )
+            Arc::clone(sessions.entry(known.alias.clone()).or_insert_with(|| {
+                Arc::new(Session {
+                    host: known.host.clone(),
+                    base,
+                    fs,
+                })
+            }))
         };
         self.opened(&known.alias, &known.host, &session.base)
     }
@@ -1560,6 +1646,16 @@ mod tests {
         b.body(Empty::<Bytes>::new()).expect("request builds")
     }
 
+    /// A loopback request carrying no token, and whatever the browser would have said
+    /// about who started it.
+    fn from_site(path: &str, site: Option<&str>) -> Request<Empty<Bytes>> {
+        let mut b = Request::builder().uri(path).header(HOST, "127.0.0.1:7391");
+        if let Some(site) = site {
+            b = b.header(control::FETCH_SITE_HEADER, site);
+        }
+        b.body(Empty::<Bytes>::new()).expect("request builds")
+    }
+
     fn control_post(path: &str, token: Option<&str>, body: &str) -> Request<Full<Bytes>> {
         let mut b = Request::builder()
             .method(Method::POST)
@@ -1594,6 +1690,7 @@ mod tests {
         sessions.insert(
             "docs".to_string(),
             Arc::new(Session {
+                host: "nowhere".to_string(),
                 base: "/srv".to_string(),
                 fs,
             }),
@@ -2955,5 +3052,50 @@ mod tests {
                 .await;
             assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "token {token:?}");
         }
+    }
+
+    /// What removes the paste, and the check that makes it safe to.
+    ///
+    /// The header values are the measured ones: an extension's `fetch` arrives with no
+    /// `Sec-Fetch-Site` value this daemon would call a page, and a page the daemon itself
+    /// serves in fallback mode arrives as `same-origin` -- the hardest case, because it
+    /// shares an origin with the control API.
+    #[tokio::test]
+    async fn the_token_is_handed_over_to_something_that_is_not_a_page() {
+        let origin = origin_with(one_page()).await;
+        for site in [None, Some("none")] {
+            let res = origin.handle(from_site("/_control/token", site)).await;
+            assert_eq!(res.status(), StatusCode::OK, "site {site:?}");
+            let body = String::from_utf8(body_of(res).await.to_vec()).expect("utf-8");
+            assert_eq!(body.trim(), TEST_TOKEN, "site {site:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_is_not_handed_the_token() {
+        let origin = origin_with(one_page()).await;
+        for site in ["same-origin", "same-site", "cross-site"] {
+            let res = origin
+                .handle(from_site("/_control/token", Some(site)))
+                .await;
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "site {site}");
+            let body = String::from_utf8(body_of(res).await.to_vec()).expect("utf-8");
+            assert!(!body.contains(TEST_TOKEN), "the refusal leaked it: {body}");
+        }
+    }
+
+    /// The case the token alone could not refuse: a page in the no-proxy fallback mode is
+    /// same-origin with the control API, so a leaked token would have been enough.
+    #[tokio::test]
+    async fn a_page_with_the_token_still_cannot_use_the_control_api() {
+        let origin = origin_with(one_page()).await;
+        let req = Request::builder()
+            .uri("http://127.0.0.1:7391/_control/hello")
+            .header(HOST, "127.0.0.1:7391")
+            .header(control::TOKEN_HEADER, TEST_TOKEN)
+            .header(control::FETCH_SITE_HEADER, "same-origin")
+            .body(Full::new(Bytes::new()))
+            .expect("request builds");
+        assert_eq!(origin.handle(req).await.status(), StatusCode::FORBIDDEN);
     }
 }

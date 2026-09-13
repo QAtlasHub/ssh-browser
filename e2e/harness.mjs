@@ -29,9 +29,20 @@ export const DAEMON =
 /// runner, which makes the caller flaky, or too long everywhere else. The line is printed only
 /// once the port has been taken and every host is connected, so it means what it says.
 export async function startDaemon(port) {
+  // An empty config file, named explicitly. Without it the daemon reads whatever
+  // `<config dir>/ssh-browser/config.toml` happens to hold, so a run on a machine that
+  // uses ssh-browser for real would connect to every host configured there: slower, and
+  // failing for reasons that have nothing to do with the change under test.
+  const empty = join(await mkdtemp(join(tmpdir(), "ssh-browser-e2e-")), "config.toml");
+  await writeFile(empty, "");
+
   const child = spawn(
     DAEMON,
-    ["serve", "--port", String(port), "--suffix", SUFFIX, `${ALIAS}=${HOST}:${BASE}`],
+    // prettier-ignore
+    [
+      "serve", "--config", empty, "--port", String(port),
+      "--suffix", SUFFIX, `${ALIAS}=${HOST}:${BASE}`,
+    ],
     { stdio: ["ignore", "pipe", "pipe"] },
   );
 
@@ -127,16 +138,19 @@ export function loadExtension(dir) {
 /// The id `background.ts` registers the annotation script under.
 const CONTENT_SCRIPT_ID = "alias-pages";
 
-/// Drive the popup to connect, and wait until the content script is actually registered.
+/// Open the popup, point it at the daemon, and wait until the content script is registered.
+///
+/// No token is typed. The popup asks the daemon for one, which the daemon hands over to
+/// anything that is not a page — so the first-run paste is gone, and so is the field the
+/// old version of this filled in.
 ///
 /// Waiting on the registration rather than on the popup's text, because the text is set
-/// before the registration happens: `connect` reports its result, *then* asks for the host
-/// permission, *then* registers, and only then appends what registration said. A wait that
-/// accepted the first of those three won a race most of the time and lost it whenever
-/// anything else was slow — which is a flake that looks exactly like a broken content script.
+/// before the registration happens. A wait that accepted the first status line won a race
+/// most of the time and lost it whenever anything else was slow — a flake that looks
+/// exactly like a broken content script.
 ///
 /// The registration is the thing the caller depends on, so it is the thing to wait for.
-export async function connectThroughPopup(browser, port, token) {
+export async function connectThroughPopup(browser, port) {
   const worker =
     browser.serviceWorkers()[0] ??
     (await browser.waitForEvent("serviceworker", { timeout: 20_000 }));
@@ -144,9 +158,13 @@ export async function connectThroughPopup(browser, port, token) {
 
   const popup = await browser.newPage();
   await popup.goto(`chrome-extension://${extensionId}/panel.html`);
+  // The port lives behind a disclosure, because the ordinary run never touches it. Opening
+  // it is what a reader would do, so it is what this does rather than reaching past it.
+  await popup.click("summary");
   await popup.fill("#port", String(port));
-  await popup.fill("#token", token);
-  await popup.click("#connect");
+  // Dispatched rather than relied upon: the popup re-runs on `change`, and whether `fill`
+  // emits one is Playwright's business rather than something this should depend on.
+  await popup.dispatchEvent("#port", "change");
 
   const deadline = Date.now() + 20_000;
   for (;;) {

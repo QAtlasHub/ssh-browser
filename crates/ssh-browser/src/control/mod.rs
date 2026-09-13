@@ -30,6 +30,12 @@ pub const TOKEN_HEADER: &str = "x-ssh-browser-token";
 
 pub const PATH_PREFIX: &str = "/_control/";
 
+/// What a browser says about who started a request.
+///
+/// A forbidden header name: page script can neither set it nor remove it, so what arrives
+/// is the browser's account rather than the caller's.
+pub const FETCH_SITE_HEADER: &str = "sec-fetch-site";
+
 /// Protocol versions this daemon can speak.
 ///
 /// Negotiated rather than assumed. The extension ships through a store review and the
@@ -216,8 +222,26 @@ struct Hello<'a> {
 ///
 /// Separated from routing so that a caller cannot reach a route without going through it:
 /// there is no path to the annotation handlers that does not pass this function first.
+/// Whether a request could have come from a page.
+///
+/// Measured rather than assumed. In Chromium an extension's `fetch` arrives with
+/// `Sec-Fetch-Site: none` and no `Origin` at all, while a page the daemon itself serves in
+/// the no-proxy fallback mode -- which is *same-origin* with the control API, and so the
+/// hardest case -- arrives with `same-origin`. Anything from another site is `cross-site`.
+///
+/// Absent means no browser sent it. That is a local process, which could read the token
+/// file directly, so refusing it here would protect nothing.
+pub fn from_a_page(site: Option<&str>) -> bool {
+    match site {
+        None => false,
+        Some("none") => false,
+        Some(_) => true,
+    }
+}
+
 pub fn gate(
     method: &Method,
+    fetch_site: Option<&str>,
     presented: Option<&str>,
     token: &Token,
 ) -> Option<Response<Full<Bytes>>> {
@@ -228,6 +252,18 @@ pub fn gate(
         return Some(text(
             StatusCode::METHOD_NOT_ALLOWED,
             "the control API does not participate in CORS",
+        ));
+    }
+
+    // Before the token, because it is a stronger statement: no page reaches this API at
+    // all, whatever it has got hold of. The token answers "is this caller authorised";
+    // this answers "is this caller a page", and a page holding a leaked token was the one
+    // case the token alone could not refuse. It matters most in the no-proxy fallback
+    // mode, where a page the daemon serves shares an origin with the control API.
+    if from_a_page(fetch_site) {
+        return Some(text(
+            StatusCode::FORBIDDEN,
+            "the control API is not reachable from a page",
         ));
     }
 
@@ -301,13 +337,13 @@ mod tests {
 
     #[test]
     fn the_right_token_passes_the_gate() {
-        assert!(gate(&Method::GET, Some(token().as_str()), &token()).is_none());
+        assert!(gate(&Method::GET, None, Some(token().as_str()), &token()).is_none());
     }
 
     #[test]
     fn a_missing_or_wrong_token_is_refused_identically() {
         for presented in [None, Some(""), Some("wrong"), Some(&token().as_str()[..10])] {
-            let refusal = gate(&Method::GET, presented, &token()).expect("refused");
+            let refusal = gate(&Method::GET, None, presented, &token()).expect("refused");
             assert_eq!(refusal.status(), StatusCode::UNAUTHORIZED);
         }
     }
@@ -316,7 +352,8 @@ mod tests {
     /// with the control API instead of being stopped before the request is even made.
     #[test]
     fn a_preflight_is_refused_even_with_a_valid_token() {
-        let refusal = gate(&Method::OPTIONS, Some(token().as_str()), &token()).expect("refused");
+        let refusal =
+            gate(&Method::OPTIONS, None, Some(token().as_str()), &token()).expect("refused");
         assert_eq!(refusal.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
@@ -325,8 +362,8 @@ mod tests {
     #[test]
     fn no_response_carries_cors_headers() {
         let mut responses = vec![hello(&["docs".to_string()], "ssh-browser")];
-        responses.extend(gate(&Method::OPTIONS, None, &token()));
-        responses.extend(gate(&Method::GET, None, &token()));
+        responses.extend(gate(&Method::OPTIONS, None, None, &token()));
+        responses.extend(gate(&Method::GET, None, None, &token()));
         responses.push(text(StatusCode::NOT_FOUND, "nope"));
 
         for res in responses {
@@ -417,5 +454,32 @@ mod tests {
         assert_eq!(route_of("/_control/hello"), "hello");
         assert_eq!(route_of("/_control/annotations"), "annotations");
         assert_eq!(route_of("/not-control"), "");
+    }
+
+    /// The measured cases. An extension's fetch arrives as `none` with no `Origin`; a page
+    /// the daemon serves in the no-proxy fallback mode arrives as `same-origin`, which is
+    /// the hardest one because it shares an origin with the control API; anything from
+    /// elsewhere is `cross-site`. Absent is not a browser at all.
+    #[test]
+    fn a_page_is_told_apart_from_an_extension() {
+        assert!(!from_a_page(None));
+        assert!(!from_a_page(Some("none")));
+        for page in ["same-origin", "same-site", "cross-site"] {
+            assert!(from_a_page(Some(page)), "{page} is a page");
+        }
+    }
+
+    /// Refused before the token is even looked at, because it is the stronger statement:
+    /// a page holding a leaked token is the one case the token alone could not refuse.
+    #[test]
+    fn a_page_cannot_reach_the_control_api_even_with_the_right_token() {
+        let refusal = gate(
+            &Method::GET,
+            Some("same-origin"),
+            Some(token().as_str()),
+            &token(),
+        )
+        .expect("refused");
+        assert_eq!(refusal.status(), StatusCode::FORBIDDEN);
     }
 }

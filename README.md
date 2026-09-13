@@ -159,6 +159,12 @@ a file that asked for https is the one outcome that looks like success.
 
 ### The extension
 
+Open the popup and it lists the hosts your `~/.ssh/config` can reach, with what `ssh -G`
+resolved for each. Click one and it opens, and you land on its directory tree. There is
+nothing to paste: the extension asks the daemon for its control token, and the daemon hands
+that to anything except a page — see [SECURITY.md](SECURITY.md).
+
+
 `extension/` builds with `npm ci && npm run build` and loads unpacked from
 `extension/dist`. Give it the port and the control token the daemon printed; it applies
 the PAC itself, so `--proxy-pac-url` is not needed as well.

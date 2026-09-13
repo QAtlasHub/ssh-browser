@@ -66,6 +66,32 @@ under your runtime or configuration directory with mode `0600` on Unix. Any proc
 running as you can read that file. That is the limit of what a loopback listener can
 promise, and no arrangement of headers changes it.
 
+## Why there is nothing to paste
+
+`GET /_control/token` hands the control token to the caller. That is what removes the
+first-run paste: an extension cannot read a file, so the token had to be copied out of a
+terminal by hand.
+
+It is safe because of a different check, applied to the whole control API: **a request that
+came from a page is refused, whatever it is carrying.** `Sec-Fetch-Site` is a forbidden
+header name, so page script can neither set it nor remove it, and what arrives is the
+browser's account of who started the request rather than the caller's.
+
+The values are measured, not assumed. In Chromium an extension's `fetch` arrives with
+`Sec-Fetch-Site: none` and no `Origin` at all. A page the daemon itself serves in the
+no-proxy fallback mode arrives as `same-origin` — the hardest case, because it genuinely
+shares an origin with the control API — and anything from another site as `cross-site`.
+Absent means no browser sent it, which is a local process; that could read the token file
+directly, so refusing it would protect nothing.
+
+This is strictly stronger than the token was on its own. A page that had somehow got hold
+of the token could previously have used it, and in the fallback mode a same-origin page
+could have read every control response. Now it cannot reach the API at all.
+
+The token is still required on every other route, and still matters: it is what forces a
+preflight, and the preflight is what stops a cross-origin POST that would otherwise be sent
+without one.
+
 ## What the control API connects to
 
 `POST /_control/open` starts an ssh session, which is the only control route with an
