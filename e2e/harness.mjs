@@ -5,7 +5,7 @@
 // screenshots stopped matching what the tests were passing against.
 
 import { spawn } from "node:child_process";
-import { cp, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,12 +23,85 @@ export const DAEMON =
   process.env["SSH_BROWSER_E2E_BIN"] ??
   join(repo, "target", "debug", process.platform === "win32" ? "ssh-browser.exe" : "ssh-browser");
 
+/// Refuse to run a daemon older than the source it is supposed to be.
+///
+/// Nothing here builds the binary, so the default one is whatever `cargo build` last left —
+/// and a run against yesterday's binary checks yesterday's code and prints `ok` for all of it.
+/// That is this project's own defined failure mode arriving through its test harness, and it
+/// has already happened once: a field added to a control response came back `undefined` and
+/// the measurement printed `NaN`. `NaN` is a lucky shape. A changed *behaviour* would have
+/// read as a passing test.
+///
+/// The ordinary way to get here on a developer's machine is a daemon they started themselves
+/// still holding the binary, because `cargo build` then fails with an access error and leaves
+/// the old one in place.
+///
+/// Compared by modification time rather than by content, so it is approximate in one
+/// direction only: it can ask for a rebuild that changes nothing, and cannot pass a binary
+/// that is genuinely behind.
+async function refuseIfStale() {
+  // Somebody who named a binary chose it. Only the default is guessed, so only the default is
+  // second-guessed.
+  if (process.env["SSH_BROWSER_E2E_BIN"]) return;
+
+  const built = await stat(DAEMON).catch(() => null);
+  if (!built) throw new Error(`no daemon at ${DAEMON} — run: cargo build`);
+
+  let newest = 0;
+  let culprit = "";
+  for (const root of [join(repo, "crates"), join(repo, "Cargo.toml"), join(repo, "Cargo.lock")]) {
+    for (const file of await sources(root)) {
+      const { mtimeMs } = await stat(file);
+      if (mtimeMs > newest) {
+        newest = mtimeMs;
+        culprit = file;
+      }
+    }
+  }
+
+  if (newest > built.mtimeMs) {
+    throw new Error(
+      `the daemon at ${DAEMON} is older than ${culprit}.\n` +
+        `  Run: cargo build\n` +
+        `  If that fails with an access error, a daemon you started is still holding it.\n` +
+        `  Or set SSH_BROWSER_E2E_BIN to a binary built elsewhere.`,
+    );
+  }
+}
+
+/// Every `.rs` and `.toml` under `root`, or `root` itself if it is a file.
+async function sources(root) {
+  const found = [];
+  const info = await stat(root).catch(() => null);
+  if (!info) return found;
+  if (!info.isDirectory()) {
+    found.push(root);
+    return found;
+  }
+  const walk = async (dir) => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      // Build output is skipped: it holds copies of the sources, and its own artifacts are
+      // newer than the binary by construction.
+      if (entry.isDirectory()) {
+        if (entry.name !== "target") await walk(path);
+      } else if (entry.name.endsWith(".rs") || entry.name.endsWith(".toml")) {
+        found.push(path);
+      }
+    }
+  };
+  await walk(root);
+  return found;
+}
+
 /// Start the daemon on `port` and wait until it says it is listening.
 ///
 /// Waiting for the line rather than sleeping: a fixed sleep is either too short on a loaded
 /// runner, which makes the caller flaky, or too long everywhere else. The line is printed only
 /// once the port has been taken and every host is connected, so it means what it says.
 export async function startDaemon(port) {
+  await refuseIfStale();
+
   // An empty config file, named explicitly. Without it the daemon reads whatever
   // `<config dir>/ssh-browser/config.toml` happens to hold, so a run on a machine that
   // uses ssh-browser for real would connect to every host configured there: slower, and

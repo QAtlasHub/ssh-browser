@@ -107,6 +107,10 @@ pub trait RemoteFs {
     async fn home(&self) -> Result<String>;
 
     /// Flushes issued so far. One flush is one remote round trip, so this is the
-    /// invariant made observable, and assertable in tests.
+    /// invariant made observable.
+    ///
+    /// Reported by `GET /_control/hosts` per open alias, not only asserted in tests. A
+    /// claim about round trips that can only be checked against a fake remote is a claim
+    /// about the fake.
     fn round_trips(&self) -> u64;
 }
