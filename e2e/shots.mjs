@@ -22,6 +22,7 @@ import {
   ALIAS,
   SUFFIX,
   TOKEN_HEADER,
+  browserOptions,
   connectThroughPopup,
   extensionWithPermissionGranted,
   loadExtension,
@@ -46,10 +47,7 @@ let browser;
 try {
   await mkdir(OUT, { recursive: true });
   browser = await chromium.launchPersistentContext(profile, {
-    // An MV3 service worker does not start in the old headless mode, so without this the
-    // extension would be loaded and inert and the photographs would show none of it.
-    channel: "chromium",
-    headless: true,
+    ...browserOptions(),
     viewport: VIEW,
     proxy: { server: `http://127.0.0.1:${PORT}` },
     args: loadExtension(extension),
