@@ -5,46 +5,86 @@
     <title>ssh-browser</title>
     <style>
       body {
-        font: 13px/1.5 system-ui, sans-serif;
+        font:
+          13px/1.5 system-ui,
+          sans-serif;
         margin: 0;
         padding: 12px;
-        width: 320px;
+        width: 340px;
       }
       h1 {
         font-size: 13px;
         font-weight: 600;
         margin: 0 0 8px;
       }
-      label {
-        display: block;
-        margin-top: 8px;
-      }
-      input {
-        box-sizing: border-box;
-        font: inherit;
-        margin-top: 2px;
-        padding: 4px 6px;
-        width: 100%;
-      }
-      button {
-        font: inherit;
-        margin-top: 10px;
-        padding: 5px 10px;
-      }
       #status {
-        margin-top: 10px;
+        margin-bottom: 8px;
         white-space: pre-wrap;
+      }
+      #status:empty {
+        display: none;
       }
       #status.bad {
         color: #b00020;
       }
-      ul {
-        margin: 6px 0 0;
-        padding-left: 18px;
+      #hosts {
+        list-style: none;
+        margin: 0;
+        padding: 0;
       }
-      #hint {
+      #hosts button {
+        background: none;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        cursor: pointer;
+        display: block;
+        font: inherit;
+        margin-bottom: 4px;
+        padding: 6px 8px;
+        text-align: left;
+        width: 100%;
+      }
+      #hosts button:hover {
+        background: #f6f6f6;
+      }
+      #hosts button:disabled {
+        cursor: progress;
+        opacity: 0.6;
+      }
+      .alias {
+        font-weight: 600;
+      }
+      .where {
+        color: #666;
+      }
+      .served {
+        color: #0a7d33;
+        float: right;
+        font-weight: normal;
+      }
+      .bad-host {
+        color: #b00020;
+      }
+      #skipped {
+        color: #666;
+        margin-top: 8px;
+      }
+      #skipped:empty {
+        display: none;
+      }
+      details {
         color: #666;
         margin-top: 10px;
+      }
+      summary {
+        cursor: pointer;
+      }
+      input {
+        box-sizing: border-box;
+        font: inherit;
+        margin-top: 4px;
+        padding: 4px 6px;
+        width: 100%;
       }
       kbd {
         background: #f2f2f2;
@@ -57,22 +97,20 @@
   </head>
   <body>
     <h1>ssh-browser</h1>
-    <label>
-      Port
-      <input id="port" type="number" min="1" max="65535" value="7391" />
-    </label>
-    <label>
-      Control token
-      <input id="token" type="password" autocomplete="off" spellcheck="false" />
-    </label>
-    <button id="connect">Connect</button>
     <div id="status"></div>
-    <ul id="aliases"></ul>
-    <!-- An address-bar keyword nobody is told about is one nobody uses. Static text rather
-         than something panel.ts fills in, so it cannot become a sixth id that must exist. -->
-    <div id="hint">
-      In the address bar: <kbd>ssh</kbd> then Tab, then an alias and a path.
-    </div>
+    <ul id="hosts"></ul>
+    <div id="skipped"></div>
+    <!-- Out of the way in a disclosure, because the ordinary run needs neither. There is no
+         token field: the extension asks the daemon for it, and the daemon answers that only
+         to something that is not a page. -->
+    <details>
+      <summary>Settings</summary>
+      <label>
+        Port
+        <input id="port" type="number" min="1" max="65535" value="7391" />
+      </label>
+      <p>In the address bar: <kbd>ssh</kbd> then Tab, then an alias and a path.</p>
+    </details>
     <script type="module" src="panel.js"></script>
   </body>
 </html>

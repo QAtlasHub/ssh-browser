@@ -50,10 +50,34 @@ export interface Reply {
   annotations?: unknown[];
   skipped?: number;
   id?: string;
+  open?: OpenAlias[];
+  hosts?: KnownHost[];
+  unusable?: { host: string; why: string }[];
+  url?: string;
+}
+
+export interface OpenAlias {
+  alias: string;
+  host: string;
+  base: string;
+  url: string;
+}
+
+export interface KnownHost {
+  alias: string;
+  host: string;
+  user?: string;
+  hostname?: string;
+  port?: number;
+  proxyJump?: string | null;
+  served: boolean;
+  unresolved?: string;
 }
 
 type Request =
-  | { kind: "connect"; port: number; token: string }
+  | { kind: "connect"; port: number }
+  | { kind: "hosts" }
+  | { kind: "open"; host: string; base?: string }
   | { kind: "disconnect" }
   | { kind: "status" }
   | { kind: "register"; suffix: string }
@@ -170,9 +194,54 @@ async function applyPac(s: Settings): Promise<void> {
   });
 }
 
-async function connect(port: number, token: string): Promise<Reply> {
+/// Ask the daemon for its control token.
+///
+/// This is why there is nothing to paste. An extension cannot read a file, so before this
+/// the first run meant copying sixty-four hex characters out of a terminal.
+///
+/// It is safe to hand over because the daemon refuses this route to anything page-shaped,
+/// and it knows which is which from `Sec-Fetch-Site` — a forbidden header name, so page
+/// script can neither set it nor remove it. An extension fetch arrives as `none`; a page,
+/// including one the daemon itself serves in fallback mode, arrives as `same-origin` or
+/// `cross-site` and is refused. A caller that is not a browser at all could read the token
+/// file directly, so refusing it would protect nothing.
+async function handshake(port: number): Promise<string> {
+  const res = await fetch(`http://127.0.0.1:${port}/_control/token`);
+  if (res.status === 404) {
+    throw new Error(
+      "that daemon is too old to hand over its token; update it with: cargo install ssh-browser",
+    );
+  }
+  if (!res.ok) {
+    throw new Error(`the daemon would not hand over its token (${res.status})`);
+  }
+  const token = (await res.text()).trim();
+  if (!/^[0-9a-f]{64}$/.test(token)) {
+    // Refused rather than stored. A token that is not one would be sent on every later
+    // call and produce a 401 whose cause was several steps back.
+    throw new Error("the daemon answered with something that is not a token");
+  }
+  return token;
+}
+
+async function connect(port: number): Promise<Reply> {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return { ok: false, detail: `${port} is not a port` };
+  }
+
+  let token: string;
+  try {
+    token = await handshake(port);
+  } catch (e) {
+    if (e instanceof TypeError) {
+      // A refused connection is the ordinary case of "the daemon is not running", so say
+      // that rather than surfacing a network error the reader cannot act on.
+      return {
+        ok: false,
+        detail: `nothing is listening on 127.0.0.1:${port}. Start it with: ssh-browser serve`,
+      };
+    }
+    return { ok: false, detail: String(e instanceof Error ? e.message : e) };
   }
   // Neither the suffix nor the aliases are known until `hello` answers, so these placeholders
   // only have to be good enough to reach the daemon; the real ones are stored below.
@@ -182,19 +251,9 @@ async function connect(port: number, token: string): Promise<Reply> {
   try {
     res = await callDaemon(s, "/_control/hello");
   } catch {
-    // A refused connection is the ordinary case of "the daemon is not running", so say that
-    // rather than surfacing a network error the reader cannot act on.
-    return {
-      ok: false,
-      detail:
-        `nothing is listening on 127.0.0.1:${port}. Start it with: ` +
-        `ssh-browser serve <alias>=<host>:<path>`,
-    };
+    return { ok: false, detail: `127.0.0.1:${port} stopped answering` };
   }
 
-  if (res.status === 401) {
-    return { ok: false, detail: "the daemon refused that token" };
-  }
   if (!res.ok) {
     return { ok: false, detail: `the daemon answered ${res.status}` };
   }
@@ -212,7 +271,10 @@ async function connect(port: number, token: string): Promise<Reply> {
   try {
     await applyPac(s);
   } catch (e) {
-    return { ok: false, detail: `connected, but the proxy could not be set: ${String(e)}` };
+    return {
+      ok: false,
+      detail: `connected, but the proxy could not be set: ${String(e)}`,
+    };
   }
 
   await chrome.storage.local.set({
@@ -247,7 +309,7 @@ async function status(): Promise<Reply> {
   if (!s) {
     return { ok: false, detail: "not connected" };
   }
-  return connect(s.port, s.token);
+  return connect(s.port);
 }
 
 /// Register the content script for the daemon's suffix, and only for it.
@@ -302,6 +364,72 @@ async function resolveDoc(url: string): Promise<Resolved> {
   return { ok: true, s, doc };
 }
 
+/// The hosts ssh already knows how to reach.
+async function listHosts(): Promise<Reply> {
+  const s = await stored();
+  if (!s) {
+    return { ok: false, detail: "not connected" };
+  }
+  const res = await callDaemon(s, "/_control/hosts");
+  if (!res.ok) {
+    return { ok: false, detail: `${res.status}: ${await res.text()}` };
+  }
+  const body = (await res.json()) as {
+    open: OpenAlias[];
+    hosts: KnownHost[];
+    unusable: { host: string; why: string }[];
+  };
+  return {
+    ok: true,
+    detail:
+      body.hosts.length === 0 && body.open.length === 0 ? "no hosts in your ~/.ssh/config" : "",
+    // What is being served right now, which is not the same question as what could be: an
+    // alias need not be named after its host, so one opened as `docs=myhost:/srv` matches
+    // no row in ssh_config at all and would otherwise be live and visible nowhere.
+    open: body.open,
+    hosts: body.hosts,
+    // Carried through rather than dropped. A host missing from the list with no reason
+    // reads as ssh-browser having failed to find it, which has a different fix.
+    unusable: body.unusable,
+  };
+}
+
+/// Start serving one of them, and report the URL it is at.
+async function openHost(host: string, base?: string): Promise<Reply> {
+  const s = await stored();
+  if (!s) {
+    return { ok: false, detail: "not connected" };
+  }
+  const payload: Record<string, unknown> = { host };
+  if (base !== undefined && base !== "") {
+    payload["base"] = base;
+  }
+  const res = await callDaemon(s, "/_control/open", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    return { ok: false, detail: `${await res.text()}` };
+  }
+  const opened = (await res.json()) as {
+    alias: string;
+    base: string;
+    url: string;
+  };
+  // The alias list feeds the omnibox, and a host just opened should be suggestible without
+  // waiting for the popup to be opened again.
+  if (!s.aliases.includes(opened.alias)) {
+    await chrome.storage.local.set({
+      aliases: [...s.aliases, opened.alias].sort(),
+    });
+  }
+  return {
+    ok: true,
+    detail: `${opened.alias} is at ${opened.base}`,
+    url: opened.url,
+  };
+}
+
 async function listAnnotations(url: string): Promise<Reply> {
   const resolved = await resolveDoc(url);
   if (!resolved.ok) {
@@ -312,7 +440,10 @@ async function listAnnotations(url: string): Promise<Reply> {
   if (!res.ok) {
     return { ok: false, detail: `${res.status}: ${await res.text()}` };
   }
-  const body = (await res.json()) as { annotations: unknown[]; skipped: number };
+  const body = (await res.json()) as {
+    annotations: unknown[];
+    skipped: number;
+  };
   return {
     ok: true,
     // Surfaced rather than dropped: a line the daemon could not parse means an annotation
@@ -338,7 +469,11 @@ async function addAnnotation(url: string, body: string, selectors?: unknown): Pr
   // `encodeDoc` here as well as on the read path, and for the same reason: the daemon
   // decodes once, so both directions have to encode once. They did not, and a note written
   // to a filename needing escapes could not be read back.
-  const payload: Record<string, unknown> = { doc: encodeDoc(doc), op: "add", body };
+  const payload: Record<string, unknown> = {
+    doc: encodeDoc(doc),
+    op: "add",
+    body,
+  };
   if (selectors !== undefined) {
     payload["selectors"] = selectors;
   }
@@ -367,7 +502,11 @@ async function dispatch(message: unknown): Promise<Reply> {
   }
   switch (message.kind) {
     case "connect":
-      return connect(message.port, message.token);
+      return connect(message.port);
+    case "hosts":
+      return listHosts();
+    case "open":
+      return openHost(message.host, message.base);
     case "disconnect":
       return disconnect();
     case "status":
@@ -422,7 +561,9 @@ function installOmnibox(): void {
   const complain = (what: string) => (e: unknown) => {
     console.error(`ssh-browser: ${what} failed`, e);
     void chrome.action.setBadgeText({ text: "!" });
-    void chrome.action.setTitle({ title: `ssh-browser: ${what} failed — ${String(e)}` });
+    void chrome.action.setTitle({
+      title: `ssh-browser: ${what} failed — ${String(e)}`,
+    });
   };
 
   chrome.omnibox.setDefaultSuggestion({

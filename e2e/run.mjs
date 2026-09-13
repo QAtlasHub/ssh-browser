@@ -38,6 +38,7 @@ import {
   TOKEN_HEADER,
   browserOptions,
   connectThroughPopup,
+  BASE,
   extensionWithPermissionGranted,
   loadExtension,
   startDaemon,
@@ -53,7 +54,14 @@ let failures = 0;
 
 function check(what, fn) {
   try {
-    fn();
+    const got = fn();
+    // Refused rather than awaited. This helper is synchronous, so an `async` body used to
+    // report `ok` before it had run anything — a check that cannot fail, which is worse
+    // than no check. Making it loud costs one line and closes the whole class; awaiting
+    // instead would mean every one of the call sites below had to remember to.
+    if (got !== undefined && typeof got?.then === "function") {
+      throw new Error("check() is synchronous — await the value before calling it");
+    }
     console.log(`  ok    ${what}`);
   } catch (e) {
     failures += 1;
@@ -294,16 +302,70 @@ async function main() {
     );
 
     console.log("\nthe extension");
-    const { popup } = await connectThroughPopup(browser, PORT, token);
+    const { popup } = await connectThroughPopup(browser, PORT);
     const status = await popup.textContent("#status");
-    const links = await popup.$$eval("#aliases a", (as) => as.map((a) => a.textContent));
+    // Waited for, not assumed. The popup connects, registers the content script, *then*
+    // asks for the host list, and `connectThroughPopup` returns on the registration — so
+    // reading the rows straight afterwards is a race that passes most of the time. It
+    // passed for me once before I noticed, which is the worst way for it to behave.
+    await popup.waitForSelector("#hosts button");
+    const rows = await popup.$$eval("#hosts button", (bs) => bs.map((b) => b.textContent ?? ""));
 
     check("the popup connects and names the daemon", () =>
       assert.match(status ?? "", /connected to ssh-browser/),
     );
-    check("it lists the alias as a link", () =>
-      assert.deepEqual(links, [`http://${ALIAS}.${SUFFIX}/`]),
-    );
+    // The alias is served but is not named in any ssh_config — `e2e` is not a Host, it is
+    // a name given on the command line. Listing only ssh_config's hosts would leave it
+    // live and visible nowhere, which is the sort of invisible state this is meant not to
+    // have. So the check is that what is *open* appears, not that a host does.
+    check("it lists what is actually being served", () => {
+      const mine = rows.filter((t) => t.includes(ALIAS));
+      assert.equal(mine.length, 1, `expected one row for ${ALIAS}, got: ${rows.join(" | ")}`);
+      assert.match(mine[0], /open/);
+      // Against the *resolved* base, not the configured one: `~/x` is served at
+      // `/home/you/x`, and the row should name where the alias actually points rather
+      // than repeating what was typed. Dropping the tilde makes the tail comparable
+      // whichever form was given.
+      const tail = BASE.startsWith("~") ? BASE.slice(1) : BASE;
+      assert.ok(mine[0].endsWith(tail), `the row should name the base ${tail}: ${mine[0]}`);
+    });
+
+    // Nothing to paste is the point: the popup asked the daemon for the token, and the
+    // daemon hands it to anything that is not a page. A field for it would mean the old
+    // flow had merely been hidden.
+    const tokenField = await popup.$("#token");
+    check("the popup has no token field to fill in", () => assert.equal(tokenField, null));
+
+    // Clicking a host that is not open yet makes the daemon ssh to it, which is a real
+    // side effect on somebody's real machine. So it is opt-in by name rather than picking
+    // whatever happened to be first in the config, and says so when it is not run — a
+    // check that quietly does nothing is worse than one that is absent.
+    const clickable = process.env["SSH_BROWSER_E2E_OPEN_HOST"];
+    if (clickable === undefined) {
+      console.log(
+        "  skip  opening a host by clicking it " +
+          "(set SSH_BROWSER_E2E_OPEN_HOST=<ssh_config host> to run it)",
+      );
+    } else {
+      // By the alias attribute rather than by text. `hasText` matched the wrong row: the
+      // open alias names its ssh host in the line underneath, so a search for "panza"
+      // found the `e2e` row and clicked that instead.
+      const row = popup.locator(`#hosts button[data-alias="${clickable}"]`);
+      const opened = browser.waitForEvent("page", { timeout: 60_000 });
+      await row.click();
+      const tab = await opened;
+      await tab.waitForLoadState("domcontentloaded");
+      check("opening a host by clicking it lands on its origin", () =>
+        assert.equal(new URL(tab.url()).host, `${clickable}.${SUFFIX}`),
+      );
+      // The point of the whole exercise: what opens is a directory you can walk, not a
+      // file listing in a viewer.
+      const entries = await tab.$$eval("a", (as) => as.map((a) => a.getAttribute("href")));
+      check("and what it lands on is a directory tree", () =>
+        assert.ok(entries.length > 0, "the landing page should list entries to click"),
+      );
+      await tab.close();
+    }
 
     // A filename that needs percent-escaping, which is where the two directions of the
     // annotation API can disagree about which document they mean. They did: a note was written

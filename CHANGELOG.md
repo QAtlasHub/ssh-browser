@@ -22,6 +22,18 @@ through a browser store and has not been submitted. No surface is stable.
   user, hostname, port and `ProxyJump` that `ssh -G` resolves for each. `Include` is
   followed; patterns like `Host *` are not hosts and are skipped; a name that cannot be a
   hostname label is reported rather than silently dropped.
+- The extension's popup is the host list. It shows what is open, then what your ssh_config
+  could reach, each with the user, hostname, port and `ProxyJump` that `ssh -G` resolved.
+  Clicking one opens it and goes there.
+- **Nothing to paste.** `GET /_control/token` hands the token over, and the whole control
+  API now refuses any request a browser says came from a page. `Sec-Fetch-Site` is a
+  forbidden header name, so page script can neither set it nor remove it; the values were
+  measured rather than assumed. This is stronger than the token alone was: a page holding a
+  leaked token, or a same-origin page in the no-proxy fallback mode, could previously have
+  used the API and now cannot reach it.
+- `GET /_control/hosts` also reports the aliases open right now. An alias need not be named
+  after its host, so one opened as `docs=myhost:/srv` matches no row in ssh_config and would
+  otherwise be served and visible nowhere.
 - `POST /_control/open` starts serving one of those hosts, so a host can be opened by
   picking it rather than by configuring it first. Only a host named in ssh_config can be
   opened: "ssh to an arbitrary host on request" is a larger primitive than this needs, and
