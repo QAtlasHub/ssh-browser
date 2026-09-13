@@ -15,16 +15,16 @@ process.chdir(dirname(fileURLToPath(import.meta.url)));
 mkdirSync("dist", { recursive: true });
 
 await build({
-  entryPoints: ["src/background.ts", "src/dashboard.ts", "src/content.ts"],
+  entryPoints: ["src/background.ts", "src/dashboard.ts"],
   bundle: true,
   format: "esm",
   // The manifest's minimum_chrome_version. Keeping the two in step means a syntax the
   // stated minimum cannot parse is a build error rather than a support ticket.
   target: "chrome116",
   outdir: "dist",
-  // The content script is injected into every alias page, and Apache Annotator pulls in a
-  // core-js runtime that dominates the bundle. Minifying is not a vanity metric here: it is
-  // parse work the browser does on every page load.
+  // Nothing here is injected into a page any more, so this is a few kilobytes either way.
+  // Kept because a store reviewer reads what is shipped, and two builds of the same source
+  // should produce the same bytes.
   minify: true,
   logLevel: "info",
 });

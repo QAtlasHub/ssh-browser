@@ -14,13 +14,6 @@ const PROTOCOL = 1;
 
 const TOKEN_HEADER = "x-ssh-browser-token";
 
-const CONTENT_SCRIPT_ID = "alias-pages";
-
-/// Which pages the content script should run in, for a given suffix.
-function matchesFor(suffix: string): string[] {
-  return [`http://*.${suffix}/*`];
-}
-
 interface Settings {
   port: number;
   token: string;
@@ -47,9 +40,6 @@ export interface Reply {
   detail: string;
   aliases?: string[];
   suffix?: string;
-  annotations?: unknown[];
-  skipped?: number;
-  id?: string;
   open?: OpenAlias[];
   current?: string;
   themes?: { name: string; label: string }[];
@@ -84,10 +74,7 @@ type Request =
   | { kind: "theme" }
   | { kind: "setTheme"; name: string }
   | { kind: "disconnect" }
-  | { kind: "status" }
-  | { kind: "register"; suffix: string }
-  | { kind: "annotations"; url: string }
-  | { kind: "annotate"; url: string; body: string; selectors?: unknown };
+  | { kind: "status" };
 
 async function stored(): Promise<Settings | null> {
   const got = await chrome.storage.local.get(["port", "token", "suffix", "aliases"]);
@@ -108,56 +95,6 @@ async function stored(): Promise<Settings | null> {
   const raw: unknown = got["aliases"];
   const aliases = Array.isArray(raw) ? raw.filter((a): a is string => typeof a === "string") : [];
   return { port, token, suffix, aliases };
-}
-
-/// `http://docs.ssh-browser/a/b.html` becomes `docs/a/b.html`.
-///
-/// Derived here rather than in the content script, so the suffix stays knowledge this worker
-/// holds. A content script that had to know the suffix would need telling again every time it
-/// changed, and the page it runs in is not somewhere to keep configuration.
-function docOfUrl(href: string, suffix: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(href);
-  } catch {
-    return null;
-  }
-  if (url.protocol !== "http:") {
-    return null;
-  }
-  const tail = `.${suffix}`;
-  if (!url.hostname.endsWith(tail)) {
-    return null;
-  }
-  const alias = url.hostname.slice(0, -tail.length);
-  // A single label only. `a.b.ssh-browser` is not an alias the daemon serves, and sending it
-  // one would be asking for a refusal we can predict.
-  if (alias === "" || alias.includes(".")) {
-    return null;
-  }
-  // Decoded here, and encoded exactly once by `encodeDoc` on the way out.
-  //
-  // `pathname` keeps its percent-escapes, and the daemon decodes what it is handed exactly
-  // once — deliberately, since decoding twice would turn a literal `%2e%2e` in a filename
-  // into a traversal. Passing the escaped form straight through meant the read path escaped
-  // it a second time and the write path did not, so a note written against
-  // `Weekly Report.html` was afterwards looked for under `Weekly%20Report.html` and never
-  // found again. Decoding first is what makes the two directions agree.
-  //
-  // Per segment, so a `%2F` stays a separator question for the daemon to answer rather than
-  // becoming one here.
-  let path: string;
-  try {
-    path = url.pathname
-      .split("/")
-      .map((segment) => decodeURIComponent(segment))
-      .join("/");
-  } catch {
-    // A malformed escape, which the daemon would refuse anyway. Saying so here beats
-    // sending it something that cannot mean anything.
-    return null;
-  }
-  return `${alias}${path}`;
 }
 
 /// Every call to the daemon goes through here, so the token is attached in exactly one place
@@ -317,58 +254,6 @@ async function status(): Promise<Reply> {
   return connect(s.port);
 }
 
-/// Register the content script for the daemon's suffix, and only for it.
-///
-/// Registered at runtime rather than declared in the manifest, because the suffix is
-/// configurable: a manifest entry would have to match every http site in order to cover
-/// whatever suffix was chosen, and that is a permission this extension has no reason to hold.
-///
-/// The permission itself is requested from the popup, because a request needs a user gesture.
-async function registerContent(suffix: string): Promise<Reply> {
-  const matches = matchesFor(suffix);
-  if (!(await chrome.permissions.contains({ origins: matches }))) {
-    return {
-      ok: false,
-      detail: `not allowed to run on ${matches[0]} yet — grant it from the popup`,
-    };
-  }
-
-  await chrome.scripting.unregisterContentScripts({ ids: [CONTENT_SCRIPT_ID] }).catch(() => {
-    // Nothing registered yet, which is the ordinary first run.
-  });
-  await chrome.scripting.registerContentScripts([
-    {
-      id: CONTENT_SCRIPT_ID,
-      matches,
-      js: ["content.js"],
-      runAt: "document_idle",
-    },
-  ]);
-  return { ok: true, detail: `annotating pages under *.${suffix}` };
-}
-
-/// Settings plus the document a page URL names, or the refusal to report instead.
-///
-/// One resolution path for both annotation routes. The daemon settled the same question the
-/// same way — `resolve_doc` exists there so that reading and writing cannot disagree about
-/// what a document is — and the two copies here had already drifted once, which is how one
-/// direction came to escape the path and the other not.
-/// The failure arm pins `ok` to `false` rather than reusing `Reply`'s `boolean`, because a
-/// union only narrows on a discriminant that is a literal in each arm.
-type Resolved = { ok: true; s: Settings; doc: string } | (Reply & { ok: false });
-
-async function resolveDoc(url: string): Promise<Resolved> {
-  const s = await stored();
-  if (!s) {
-    return { ok: false, detail: "not connected" };
-  }
-  const doc = docOfUrl(url, s.suffix);
-  if (doc === null) {
-    return { ok: false, detail: "this page is not served by ssh-browser" };
-  }
-  return { ok: true, s, doc };
-}
-
 /// The hosts ssh already knows how to reach.
 async function listHosts(): Promise<Reply> {
   const s = await stored();
@@ -498,64 +383,6 @@ async function setTheme(name: string): Promise<Reply> {
   };
 }
 
-async function listAnnotations(url: string): Promise<Reply> {
-  const resolved = await resolveDoc(url);
-  if (!resolved.ok) {
-    return resolved;
-  }
-  const { s, doc } = resolved;
-  const res = await callDaemon(s, `/_control/annotations?doc=${encodeDoc(doc)}`);
-  if (!res.ok) {
-    return { ok: false, detail: `${res.status}: ${await res.text()}` };
-  }
-  const body = (await res.json()) as {
-    annotations: unknown[];
-    skipped: number;
-  };
-  return {
-    ok: true,
-    // Surfaced rather than dropped: a line the daemon could not parse means an annotation
-    // somebody wrote is not being shown, and silence about that is the worst outcome.
-    detail:
-      body.skipped > 0
-        ? `${body.annotations.length} annotations, ${body.skipped} unreadable lines`
-        : `${body.annotations.length} annotations`,
-    annotations: body.annotations,
-    skipped: body.skipped,
-  };
-}
-
-async function addAnnotation(url: string, body: string, selectors?: unknown): Promise<Reply> {
-  const resolved = await resolveDoc(url);
-  if (!resolved.ok) {
-    return resolved;
-  }
-  const { s, doc } = resolved;
-  // No author and no id: the daemon decides both, so no caller — including this extension —
-  // can write as somebody else or choose an identity.
-  //
-  // `encodeDoc` here as well as on the read path, and for the same reason: the daemon
-  // decodes once, so both directions have to encode once. They did not, and a note written
-  // to a filename needing escapes could not be read back.
-  const payload: Record<string, unknown> = {
-    doc: encodeDoc(doc),
-    op: "add",
-    body,
-  };
-  if (selectors !== undefined) {
-    payload["selectors"] = selectors;
-  }
-  const res = await callDaemon(s, "/_control/annotations", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    return { ok: false, detail: `${res.status}: ${await res.text()}` };
-  }
-  const added = (await res.json()) as { id: string };
-  return { ok: true, detail: "saved", id: added.id };
-}
-
 function isRequest(message: unknown): message is Request {
   return (
     typeof message === "object" &&
@@ -585,12 +412,6 @@ async function dispatch(message: unknown): Promise<Reply> {
       return disconnect();
     case "status":
       return status();
-    case "register":
-      return registerContent(message.suffix);
-    case "annotations":
-      return listAnnotations(message.url);
-    case "annotate":
-      return addAnnotation(message.url, message.body, message.selectors);
   }
 }
 

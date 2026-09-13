@@ -261,17 +261,14 @@ cached, so a seek does not pull the whole file and does not evict the page bodie
 make revisits free. `If-Range` is never honoured, because the only validator on offer
 is weak and the whole representation is the specified answer to that.
 
-Annotations are per-author append-only logs beside the document, so two people annotating
-one page write to different files and neither can lose the other's work. They are reachable
-from the control API directly,
+**Nothing is written to your remote.** Not restricted, absent: the SFTP requests this can
+issue are `OPEN`, `CLOSE`, `READ`, `OPENDIR`, `READDIR` and `REALPATH`, and the only open
+flag it defines is `FXF_READ`. Nothing is injected into a page either — the extension has no
+content script, so what you see is the site, unchanged.
 
-```
-curl -H "x-ssh-browser-token: $TOKEN" -X POST   --data '{"doc":"docs/index.html","op":"add","body":"a note"}'   http://127.0.0.1:7391/_control/annotations
-```
-
-and the extension draws them. Highlights use the CSS Custom Highlight API and the panel is a
-closed shadow root, so the document is never modified — no wrapper elements, no `<style>`
-node, nothing a page script can see by walking the DOM.
+There used to be an annotation feature here, writing per-author logs into a sidecar
+directory. It is gone. A site that wants notes should have notes built into it; this is for
+seeing that site work.
 
 Four things are said rather than hidden, because each one means somebody's note is not
 saying what it appears to say:

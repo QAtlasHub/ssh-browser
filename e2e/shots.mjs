@@ -21,7 +21,6 @@ import { chromium } from "playwright";
 import {
   ALIAS,
   SUFFIX,
-  TOKEN_HEADER,
   browserOptions,
   connectThroughDashboard,
   extensionWithPermissionGranted,
@@ -37,9 +36,8 @@ const OUT = join(import.meta.dirname, "shots");
 const VIEW = { width: 1280, height: 800 };
 
 // The fuller of the two fixtures: a heading, an image and a script that ran.
-const DOC = "index.html";
 
-const { child, token } = await startDaemon(PORT);
+const { child } = await startDaemon(PORT);
 const profile = await mkdtemp(join(tmpdir(), "ssh-browser-shots-"));
 const extension = await extensionWithPermissionGranted();
 let browser;
@@ -72,34 +70,6 @@ try {
   await dashboard.waitForSelector("#theme");
   await dashboard.screenshot({ path: join(OUT, "3-settings.png") });
   console.log("  shots/3-settings.png   settings: what listings look like, and which daemon");
-
-  // A note to photograph. Written through the control API rather than by driving the panel,
-  // because the picture wanted is of a note being *shown*; how it got there is the subject of
-  // the checks rather than of a listing.
-  const posted = await fetch(`http://127.0.0.1:${PORT}/_control/annotations`, {
-    method: "POST",
-    headers: { [TOKEN_HEADER]: token, "content-type": "application/json" },
-    body: JSON.stringify({
-      doc: `${ALIAS}/${encodeURIComponent(DOC)}`,
-      op: "add",
-      body: "the quoted words are highlighted, and the note sits beside them",
-      selectors: [{ type: "TextQuoteSelector", exact: "served over ssh" }],
-    }),
-  });
-  if (!posted.ok) {
-    throw new Error(`could not write the note to photograph: ${posted.status}`);
-  }
-
-  const page = await browser.newPage();
-  await page.setViewportSize(VIEW);
-  await page.goto(`http://${ALIAS}.${SUFFIX}/${encodeURIComponent(DOC)}`, {
-    waitUntil: "networkidle",
-  });
-  // The highlight is the evidence the note arrived and anchored, so waiting for it is also
-  // what stops the shot being taken half a beat early.
-  await page.waitForFunction(() => CSS.highlights.size > 0, { timeout: 20_000 });
-  await page.screenshot({ path: join(OUT, "4-annotated.png") });
-  console.log("  shots/4-annotated.png  a page served over ssh, with a note on it");
 
   const listing = await browser.newPage();
   await listing.setViewportSize(VIEW);

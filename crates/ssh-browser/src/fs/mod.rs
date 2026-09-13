@@ -56,12 +56,6 @@ pub fn is_absent(e: &anyhow::Error) -> bool {
 pub struct Entry {
     pub name: String,
     pub attrs: Attrs,
-    /// The owner's account name, when the listing reported one legibly.
-    ///
-    /// `None` means the remote did not say, or said it in a shape not worth guessing at —
-    /// not that the file is unowned. Callers have to keep those two apart, because the one
-    /// thing this feeds is the check on who wrote an annotation log.
-    pub owner: Option<String>,
 }
 
 /// One byte range of one file.
@@ -111,23 +105,6 @@ pub trait RemoteFs {
     /// Asked once per alias at startup, never on a page path, so it costs no round trip
     /// that a reader waits for.
     async fn home(&self) -> Result<String>;
-
-    /// Append bytes to a file, creating it if absent.
-    ///
-    /// Append rather than write, and single rather than batched, because that is the
-    /// only write this design needs and the only one that is safe without a lock. A log
-    /// has exactly one writer by construction, so an append cannot interleave with
-    /// anyone else's — which is precisely why the annotation format is per-author logs
-    /// and not one shared file.
-    async fn append(&self, path: &str, bytes: &[u8]) -> Result<()>;
-
-    /// Create a directory and every missing parent.
-    ///
-    /// Every level is issued at once and per-level failures are ignored: a level that
-    /// already exists reports one, and the only outcome that matters is whether the
-    /// deepest level is there afterwards. Walking down a level per round trip would
-    /// cost depth round trips for something that happens once per document.
-    async fn mkdirs(&self, path: &str) -> Result<()>;
 
     /// Flushes issued so far. One flush is one remote round trip, so this is the
     /// invariant made observable, and assertable in tests.

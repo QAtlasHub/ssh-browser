@@ -230,7 +230,7 @@ struct Hello<'a> {
 /// refusal if there is one.
 ///
 /// Separated from routing so that a caller cannot reach a route without going through it:
-/// there is no path to the annotation handlers that does not pass this function first.
+/// there is no path to a control route that does not pass this function first.
 /// Whether a request could have come from a page.
 ///
 /// Measured rather than assumed. In Chromium an extension's `fetch` arrives with
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn routes_are_named_after_the_prefix() {
         assert_eq!(route_of("/_control/hello"), "hello");
-        assert_eq!(route_of("/_control/annotations"), "annotations");
+        assert_eq!(route_of("/_control/open"), "open");
         assert_eq!(route_of("/not-control"), "");
     }
 

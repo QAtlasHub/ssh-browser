@@ -11,6 +11,25 @@ through a browser store and has not been submitted. No surface is stable.
 
 ## [Unreleased]
 
+### Removed
+
+- **Annotations, entirely.** The daemon's `annot` module, the `/_control/annotations` routes,
+  the extension's content script, and the two npm dependencies it pulled in. souta's call, and
+  the right one: a site that wants notes should have notes built into it, and this product's
+  job is to let you see that site working.
+  What it bought is a property rather than a saving. **The daemon has no write path to a
+  remote** — not "writes are restricted", absent. The SFTP requests it can issue are `OPEN`,
+  `CLOSE`, `READ`, `OPENDIR`, `READDIR` and `REALPATH`, and the only open flag it defines is
+  `FXF_READ`; `RemoteFs` has no `append` or `mkdirs` to call.
+  The extension lost its only content script with it, so it no longer runs in, reads from, or
+  modifies the sites it opens, and it dropped the `scripting` permission and the
+  `http://*/*` optional host permission. It now asks for `proxy`, `storage` and
+  `http://127.0.0.1/*` and nothing else. The bundle went from ~152 KB to ~14 KB, of which the
+  138 KB content script was parsed on every page load.
+  Also gone with it: `--author` and `[server] author`, which existed only to name a log;
+  `Entry.owner` and the `longname` owner parse, which existed only to check one; and
+  `SECURITY.md`'s two sections about what was written and who a log belonged to.
+
 ### Fixed
 
 - The extension was never attached to a release automatically. `release-assets.yml`

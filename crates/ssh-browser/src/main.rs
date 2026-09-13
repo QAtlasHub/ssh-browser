@@ -9,7 +9,7 @@ use ssh_browser::origin::{Alias, Origin, pac};
 use ssh_browser::ssh_config;
 use ssh_browser::theme;
 
-const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--author NAME] [--new-token] [<alias>=<ssh-host>[:<base>] ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]
+const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--new-token] [<alias>=<ssh-host>[:<base>] ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]
   ssh-browser hosts\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"~/docs\"   # or an absolute path; omit for the home directory itself";
 
 #[tokio::main]
@@ -43,9 +43,6 @@ async fn main() -> Result<()> {
             "--suffix" => {
                 cli.suffix = Some(args.next().context("--suffix needs a value")?.clone());
             }
-            "--author" => {
-                cli.author = Some(args.next().context("--author needs a value")?.clone());
-            }
             // A flag rather than a value, so it consumes nothing: rotating is a thing you
             // do, not a thing you configure.
             "--new-token" => new_token = true,
@@ -75,9 +72,8 @@ async fn main() -> Result<()> {
     let config::Resolved {
         port,
         suffix,
-        author,
         aliases,
-    } = config::merge(cli, from_file, default_author())?;
+    } = config::merge(cli, from_file)?;
 
     match command.as_str() {
         // Prints what the extension's host list will show, so a host that does not
@@ -143,7 +139,6 @@ async fn main() -> Result<()> {
                 "  the extension sends it as {}",
                 ssh_browser::control::TOKEN_HEADER
             );
-            eprintln!("  annotations are written as {author}");
             eprintln!();
 
             // Said before the wait rather than after it, so a slow handshake looks like a
@@ -161,7 +156,7 @@ async fn main() -> Result<()> {
             let theme = theme::remembered()
                 .or_else(|| from_file_theme.clone())
                 .unwrap_or_else(|| theme::DEFAULT.to_string());
-            let bound = Origin::bind(aliases, suffix.clone(), port, token, author, theme).await?;
+            let bound = Origin::bind(aliases, suffix.clone(), port, token, theme).await?;
 
             // Everything from here is true by the time it is said. The routes come from
             // the bound origin rather than from the aliases, because an alias rooted at
@@ -191,23 +186,6 @@ async fn main() -> Result<()> {
         }
         other => bail!("unknown command {other:?}\n\n{USAGE}"),
     }
-}
-
-/// Who annotations are written as, unless `--author` says otherwise.
-///
-/// The local account name, which is a guess at the remote one. The SFTP transport never
-/// runs a shell, so the remote account is not something this process can ask for, and
-/// inferring it from a home directory path would be a guess presented as a fact. Naming it
-/// explicitly with `--author` is the honest alternative.
-///
-/// The guess does not go unchecked: what a log claims is compared against the owner a
-/// listing reports, and a mismatch is shown beside the note. See `annot::Attribution`. That
-/// comparison uses the owner's *name* out of the listing's `longname`, not the numeric uid,
-/// which cannot answer the question at all.
-fn default_author() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Parse `<alias>=<ssh-host>[:<absolute-base>]`.
