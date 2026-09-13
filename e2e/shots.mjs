@@ -74,8 +74,8 @@ try {
   const listing = await browser.newPage();
   await listing.setViewportSize(VIEW);
   await listing.goto(`http://${ALIAS}.${SUFFIX}/assets/`, { waitUntil: "networkidle" });
-  await listing.screenshot({ path: join(OUT, "5-listing.png") });
-  console.log("  shots/5-listing.png    a directory, at its own origin");
+  await listing.screenshot({ path: join(OUT, "4-listing.png") });
+  console.log("  shots/4-listing.png    a directory, at its own origin");
 } finally {
   await browser?.close();
   child.kill();
