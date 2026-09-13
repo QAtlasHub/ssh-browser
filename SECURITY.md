@@ -66,6 +66,27 @@ under your runtime or configuration directory with mode `0600` on Unix. Any proc
 running as you can read that file. That is the limit of what a loopback listener can
 promise, and no arrangement of headers changes it.
 
+## What the control API connects to
+
+`POST /_control/open` starts an ssh session, which is the only control route with an
+effect outside this process. **It will only open a host named in your ssh_config.**
+
+Not because the token is insufficient, but because the smaller primitive is the right one.
+"Open a host from the list you already have" and "ssh anywhere on request" differ by
+everything, and the list the extension offers is already the menu; a host that is not on it
+is a config change, which is a deliberate act rather than one request.
+
+The token matters most on this route for a reason specific to it. A page can send a
+cross-origin POST without a preflight if it keeps to the CORS-safelisted content types, and
+while it could not read the answer, the connection would still have been made. A custom
+header is not safelisted, so a request carrying one is preflighted, and the preflight is
+refused.
+
+An alias already open is not reopened under a second base. That would change what an origin
+means underneath any page already open in it, which is the one thing an origin must not do.
+The comparison resolves `~` first, so `~/work` and `/home/me/work` are recognised as the
+same place rather than refused as different ones.
+
 ## What the control API writes
 
 Exactly one shape of path:

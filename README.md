@@ -104,6 +104,10 @@ Without touching proxy settings at all, `http://127.0.0.1:7391/docs/` serves the
 same tree. That is useful for a quick look, but it puts every alias in one origin,
 so prefer the PAC.
 
+`ssh-browser serve` with no aliases at all is fine: the extension opens a host when you
+pick one, and `POST /_control/open` is what it calls. Only a host named in your ssh_config
+can be opened — the list is the menu, and anything else is a config change.
+
 `--port` and `--suffix` change the listener and the hostname suffix. `ssh-browser
 pac` prints the script without starting a server.
 

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use ssh_browser::config;
 use ssh_browser::control::{self, Token};
 use ssh_browser::origin::{Alias, Origin, pac};
@@ -114,10 +114,6 @@ async fn main() -> Result<()> {
             Ok(())
         }
         "serve" => {
-            ensure!(
-                !aliases.is_empty(),
-                "no aliases: give one as <alias>=<ssh-host>[:<base>], or put them in a config file\n\n{USAGE}"
-            );
             let (token, source) = Token::load_or_generate(new_token)?;
             // Printed as well as written, because a first run has nowhere else to look.
             // To stderr so that piping the daemon's output does not carry it along.
@@ -150,6 +146,7 @@ async fn main() -> Result<()> {
             // `bind` does both and either can fail: announcing only the ssh half put a
             // "connecting over ssh" line directly above an error about the port.
             match aliases.len() {
+                0 => eprintln!("taking 127.0.0.1:{port}..."),
                 1 => eprintln!("taking 127.0.0.1:{port} and connecting over ssh..."),
                 n => eprintln!("taking 127.0.0.1:{port} and connecting {n} hosts over ssh..."),
             }
@@ -163,6 +160,13 @@ async fn main() -> Result<()> {
             eprintln!("listening on 127.0.0.1:{port}");
             for route in bound.routes() {
                 eprintln!("{route}");
+            }
+            // Starting with none is the ordinary case now: the extension opens a host from
+            // your ssh_config when you pick one. Said outright, because a daemon that
+            // listed nothing used to mean a misconfiguration.
+            if bound.routes().is_empty() {
+                eprintln!("  no aliases open yet — pick a host in the extension, or see");
+                eprintln!("  `ssh-browser hosts` for what your ssh_config can reach");
             }
             eprintln!();
             // A PAC is not discoverable, so the banner says outright what to do with it

@@ -22,6 +22,14 @@ through a browser store and has not been submitted. No surface is stable.
   user, hostname, port and `ProxyJump` that `ssh -G` resolves for each. `Include` is
   followed; patterns like `Host *` are not hosts and are skipped; a name that cannot be a
   hostname label is reported rather than silently dropped.
+- `POST /_control/open` starts serving one of those hosts, so a host can be opened by
+  picking it rather than by configuring it first. Only a host named in ssh_config can be
+  opened: "ssh to an arbitrary host on request" is a larger primitive than this needs, and
+  the list is already the menu. Asking twice for the same base is an answer rather than an
+  error; asking for a different one is a 409, because reconnecting under it would change
+  what an origin means underneath any page open in it.
+- `serve` now starts with no aliases at all, which is the ordinary case once hosts are
+  opened on demand.
 - `GET /_control/hosts` answers the same list, plus whether this daemon is currently
   serving each one. Answering it connects to nothing.
 
