@@ -9,6 +9,22 @@ The two halves ship through different channels, and only one of them has shipped
 is on crates.io as [`ssh-browser`](https://crates.io/crates/ssh-browser); the extension goes
 through a browser store and has not been submitted. No surface is stable.
 
+## [Unreleased]
+
+### Added
+
+- A first run with no daemon now says what ssh-browser is, what to run to get one, and where
+  the source is, instead of one red line naming a command the reader has never heard of. It
+  is the only screen somebody sees before anything works — including whoever reviews the
+  extension for a store, who installs it with no daemon anywhere.
+  A daemon that has merely stopped still gets the terse message: a returning reader does not
+  need the explanation, and giving it to them every time would be noise.
+
+### Fixed
+
+- A failed connection left the previous daemon's sites in place, so going back reached a list
+  of things that were not being served — every one of them a link that would not answer.
+
 ## [0.2.0] - 2026-09-13
 
 ### Removed

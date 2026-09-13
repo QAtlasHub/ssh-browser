@@ -489,6 +489,36 @@ async function main() {
 
     await dashboard.click(".back").catch(() => {});
 
+    // The screen somebody sees before any of this works, which on a first run is the only
+    // screen there is — including for whoever reviews the extension for the store, who will
+    // install it with no daemon anywhere. It used to be one red line naming a command they
+    // had never heard of.
+    //
+    // Storage is cleared first so this is a genuine first run whatever else is on the
+    // machine: a stored suffix is what tells the two apart, and on a developer's box there
+    // is usually a daemon already answering on the default port. This goes last because it
+    // throws that state away.
+    const worker =
+      browser.serviceWorkers()[0] ??
+      (await browser.waitForEvent("serviceworker", { timeout: 20_000 }));
+    await worker.evaluate(() => chrome.storage.local.clear());
+    await dashboard.goto(dashboard.url().replace(/#.*$/, ""));
+    await dashboard.waitForSelector(".cmd", { timeout: 20_000 });
+    const firstRun = await dashboard.evaluate(() => ({
+      view: document.getElementById("view")?.textContent ?? "",
+      cmd: document.querySelector(".cmd")?.textContent ?? "",
+      repo: document.querySelector('a[href*="github.com"]')?.getAttribute("href") ?? "",
+      status: document.getElementById("status")?.textContent ?? "",
+    }));
+    check("with no daemon, the first run says what this is and what to run", () => {
+      assert.match(firstRun.view, /daemon is not running/);
+      assert.match(firstRun.cmd, /cargo install ssh-browser/);
+      assert.match(firstRun.cmd, /ssh-browser serve/);
+      assert.ok(firstRun.repo.includes("QAtlasHub/ssh-browser"), `no source link: ${firstRun.repo}`);
+    });
+    // Two versions of the same bad news, one of them in red, reads as two problems.
+    check("and does not also shout it in red", () => assert.equal(firstRun.status, ""));
+
   } catch (e) {
     failures += 1;
     console.error(`\nthe run itself failed: ${e.message}`);

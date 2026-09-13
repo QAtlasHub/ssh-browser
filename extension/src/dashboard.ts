@@ -179,6 +179,46 @@ function renderList(): void {
   view.append(settingsLink());
 }
 
+/// What is on screen when the daemon is not answering.
+///
+/// On a first run this is the only thing anybody sees — including whoever reviews the
+/// extension for the store, who will install it with no daemon anywhere. One red line
+/// naming a command they have never heard of is not enough to act on, and "does not
+/// function" is a fair reading of it.
+function renderOffline(firstRun: boolean): void {
+  const view = clear();
+  if (!firstRun) {
+    view.append(settingsLink());
+    return;
+  }
+
+  view.append(node("h2", "", "the daemon is not running"));
+  view.append(
+    node(
+      "p",
+      "",
+      "ssh-browser puts files from a host you reach over SSH onto a real browser origin, so " +
+        "a page there loads as a page rather than as a preview. This extension is the browser " +
+        "half; the daemon runs on your own machine and does the SSH.",
+    ),
+  );
+  view.append(node("pre", "cmd", "cargo install ssh-browser\nssh-browser serve"));
+  view.append(
+    node("p", "note", "Then reload this page. It talks to 127.0.0.1 and to nothing else."),
+  );
+
+  const repo = document.createElement("a");
+  repo.className = "back";
+  repo.href = "https://github.com/QAtlasHub/ssh-browser";
+  repo.target = "_blank";
+  repo.rel = "noreferrer";
+  repo.textContent = "github.com/QAtlasHub/ssh-browser";
+  const line = document.createElement("p");
+  line.append(repo);
+  view.append(line);
+  view.append(settingsLink());
+}
+
 /// The way into settings, and it has to exist on every screen.
 ///
 /// Including the one that says nothing is listening: the port lives in settings, so a
@@ -514,13 +554,26 @@ async function start(): Promise<void> {
 
   const reply = await send({ kind: "connect", port });
   if (!reply.ok || reply.suffix === undefined) {
-    say(reply.detail, true);
     el("daemon").textContent = "";
+    // Forgotten, not merely hidden. Without this the previous daemon's sites stay in
+    // `latest`, so going back reaches a list of things that are not being served — by a
+    // daemon that is not running — and every one of them is a link that will not answer.
+    latest = { ok: false, detail: "" };
     // Only when there is nothing else on screen. Calling this while the settings view is
     // open would wipe the port field out from under somebody typing in it.
-    if (location.hash.replace(/^#/, "") !== "/config") {
-      const view = clear();
-      view.append(settingsLink());
+    if (location.hash.replace(/^#/, "") === "/config") {
+      say(reply.detail, true);
+    } else {
+      // A suffix is only ever stored after a successful connect, so its absence is the
+      // difference between somebody who has never got this working and somebody whose
+      // daemon has stopped. The first needs telling what this is; the second does not, and
+      // explaining it to them every time would be noise.
+      const seen = (await chrome.storage.local.get("suffix")) as { suffix?: string };
+      const firstRun = seen.suffix === undefined || seen.suffix === "";
+      // On a first run the screen below says all of this, better. Two versions of the same
+      // bad news, one of them in red, reads as two problems.
+      say(firstRun ? "" : reply.detail, !firstRun);
+      renderOffline(firstRun);
     }
     return;
   }
