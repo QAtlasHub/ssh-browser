@@ -22,9 +22,15 @@ through a browser store and has not been submitted. No surface is stable.
   user, hostname, port and `ProxyJump` that `ssh -G` resolves for each. `Include` is
   followed; patterns like `Host *` are not hosts and are skipped; a name that cannot be a
   hostname label is reported rather than silently dropped.
-- The extension's popup is the host list. It shows what is open, then what your ssh_config
-  could reach, each with the user, hostname, port and `ProxyJump` that `ssh -G` resolved.
-  Clicking one opens it and goes there.
+- The extension opens a dashboard rather than a popup. It lists the sites being served,
+  each with its URL and the host and root it comes from, and under them the hosts your
+  ssh_config could reach with what `ssh -G` resolved for each. Clicking a host serves it;
+  clicking a site opens that site's own page, where its root can be changed and it can be
+  stopped. The framing is deployment because that is what the product is: a directory only
+  reachable over ssh, made to look like a site on a host without being deployed to one.
+- `POST /_control/close` stops serving an alias. It is also how a root gets changed: the
+  daemon refuses to reopen under a second base while the first is live, so closing first is
+  what makes that an act somebody chose rather than one that happened to them.
 - **Nothing to paste.** `GET /_control/token` hands the token over, and the whole control
   API now refuses any request a browser says came from a page. `Sec-Fetch-Site` is a
   forbidden header name, so page script can neither set it nor remove it; the values were

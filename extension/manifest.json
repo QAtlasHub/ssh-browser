@@ -23,7 +23,6 @@
     "128": "icons/icon-128.png"
   },
   "action": {
-    "default_popup": "panel.html",
     "default_title": "ssh-browser",
     "default_icon": {
       "16": "icons/icon-16.png",

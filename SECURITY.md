@@ -108,6 +108,10 @@ while it could not read the answer, the connection would still have been made. A
 header is not safelisted, so a request carrying one is preflighted, and the preflight is
 refused.
 
+`POST /_control/close` ends a session. Dropping the last reference is what closes the ssh
+connection, and a request in flight holds one, so the connection goes when the last reader is
+done with it rather than out from under them.
+
 An alias already open is not reopened under a second base. That would change what an origin
 means underneath any page already open in it, which is the one thing an origin must not do.
 The comparison resolves `~` first, so `~/work` and `/home/me/work` are recognised as the

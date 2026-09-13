@@ -15,7 +15,7 @@ process.chdir(dirname(fileURLToPath(import.meta.url)));
 mkdirSync("dist", { recursive: true });
 
 await build({
-  entryPoints: ["src/background.ts", "src/panel.ts", "src/content.ts"],
+  entryPoints: ["src/background.ts", "src/dashboard.ts", "src/content.ts"],
   bundle: true,
   format: "esm",
   // The manifest's minimum_chrome_version. Keeping the two in step means a syntax the
@@ -29,7 +29,7 @@ await build({
   logLevel: "info",
 });
 
-for (const file of ["manifest.json", "panel.html"]) {
+for (const file of ["manifest.json", "dashboard.html"]) {
   copyFileSync(file, `dist/${file}`);
 }
 

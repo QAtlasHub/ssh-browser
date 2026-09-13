@@ -71,8 +71,8 @@ export async function startDaemon(port) {
 
 /// A copy of the built extension with the alias hosts already granted.
 ///
-/// The shipped manifest asks for them through `optional_host_permissions`, and the popup
-/// requests them on the Connect click. That request raises a permission bubble, which is
+/// The shipped manifest asks for them through `optional_host_permissions`, and the dashboard
+/// requests them on the first click in it. That request raises a permission bubble, which is
 /// browser chrome and not something a script can click.
 ///
 /// Worth being plain about what this covers. Everything downstream of the grant is exercised
@@ -138,33 +138,34 @@ export function loadExtension(dir) {
 /// The id `background.ts` registers the annotation script under.
 const CONTENT_SCRIPT_ID = "alias-pages";
 
-/// Open the popup, point it at the daemon, and wait until the content script is registered.
+/// Open the dashboard, point it at the daemon, and wait until the content script is
+/// registered.
 ///
-/// No token is typed. The popup asks the daemon for one, which the daemon hands over to
+/// No token is typed. The dashboard asks the daemon for one, which the daemon hands over to
 /// anything that is not a page — so the first-run paste is gone, and so is the field the
-/// old version of this filled in.
+/// old popup version of this filled in.
 ///
-/// Waiting on the registration rather than on the popup's text, because the text is set
+/// Waiting on the registration rather than on the page's text, because the text is set
 /// before the registration happens. A wait that accepted the first status line won a race
 /// most of the time and lost it whenever anything else was slow — a flake that looks
 /// exactly like a broken content script.
 ///
 /// The registration is the thing the caller depends on, so it is the thing to wait for.
-export async function connectThroughPopup(browser, port) {
+export async function connectThroughDashboard(browser, port) {
   const worker =
     browser.serviceWorkers()[0] ??
     (await browser.waitForEvent("serviceworker", { timeout: 20_000 }));
   const extensionId = new URL(worker.url()).host;
 
-  const popup = await browser.newPage();
-  await popup.goto(`chrome-extension://${extensionId}/panel.html`);
-  // The port lives behind a disclosure, because the ordinary run never touches it. Opening
-  // it is what a reader would do, so it is what this does rather than reaching past it.
-  await popup.click("summary");
-  await popup.fill("#port", String(port));
-  // Dispatched rather than relied upon: the popup re-runs on `change`, and whether `fill`
-  // emits one is Playwright's business rather than something this should depend on.
-  await popup.dispatchEvent("#port", "change");
+  // Navigated to directly rather than by clicking the toolbar icon, which is browser chrome
+  // and not something a script can reach. What the click does is open this page, so this is
+  // the same arrival by the only route a test has.
+  const dashboard = await browser.newPage();
+  await dashboard.goto(`chrome-extension://${extensionId}/dashboard.html`);
+  await dashboard.fill("#port", String(port));
+  // Dispatched rather than relied upon: the dashboard re-runs on `change`, and whether
+  // `fill` emits one is Playwright's business rather than something this should depend on.
+  await dashboard.dispatchEvent("#port", "change");
 
   const deadline = Date.now() + 20_000;
   for (;;) {
@@ -175,11 +176,11 @@ export async function connectThroughPopup(browser, port) {
       break;
     }
     if (Date.now() > deadline) {
-      const said = await popup.textContent("#status");
-      throw new Error(`the content script was never registered; the popup said: ${said}`);
+      const said = await dashboard.textContent("#status");
+      throw new Error(`the content script was never registered; the dashboard said: ${said}`);
     }
     await new Promise((r) => setTimeout(r, 200));
   }
 
-  return { popup, extensionId };
+  return { dashboard, extensionId };
 }

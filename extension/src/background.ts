@@ -78,6 +78,7 @@ type Request =
   | { kind: "connect"; port: number }
   | { kind: "hosts" }
   | { kind: "open"; host: string; base?: string }
+  | { kind: "close"; alias: string }
   | { kind: "disconnect" }
   | { kind: "status" }
   | { kind: "register"; suffix: string }
@@ -430,6 +431,28 @@ async function openHost(host: string, base?: string): Promise<Reply> {
   };
 }
 
+/// Stop serving an alias.
+///
+/// The other half of `open`, and the way a root gets changed: close, then open again.
+/// Reopening under a second base while the first is live is refused by the daemon, because
+/// it would change what an origin means underneath any page open in it — so closing first
+/// is what makes it an act somebody chose.
+async function closeAlias(alias: string): Promise<Reply> {
+  const s = await stored();
+  if (!s) {
+    return { ok: false, detail: "not connected" };
+  }
+  const res = await callDaemon(s, "/_control/close", {
+    method: "POST",
+    body: JSON.stringify({ alias }),
+  });
+  if (!res.ok) {
+    return { ok: false, detail: await res.text() };
+  }
+  await chrome.storage.local.set({ aliases: s.aliases.filter((a) => a !== alias) });
+  return { ok: true, detail: `${alias} is no longer served` };
+}
+
 async function listAnnotations(url: string): Promise<Reply> {
   const resolved = await resolveDoc(url);
   if (!resolved.ok) {
@@ -507,6 +530,8 @@ async function dispatch(message: unknown): Promise<Reply> {
       return listHosts();
     case "open":
       return openHost(message.host, message.base);
+    case "close":
+      return closeAlias(message.alias);
     case "disconnect":
       return disconnect();
     case "status":
@@ -617,6 +642,48 @@ function installOmnibox(): void {
     })().catch(complain("omnibox navigation"));
   });
 }
+
+/// Where the dashboard is, and how not to end up with six of them.
+///
+/// The tab id is remembered rather than searched for. Finding it with
+/// `chrome.tabs.query({url})` would need the `tabs` permission, which is the right to read
+/// every tab's URL and title — far more than is needed to raise one page, and not something
+/// to ask a reader for in exchange for a convenience.
+///
+/// Session storage rather than a variable, because the service worker is evicted when idle
+/// and a variable would be gone by the next click.
+const DASHBOARD = "dashboard.html";
+
+async function showDashboard(): Promise<void> {
+  const url = chrome.runtime.getURL(DASHBOARD);
+  const { dashboardTab } = (await chrome.storage.session.get("dashboardTab")) as {
+    dashboardTab?: number;
+  };
+
+  if (typeof dashboardTab === "number") {
+    try {
+      // Raises the existing one, and also puts it back to the top level: clicking the
+      // icon is how you ask for the dashboard, not for whichever alias you left it on.
+      await chrome.tabs.update(dashboardTab, { active: true, url });
+      return;
+    } catch {
+      // Closed since. Falling through to open a new one is the whole point of catching.
+    }
+  }
+
+  const tab = await chrome.tabs.create({ url });
+  if (tab.id !== undefined) {
+    await chrome.storage.session.set({ dashboardTab: tab.id });
+  }
+}
+
+// Fires only because the manifest declares no `default_popup`. A popup is 340px of chrome
+// with no address bar, which is the wrong shape for a page you navigate within.
+chrome.action.onClicked.addListener(() => {
+  void showDashboard().catch((e: unknown) => {
+    console.error("ssh-browser: opening the dashboard failed", e);
+  });
+});
 
 installOmnibox();
 
