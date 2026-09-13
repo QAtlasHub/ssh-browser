@@ -11,6 +11,15 @@ through a browser store and has not been submitted. No surface is stable.
 
 ## [Unreleased]
 
+### Added
+
+- Names beginning with a dot are never served, at any depth, and do not appear in listings.
+  An alias base is one origin, so a page under it can read everything else under it — the base
+  is the blast radius, and on a home directory nearly everything worth stealing is behind a
+  dot. Refusing them is what makes pointing an alias at a home directory reasonable at all.
+  The prefetcher applies the same rule, so a page cannot get `.ssh` read by naming it in an
+  `<img src>`.
+
 ### Fixed
 
 - The control token is reused across daemon restarts instead of being regenerated every time.
