@@ -242,6 +242,16 @@ impl Origin {
         names.sort();
         names
     }
+
+    /// Remote round trips every open session has cost, added up.
+    async fn round_trips(&self) -> u64 {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .map(|s| s.fs.round_trips())
+            .sum()
+    }
 }
 
 struct Session {
@@ -778,7 +788,7 @@ impl Origin {
         match (method, control::route_of(path)) {
             (&Method::GET, "hello") => {
                 let aliases = self.alias_names().await;
-                control::hello(&aliases, &self.suffix)
+                control::hello(&aliases, &self.suffix, self.round_trips().await)
             }
             (&Method::GET, "hosts") => self.list_hosts().await,
             (&Method::POST, "open") => self.open_host(body).await,

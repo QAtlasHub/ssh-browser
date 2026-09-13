@@ -224,6 +224,14 @@ struct Hello<'a> {
     /// hardcoded it would break the moment somebody changed it. Additive, so a protocol-1
     /// client that does not read this field is unaffected and the range stays 1..=1.
     suffix: &'a str,
+    /// Remote round trips every open session has cost, added up.
+    ///
+    /// Here as well as in `hosts` because this is the cheap route. `hosts` runs `ssh -G` once
+    /// per configured host, which is the right cost for a list somebody is about to read and
+    /// the wrong cost for a number sampled twice around a page load: the measurement takes
+    /// long enough to expire the listings it is measuring. That mistake has been made twice
+    /// here already. A counter nobody can read without disturbing is not a counter.
+    trips: u64,
 }
 
 /// Check the two things that must hold before any control route runs, returning the
@@ -289,7 +297,7 @@ pub fn route_of(path: &str) -> &str {
     path.strip_prefix(PATH_PREFIX).unwrap_or("")
 }
 
-pub fn hello(aliases: &[String], suffix: &str) -> Response<Full<Bytes>> {
+pub fn hello(aliases: &[String], suffix: &str, trips: u64) -> Response<Full<Bytes>> {
     json(&Hello {
         daemon: env!("CARGO_PKG_VERSION"),
         protocol: Protocol {
@@ -298,6 +306,7 @@ pub fn hello(aliases: &[String], suffix: &str) -> Response<Full<Bytes>> {
         },
         aliases,
         suffix,
+        trips,
     })
 }
 
@@ -370,7 +379,7 @@ mod tests {
     /// even if it somehow manages to send the request.
     #[test]
     fn no_response_carries_cors_headers() {
-        let mut responses = vec![hello(&["docs".to_string()], "ssh-browser")];
+        let mut responses = vec![hello(&["docs".to_string()], "ssh-browser", 0)];
         responses.extend(gate(&Method::OPTIONS, None, None, &token()));
         responses.extend(gate(&Method::GET, None, None, &token()));
         responses.push(text(StatusCode::NOT_FOUND, "nope"));
@@ -396,12 +405,15 @@ mod tests {
             },
             aliases: &["docs".to_string()],
             suffix: "ssh-browser",
+            trips: 7,
         })
         .expect("serialises");
         assert!(body.contains("\"min\":1"));
         assert!(body.contains("\"max\":1"));
         assert!(body.contains("\"aliases\":[\"docs\"]"));
         assert!(body.contains("\"daemon\":\""));
+        // The cheap route carries it too, so a measurement does not have to pay for `hosts`.
+        assert!(body.contains("\"trips\":7"), "{body}");
     }
 
     /// A temporary file, named after the test so parallel runs cannot collide.

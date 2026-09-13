@@ -314,6 +314,55 @@ async function main() {
       assert.equal(local.headingColour, "rgb(0, 128, 64)"),
     );
 
+    console.log("\ninvariant 2, over a real transport");
+    // The unit test for this holds a fake remote and a three-byte fixture. This is the same
+    // claim against whatever host the run is pointed at, through the real SFTP transport.
+    //
+    // Not through the browser, deliberately. A browser revisit is a *different and stronger*
+    // claim — that a whole page costs nothing the second time — and it is not true: against a
+    // real host this fixture costs four round trips on a browser revisit, because a page
+    // fetches things no HTML scan can see and the freshness window is a wall clock a test has
+    // to race. A check asserting zero there asserts something nobody established. What
+    // invariant 2 actually says is about a request, and about a request it is exact.
+    //
+    // The count comes off `hello`, not `hosts`. `hosts` runs `ssh -G` once per configured
+    // host; sampled either side of a measurement it takes long enough to expire the very
+    // listings being measured. Not a hypothesis — the first version of this check used
+    // `hosts`, passed against a real host, and failed in CI for exactly that reason.
+    const remoteTrips = async () => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/_control/hello`, {
+        headers: { [TOKEN_HEADER]: token },
+      });
+      assert.ok(res.ok, `/_control/hello said ${res.status}`);
+      return (await res.json()).trips;
+    };
+
+    /// What one request cost the remote, and what came back.
+    const costOf = async (path, headers = {}) => {
+      const before = await remoteTrips();
+      const res = await alias(path, { headers });
+      return { spent: (await remoteTrips()) - before, status: res.status, headers: res.headers };
+    };
+
+    const cold = await costOf("/index.html");
+    const warm = await costOf("/index.html");
+    const sliced = await costOf("/index.html", { Range: "bytes=0-15" });
+    const validated = await costOf("/index.html", { "If-None-Match": cold.headers["etag"] });
+
+    check("the first read of a file costs the remote something", () =>
+      assert.ok(cold.spent > 0, `nothing was fetched at all (${cold.spent})`),
+    );
+    check("reading it again costs nothing", () => assert.equal(warm.spent, 0));
+    // Sliced out of the body already held rather than fetched.
+    check("and a range out of it costs nothing", () => {
+      assert.equal(sliced.status, 206);
+      assert.equal(sliced.spent, 0);
+    });
+    check("the browser's own validator is answered here, not there", () => {
+      assert.equal(validated.status, 304);
+      assert.equal(validated.spent, 0);
+    });
+
     console.log("\nwhat an http origin does not buy");
     // Measured rather than reasoned about, and pinned in both directions, because the README
     // used to imply this fixes everything `file://` breaks. It does not: an alias origin is

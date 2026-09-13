@@ -86,13 +86,14 @@ try {
   // remote is asked for are different numbers by design — the whole point is that the second
   // does not follow the first — so counting requests in this process would measure the thing
   // that is supposed to be large.
+  // Off `hello`, the cheap route: `hosts` runs `ssh -G` once per configured host, which takes
+  // long enough to expire the listings between two samples and so perturbs what it measures.
   const trips = async () => {
-    const res = await fetch(`http://127.0.0.1:${PORT}/_control/hosts`, {
+    const res = await fetch(`http://127.0.0.1:${PORT}/_control/hello`, {
       headers: { [TOKEN_HEADER]: token },
     });
-    if (!res.ok) throw new Error(`/_control/hosts said ${res.status}`);
-    const { open } = await res.json();
-    return open.reduce((n, o) => n + o.trips, 0);
+    if (!res.ok) throw new Error(`/_control/hello said ${res.status}`);
+    return (await res.json()).trips;
   };
   const tripsBefore = await trips();
 
