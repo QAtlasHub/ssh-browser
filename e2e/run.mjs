@@ -302,6 +302,54 @@ async function main() {
       assert.equal(local.headingColour, "rgb(0, 128, 64)"),
     );
 
+    console.log("\nthe tree");
+    const tree = await browser.newPage();
+    await tree.goto(`http://${ALIAS}.${SUFFIX}/assets/`, { waitUntil: "domcontentloaded" });
+
+    const opened = await tree.evaluate(() => ({
+      // The whole path is expanded, so the root's other entries are there beside it.
+      rows: [...document.querySelectorAll("a.row")].map((a) => a.getAttribute("href")),
+      here: document.querySelector("a.row.here")?.getAttribute("href") ?? null,
+    }));
+    check("a directory opens as a tree with its whole path expanded", () => {
+      assert.ok(opened.rows.includes("/assets/"), `no assets row: ${opened.rows}`);
+      assert.ok(opened.rows.includes("/index.html"), `the root is not shown: ${opened.rows}`);
+      assert.ok(opened.rows.includes("/assets/style.css"), `not expanded: ${opened.rows}`);
+    });
+    check("and the directory you asked for is the selected one", () =>
+      assert.equal(opened.here, "/assets/"),
+    );
+
+    // The load-bearing interaction: a folder that is not on the path has no children in the
+    // page, so opening it has to go and get them.
+    //
+    // The document is marked first, because every row is a real link and the tree works
+    // without any script at all — clicking one simply loads that directory's page, which
+    // ends up looking almost the same. Counting rows could not tell the two apart, and the
+    // first version of this check passed with the script deleted. What distinguishes them
+    // is that the enhanced one never navigates, so the mark survives.
+    const before = opened.rows.length;
+    await tree.evaluate(() => {
+      Object.assign(window, { sameDocument: true });
+    });
+    await tree.click(`a.row[href="/assets/nested/"]`);
+    await tree.waitForSelector(`a.row[href="/assets/nested/deep.txt"]`, { timeout: 15_000 });
+    const after = await tree.evaluate(() => ({
+      rows: document.querySelectorAll("a.row").length,
+      here: document.querySelector("a.row.here")?.getAttribute("href") ?? null,
+      path: location.pathname,
+      same: window.sameDocument === true,
+    }));
+    check("expanding a folder fetches its level and puts it in place", () => {
+      assert.ok(after.rows > before, `${before} rows before, ${after.rows} after`);
+      assert.equal(after.same, true, "the page navigated instead of expanding in place");
+    });
+    check("and the address bar follows, so a reload lands where you are", () => {
+      assert.equal(after.here, "/assets/nested/");
+      assert.equal(after.path, "/assets/nested/");
+    });
+    await tree.close();
+
     console.log("\nthe dashboard");
     const { dashboard } = await connectThroughDashboard(browser, PORT);
     // Waited for, not assumed. The dashboard connects, registers the content script, *then*
