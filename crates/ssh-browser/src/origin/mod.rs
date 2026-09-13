@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::sync::RwLock;
+
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use http_body_util::Full;
@@ -197,6 +199,22 @@ async fn resolve_base(base: Option<&str>, fs: &SftpFs) -> Result<String> {
     })
 }
 
+/// One alias's session, or nothing if no such alias is open.
+///
+/// The guard is dropped before returning, so nothing a caller does afterwards holds up
+/// another request.
+impl Origin {
+    async fn session(&self, alias: &str) -> Option<Arc<Session>> {
+        self.sessions.read().await.get(alias).cloned()
+    }
+
+    async fn alias_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.sessions.read().await.keys().cloned().collect();
+        names.sort();
+        names
+    }
+}
+
 struct Session {
     base: String,
     fs: SftpFs,
@@ -205,7 +223,17 @@ struct Session {
 pub struct Origin {
     suffix: String,
     port: u16,
-    sessions: HashMap<String, Session>,
+    /// The aliases being served right now.
+    ///
+    /// Behind a lock because the set changes while the daemon runs: a host is opened when
+    /// somebody picks it, not when the daemon starts. Starting six ssh sessions so that a
+    /// popup could list six hosts would make looking at the list cost more than using one.
+    ///
+    /// The values are `Arc`d so a request can take its session and let go of the lock.
+    /// Holding a read guard across the awaits a page costs would block every open for the
+    /// length of a remote read, and `Session` owns the ssh child — dropping one kills the
+    /// connection, so it cannot simply be cloned out.
+    sessions: RwLock<HashMap<String, Arc<Session>>>,
     cache: Cache,
     token: Token,
     /// Whose annotations this daemon writes.
@@ -307,7 +335,7 @@ impl Origin {
             // `insert` returning the displaced value is the check that cannot be skipped.
             ensure!(
                 sessions
-                    .insert(a.name.clone(), Session { base, fs })
+                    .insert(a.name.clone(), Arc::new(Session { base, fs }))
                     .is_none(),
                 "alias {:?} is defined twice",
                 a.name
@@ -318,7 +346,7 @@ impl Origin {
             origin: Arc::new(Self {
                 suffix,
                 port,
-                sessions,
+                sessions: RwLock::new(sessions),
                 cache: Cache::default(),
                 token,
                 author,
@@ -432,7 +460,10 @@ impl Origin {
 
         let rest = path.trim_start_matches('/');
         if rest.is_empty() {
-            return plain_ok("text/html; charset=utf-8", Bytes::from(self.alias_index()));
+            return plain_ok(
+                "text/html; charset=utf-8",
+                Bytes::from(self.alias_index().await),
+            );
         }
 
         let (alias, sub) = rest.split_once('/').unwrap_or((rest, ""));
@@ -457,9 +488,10 @@ impl Origin {
             );
         }
 
-        let Some(session) = self.sessions.get(alias) else {
+        let Some(session) = self.session(alias).await else {
             return fail(StatusCode::NOT_FOUND, format!("no alias named {alias:?}"));
         };
+        let session = session.as_ref();
         let resolved = match guard::resolve(&session.base, path) {
             Ok(p) => p,
             Err(e) => return fail(StatusCode::FORBIDDEN, format!("{e:#}")),
@@ -638,11 +670,11 @@ impl Origin {
     ) -> Response<Full<Bytes>> {
         match (method, control::route_of(path)) {
             (&Method::GET, "hello") => {
-                let mut aliases: Vec<String> = self.sessions.keys().cloned().collect();
-                aliases.sort();
+                let aliases = self.alias_names().await;
                 control::hello(&aliases, &self.suffix)
             }
             (&Method::GET, "hosts") => self.list_hosts().await,
+            (&Method::POST, "open") => self.open_host(body).await,
             (&Method::GET, "annotations") => self.list_annotations(query).await,
             (&Method::POST, "annotations") => self.add_annotation(body).await,
             (&Method::GET, route) => {
@@ -660,9 +692,9 @@ impl Origin {
     /// Runs the same guards the read path runs, and the symlink one matters more here: a
     /// write that reached through a symlinked directory could place a file outside the
     /// alias base entirely.
-    async fn resolve_doc(&self, doc: &str) -> Result<(&Session, String), (StatusCode, String)> {
+    async fn resolve_doc(&self, doc: &str) -> Result<(Arc<Session>, String), (StatusCode, String)> {
         let (alias, rest) = doc.split_once('/').unwrap_or((doc, ""));
-        let Some(session) = self.sessions.get(alias) else {
+        let Some(session) = self.session(alias).await else {
             return Err((StatusCode::NOT_FOUND, format!("no alias named {alias:?}")));
         };
         let resolved = match guard::resolve(&session.base, &format!("/{rest}")) {
@@ -671,7 +703,7 @@ impl Origin {
         };
 
         let chain = components(&session.base, &resolved);
-        self.warm_ancestor_listings(session, &chain).await;
+        self.warm_ancestor_listings(&session, &chain).await;
         if let Some(at) = self.first_symlink(&chain) {
             return Err((StatusCode::FORBIDDEN, format!("refusing symlink at {at}")));
         }
@@ -711,6 +743,7 @@ impl Origin {
             })
             .collect();
 
+        let open = self.alias_names().await;
         let mut hosts = Vec::with_capacity(found.hosts.len());
         for (h, task) in found.hosts.iter().zip(described) {
             // A host ssh cannot describe is still listed, with the reason attached.
@@ -725,13 +758,155 @@ impl Origin {
                 alias: h.alias.clone(),
                 host: h.host.clone(),
                 settings,
-                served: self.sessions.contains_key(&h.alias),
+                served: open.iter().any(|a| a == &h.alias),
                 unresolved,
             });
         }
         control::json(&KnownHosts {
             hosts,
             unusable: found.unusable,
+        })
+    }
+
+    /// `POST /_control/open` -- start serving one of the hosts ssh already knows.
+    ///
+    /// This is what replaces configuring an alias before you can look at anything. The
+    /// host is picked from the list, the daemon connects, and the URL comes back.
+    ///
+    /// **Only a host named in ssh_config can be opened.** Not because the token is
+    /// insufficient, but because "ssh to an arbitrary host on request" is a larger
+    /// primitive than this needs to be, and the list the extension offers is already the
+    /// menu. A host that is not on it is a config change, which is a deliberate act.
+    async fn open_host(&self, body: &[u8]) -> Response<Full<Bytes>> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Ask {
+            host: String,
+            /// Absolute, or `~`, or `~/path`. Absent means the home directory.
+            #[serde(default)]
+            base: Option<String>,
+        }
+
+        let ask: Ask = match serde_json::from_slice(body) {
+            Ok(ask) => ask,
+            Err(e) => {
+                return control::text(
+                    StatusCode::BAD_REQUEST,
+                    format!("open needs a JSON body naming a host: {e}"),
+                );
+            }
+        };
+
+        let found = match ssh_config::read() {
+            Ok(found) => found,
+            Err(e) => {
+                return control::text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("reading ssh_config: {e:#}"),
+                );
+            }
+        };
+        // Matched against ssh_config rather than trusted, and matched case-insensitively
+        // because that is how hostnames compare: the extension shows `panza` and the file
+        // says `Panza`.
+        let Some(known) = found
+            .hosts
+            .iter()
+            .find(|h| h.host.eq_ignore_ascii_case(&ask.host) || h.alias == ask.host)
+        else {
+            return control::text(
+                StatusCode::NOT_FOUND,
+                format!("{:?} is not a host in your ssh_config", ask.host),
+            );
+        };
+
+        let alias = match Alias::new(&known.alias, &known.host, ask.base.as_deref()) {
+            Ok(alias) => alias,
+            Err(e) => return control::text(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        };
+
+        // Already open is an answer, not an error: two tabs asking at once should both
+        // get the URL. A *different* base is refused, though. Reconnecting under one
+        // would change what an origin means underneath any page already open in it,
+        // which is the one thing an origin must not do.
+        if let Some(open) = self.session(&known.alias).await {
+            // Resolved against the session that is already there, rather than compared as
+            // written. `~/work` and `/home/souta/work` are the same base, and a check that
+            // could not tell would either refuse an identical request or -- worse -- accept
+            // a different one, handing back a URL rooted somewhere the caller did not ask
+            // for. The round trip is paid on a path that is not a page load.
+            let wanted = match resolve_base(alias.base(), &open.fs).await {
+                Ok(base) => base,
+                Err(e) => {
+                    return control::text(
+                        StatusCode::BAD_GATEWAY,
+                        format!("working out where to root {}: {e:#}", known.alias),
+                    );
+                }
+            };
+            if wanted != open.base {
+                return control::text(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "{} is already open at {}, and {} is not the same place; a second base would change what that origin means underneath any page open in it",
+                        known.alias, open.base, wanted
+                    ),
+                );
+            }
+            return self.opened(&known.alias, &known.host, &open.base);
+        }
+
+        let fs = match SftpFs::connect(&known.host).await {
+            Ok(fs) => fs,
+            Err(e) => {
+                // The reason is passed through rather than flattened to "could not
+                // connect". It is ssh's, and ssh's reasons are the ones with a fix in
+                // them: a jump host that is down, a key that is not loaded, a name that
+                // does not resolve.
+                return control::text(
+                    StatusCode::BAD_GATEWAY,
+                    format!("ssh to {}: {e:#}", known.host),
+                );
+            }
+        };
+        let base = match resolve_base(alias.base(), &fs).await {
+            Ok(base) => base,
+            Err(e) => {
+                return control::text(
+                    StatusCode::BAD_GATEWAY,
+                    format!("working out where to root {}: {e:#}", known.alias),
+                );
+            }
+        };
+
+        // Inserted under the write lock, and a session that lost the race is dropped
+        // rather than replacing the winner. Dropping it closes that ssh child, which is
+        // the right end for a connection nothing is using; replacing the winner would
+        // close one that requests are already going through.
+        let session = {
+            let mut sessions = self.sessions.write().await;
+            Arc::clone(
+                sessions
+                    .entry(known.alias.clone())
+                    .or_insert_with(|| Arc::new(Session { base, fs })),
+            )
+        };
+        self.opened(&known.alias, &known.host, &session.base)
+    }
+
+    fn opened(&self, alias: &str, host: &str, base: &str) -> Response<Full<Bytes>> {
+        #[derive(serde::Serialize)]
+        struct Opened<'a> {
+            alias: &'a str,
+            host: &'a str,
+            base: &'a str,
+            url: String,
+        }
+        control::json(&Opened {
+            alias,
+            host,
+            base,
+            url: format!("http://{alias}.{}/", self.suffix),
         })
     }
 
@@ -1057,9 +1232,8 @@ impl Origin {
         })
     }
 
-    fn alias_index(&self) -> String {
-        let mut names: Vec<&String> = self.sessions.keys().collect();
-        names.sort();
+    async fn alias_index(&self) -> String {
+        let names = self.alias_names().await;
         let mut s = String::from(
             "<!doctype html><html><head><meta charset=\"utf-8\"><title>ssh-browser</title></head><body><h1>ssh-browser</h1><ul>",
         );
@@ -1419,15 +1593,15 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert(
             "docs".to_string(),
-            Session {
+            Arc::new(Session {
                 base: "/srv".to_string(),
                 fs,
-            },
+            }),
         );
         Origin {
             suffix: "ssh-browser".to_string(),
             port: 7391,
-            sessions,
+            sessions: RwLock::new(sessions),
             cache: Cache::default(),
             token: Token::from_hex(TEST_TOKEN),
             author: "souta".to_string(),
@@ -1444,8 +1618,14 @@ mod tests {
         b.body(Empty::new()).expect("request builds")
     }
 
-    fn trips(origin: &Origin) -> u64 {
-        origin.sessions.values().map(|s| s.fs.round_trips()).sum()
+    async fn trips(origin: &Origin) -> u64 {
+        origin
+            .sessions
+            .read()
+            .await
+            .values()
+            .map(|s| s.fs.round_trips())
+            .sum()
     }
 
     fn one_page() -> FakeRemote {
@@ -1504,7 +1684,7 @@ mod tests {
         let res = origin.handle(get("/index.html", None)).await;
         assert_eq!(res.status(), StatusCode::OK);
 
-        let before = trips(&origin);
+        let before = trips(&origin).await;
         for i in 0..N {
             let path = format!("/assets/{i}.png");
             let res = origin.handle(get(&path, None)).await;
@@ -1517,7 +1697,7 @@ mod tests {
         }
 
         assert_eq!(
-            trips(&origin) - before,
+            trips(&origin).await - before,
             0,
             "reading the page's own references is what makes these free"
         );
@@ -1529,10 +1709,10 @@ mod tests {
     async fn serving_a_page_costs_the_same_however_many_subresources_it_has() {
         async fn cost(n: usize) -> u64 {
             let origin = origin_with(page_with_subresources(n)).await;
-            let before = trips(&origin);
+            let before = trips(&origin).await;
             let res = origin.handle(get("/index.html", None)).await;
             assert_eq!(res.status(), StatusCode::OK);
-            trips(&origin) - before
+            trips(&origin).await - before
         }
         assert_eq!(cost(4).await, cost(40).await);
     }
@@ -1556,10 +1736,10 @@ mod tests {
 
     async fn cost_of_serving(refs: &[&str], extra: Vec<(&'static str, Attrs)>) -> u64 {
         let origin = origin_with(page_referring_to(refs, extra)).await;
-        let before = trips(&origin);
+        let before = trips(&origin).await;
         let res = origin.handle(get("/index.html", None)).await;
         assert_eq!(res.status(), StatusCode::OK);
-        trips(&origin) - before
+        trips(&origin).await - before
     }
 
     /// A reference that climbs out of the alias base must not be read. The check is the
@@ -1675,12 +1855,12 @@ mod tests {
             origin.handle(get("/index.html", None)).await.status(),
             StatusCode::OK
         );
-        let before = trips(&origin);
+        let before = trips(&origin).await;
         let res = origin.handle(get("/assets/x.png", None)).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(&body_of(res).await[..], b"xxx");
         assert_eq!(
-            trips(&origin) - before,
+            trips(&origin).await - before,
             0,
             "a subdirectory one level down must still be warmed"
         );
@@ -1714,21 +1894,21 @@ mod tests {
             )
             .await;
 
-            let before = trips(&origin);
+            let before = trips(&origin).await;
             assert_eq!(
                 origin.handle(get("/index.html", None)).await.status(),
                 StatusCode::OK
             );
-            let spent = trips(&origin) - before;
+            let spent = trips(&origin).await - before;
 
             // And it really was warmed, so the comparison is between two prefetches rather
             // than between a prefetch and a skip.
-            let at = trips(&origin);
+            let at = trips(&origin).await;
             let res = origin.handle(get("/assets/big.bin", None)).await;
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(body_of(res).await.len(), bytes);
             assert_eq!(
-                trips(&origin) - at,
+                trips(&origin).await - at,
                 0,
                 "{bytes} bytes should have been held"
             );
@@ -1805,12 +1985,12 @@ mod tests {
                     .file("/srv/assets/film.mp4", b"xxx"),
             )
             .await;
-            let before = trips(&origin);
+            let before = trips(&origin).await;
             assert_eq!(
                 origin.handle(get("/index.html", None)).await.status(),
                 StatusCode::OK
             );
-            trips(&origin) - before
+            trips(&origin).await - before
         }
 
         // The listing is fetched either way; only the read differs. A film the cache would
@@ -2041,13 +2221,13 @@ mod tests {
 
         let first = origin.handle(get("/a.html", None)).await;
         assert_eq!(first.status(), StatusCode::OK);
-        let after_first = trips(&origin);
+        let after_first = trips(&origin).await;
         assert!(after_first > 0, "the first request has to fetch something");
 
         let second = origin.handle(get("/a.html", None)).await;
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(
-            trips(&origin),
+            trips(&origin).await,
             after_first,
             "a revisit must be answered entirely from cache"
         );
@@ -2067,12 +2247,12 @@ mod tests {
             .to_str()
             .expect("ascii")
             .to_string();
-        let after_first = trips(&origin);
+        let after_first = trips(&origin).await;
 
         let second = origin.handle(get("/a.html", Some(&tag))).await;
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(
-            trips(&origin),
+            trips(&origin).await,
             after_first,
             "a 304 must not touch the remote"
         );
@@ -2085,12 +2265,12 @@ mod tests {
 
         // Warm the listing.
         origin.handle(get("/a.html", None)).await;
-        let warm = trips(&origin);
+        let warm = trips(&origin).await;
 
         let missing = origin.handle(get("/nope.html", None)).await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            trips(&origin),
+            trips(&origin).await,
             warm,
             "a 404 for a listed-but-absent name must cost nothing"
         );
@@ -2194,7 +2374,7 @@ mod tests {
             StatusCode::OK
         );
 
-        let (d, sh) = (trips(&deep), trips(&shallow));
+        let (d, sh) = (trips(&deep).await, trips(&shallow).await);
         // The slack absorbs one flush of fire-and-forget CLOSE requests landing on
         // either side of the measurement. A walk that listed one ancestor at a time
         // would cost about three times as many at this depth, and worse deeper.
@@ -2235,7 +2415,7 @@ mod tests {
             origin.handle(get("/a.html", None)).await.status(),
             StatusCode::OK
         );
-        let warm = trips(&origin);
+        let warm = trips(&origin).await;
 
         let res = origin.handle(ranged("/a.html", "bytes=1-3")).await;
         assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
@@ -2247,7 +2427,7 @@ mod tests {
         );
         assert_eq!(&body_of(res).await[..], b"ell");
         assert_eq!(
-            trips(&origin),
+            trips(&origin).await,
             warm,
             "slicing a held body must cost no round trip"
         );
@@ -2262,11 +2442,11 @@ mod tests {
         assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(&body_of(res).await[..], b"he");
 
-        let warm = trips(&origin);
+        let warm = trips(&origin).await;
         let again = origin.handle(ranged("/a.html", "bytes=2-4")).await;
         assert_eq!(&body_of(again).await[..], b"llo");
         assert_eq!(
-            trips(&origin),
+            trips(&origin).await,
             warm,
             "a small file fetched for a range should be held whole"
         );
@@ -2335,11 +2515,11 @@ mod tests {
         assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(&body_of(res).await[..], &body[0..10]);
 
-        let after = trips(&origin);
+        let after = trips(&origin).await;
         let second = origin.handle(ranged("/big.bin", "bytes=10-19")).await;
         assert_eq!(&body_of(second).await[..], &body[10..20]);
         assert!(
-            trips(&origin) > after,
+            trips(&origin).await > after,
             "a file over the threshold must not be held"
         );
     }
@@ -2719,5 +2899,61 @@ mod tests {
             parsed.get("unusable").is_some_and(|u| u.is_array()),
             "{text}"
         );
+    }
+
+    /// The check that keeps `open` from being "ssh to anything on request". The list the
+    /// extension offers is the menu, and a host that is not on it is a config change,
+    /// which is a deliberate act rather than one request.
+    ///
+    /// The name is nonsense on purpose, so this asserts the same thing on a machine with
+    /// an ssh_config and on one without.
+    #[tokio::test]
+    async fn opening_a_host_ssh_does_not_know_is_refused() {
+        let origin = origin_with(one_page()).await;
+        let res = origin
+            .handle(control_post(
+                "/_control/open",
+                Some(TEST_TOKEN),
+                r#"{"host":"not-a-host-in-anyones-ssh-config.invalid"}"#,
+            ))
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A body that does not name a host, and one that names a field this does not have.
+    /// The second matters for the same reason the config file refuses unknown keys: a
+    /// quietly dropped `base_path` opens an alias at somewhere nobody chose.
+    #[tokio::test]
+    async fn an_open_request_that_is_not_one_is_refused() {
+        let origin = origin_with(one_page()).await;
+        for body in [
+            "",
+            "{}",
+            r#"{"base":"/srv"}"#,
+            r#"{"host":"docs","base_path":"/srv"}"#,
+        ] {
+            let res = origin
+                .handle(control_post("/_control/open", Some(TEST_TOKEN), body))
+                .await;
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "should have been refused: {body}"
+            );
+        }
+    }
+
+    /// `open` has a side effect, so it is the route where the token matters most: a page
+    /// can send a simple POST without a preflight, and could not read the answer but
+    /// would still have caused the thing to happen.
+    #[tokio::test]
+    async fn opening_a_host_needs_the_token() {
+        let origin = origin_with(one_page()).await;
+        for token in [None, Some("wrong")] {
+            let res = origin
+                .handle(control_post("/_control/open", token, r#"{"host":"docs"}"#))
+                .await;
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "token {token:?}");
+        }
     }
 }
