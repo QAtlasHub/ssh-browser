@@ -23,7 +23,6 @@ use crate::origin::Alias;
 pub struct Server {
     pub port: Option<u16>,
     pub suffix: Option<String>,
-    pub author: Option<String>,
     /// What directory listings look like. See `crate::theme`.
     ///
     /// The starting value only: a theme chosen later from the dashboard is remembered
@@ -120,7 +119,6 @@ pub const DEFAULT_SUFFIX: &str = "ssh-browser";
 pub struct Overrides {
     pub port: Option<u16>,
     pub suffix: Option<String>,
-    pub author: Option<String>,
     pub aliases: Vec<Alias>,
 }
 
@@ -129,7 +127,6 @@ pub struct Overrides {
 pub struct Resolved {
     pub port: u16,
     pub suffix: String,
-    pub author: String,
     pub aliases: Vec<Alias>,
 }
 
@@ -142,7 +139,7 @@ pub struct Resolved {
 /// The command line wins, because it is what was typed for this run. Aliases are the
 /// exception and are added rather than replacing: naming one host on the command line should
 /// not silently drop the six in the file.
-pub fn merge(cli: Overrides, file: Config, default_author: String) -> Result<Resolved> {
+pub fn merge(cli: Overrides, file: Config) -> Result<Resolved> {
     let mut aliases = file.aliases;
     aliases.extend(cli.aliases);
     ensure_distinct(&aliases)?;
@@ -153,7 +150,6 @@ pub fn merge(cli: Overrides, file: Config, default_author: String) -> Result<Res
             .suffix
             .or(file.server.suffix)
             .unwrap_or_else(|| DEFAULT_SUFFIX.to_string()),
-        author: cli.author.or(file.server.author).unwrap_or(default_author),
         aliases,
     })
 }
@@ -185,7 +181,6 @@ mod tests {
 [server]
 port = 7391
 suffix = "ssh-browser"
-author = "souta"
 
 [[alias]]
 name = "docs"
@@ -203,7 +198,6 @@ base = "/home/me/public_html"
         let c = parse(FULL).expect("parses");
         assert_eq!(c.server.port, Some(7391));
         assert_eq!(c.server.suffix.as_deref(), Some("ssh-browser"));
-        assert_eq!(c.server.author.as_deref(), Some("souta"));
         assert_eq!(c.aliases.len(), 2);
         assert_eq!(c.aliases[0].name(), "docs");
         assert_eq!(c.aliases[1].base(), Some("/home/me/public_html"));
@@ -302,7 +296,6 @@ base = "/home/me/public_html"
             Server {
                 port: Some(1111),
                 suffix: Some("from-file".to_string()),
-                author: Some("from-file".to_string()),
                 theme: None,
                 scheme: None,
             },
@@ -311,14 +304,12 @@ base = "/home/me/public_html"
         let cli = Overrides {
             port: Some(2222),
             suffix: Some("from-cli".to_string()),
-            author: Some("from-cli".to_string()),
             aliases: vec![],
         };
 
-        let r = merge(cli, file, "fallback".to_string()).expect("merges");
+        let r = merge(cli, file).expect("merges");
         assert_eq!(r.port, 2222);
         assert_eq!(r.suffix, "from-cli");
-        assert_eq!(r.author, "from-cli");
     }
 
     #[test]
@@ -327,28 +318,21 @@ base = "/home/me/public_html"
             Server {
                 port: Some(1111),
                 suffix: Some("from-file".to_string()),
-                author: None,
                 theme: None,
                 scheme: None,
             },
             vec![],
         );
 
-        let r = merge(Overrides::default(), file, "fallback".to_string()).expect("merges");
+        let r = merge(Overrides::default(), file).expect("merges");
         assert_eq!(r.port, 1111);
         assert_eq!(r.suffix, "from-file");
         // Neither said, so the default stands.
-        assert_eq!(r.author, "fallback");
     }
 
     #[test]
     fn what_neither_supplies_falls_back() {
-        let r = merge(
-            Overrides::default(),
-            file_with(Server::default(), vec![]),
-            "fallback".to_string(),
-        )
-        .expect("merges");
+        let r = merge(Overrides::default(), file_with(Server::default(), vec![])).expect("merges");
         assert_eq!(r.port, DEFAULT_PORT);
         assert_eq!(r.suffix, DEFAULT_SUFFIX);
     }
@@ -363,7 +347,6 @@ base = "/home/me/public_html"
                 ..Overrides::default()
             },
             file_with(Server::default(), vec![alias("file", "h")]),
-            "fallback".to_string(),
         )
         .expect("merges");
 
@@ -381,7 +364,6 @@ base = "/home/me/public_html"
                 ..Overrides::default()
             },
             file_with(Server::default(), vec![alias("docs", "from-file")]),
-            "fallback".to_string(),
         )
         .expect_err("refused");
         assert!(format!("{e:#}").contains("docs"), "{e:#}");

@@ -352,10 +352,9 @@ async function main() {
 
     console.log("\nthe dashboard");
     const { dashboard } = await connectThroughDashboard(browser, PORT);
-    // Waited for, not assumed. The dashboard connects, registers the content script, *then*
-    // asks what is being served, and `connectThroughDashboard` returns on the registration
-    // -- so reading the rows straight afterwards is a race that passes most of the time. It
-    // passed for me once before I noticed, which is the worst way for it to behave.
+    // Waited for, not assumed. `connectThroughDashboard` returns once the daemon line
+    // names the port; the sites are fetched after that, so reading the rows straight
+    // afterwards is a race that passes most of the time.
     const rowFor = `#view button[data-alias="${ALIAS}"]`;
     await dashboard.waitForSelector(rowFor);
 
@@ -490,44 +489,6 @@ async function main() {
 
     await dashboard.click(".back").catch(() => {});
 
-    // A filename that needs percent-escaping, which is where the two directions of the
-    // annotation API can disagree about which document they mean. They did: a note was written
-    // under one name and looked for under another, and the panel showed nothing at all.
-    const spaced = "spaced name.html";
-    const posted = await fetch(`http://127.0.0.1:${PORT}/_control/annotations`, {
-      method: "POST",
-      headers: { [TOKEN_HEADER]: token, "content-type": "application/json" },
-      body: JSON.stringify({
-        doc: `${ALIAS}/${encodeURIComponent(spaced)}`,
-        op: "add",
-        body: "written by the harness",
-        selectors: [{ type: "TextQuoteSelector", exact: "anchor me here" }],
-      }),
-    });
-    check("the control API accepts a note on an escaped filename", () =>
-      assert.equal(posted.status, 200),
-    );
-
-    const noted = await browser.newPage();
-    await noted.goto(`http://${ALIAS}.${SUFFIX}/${encodeURIComponent(spaced)}`, {
-      waitUntil: "networkidle",
-    });
-    // The panel is a closed shadow root, so its text is deliberately unreachable from the page
-    // — that is the point of it. What is observable is that the host element exists, and that a
-    // highlight got registered, which happens only once a note has been fetched *and* anchored.
-    await noted
-      .waitForFunction(() => CSS.highlights.size > 0, { timeout: 20_000 })
-      .catch(() => {});
-    const panel = await noted.evaluate(() => ({
-      host: document.getElementById("ssh-browser-panel-host") !== null,
-      highlights: CSS.highlights.size,
-      // Nothing may be added to the document the reader came for.
-      styleTags: document.querySelectorAll("style").length,
-    }));
-
-    check("the content script ran on the alias page", () => assert.equal(panel.host, true));
-    check("the note was fetched and anchored", () => assert.equal(panel.highlights, 1));
-    check("no <style> element was added to the document", () => assert.equal(panel.styleTags, 0));
   } catch (e) {
     failures += 1;
     console.error(`\nthe run itself failed: ${e.message}`);

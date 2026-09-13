@@ -22,19 +22,18 @@ on faith.
 
 ## Single purpose
 
-> Open files that live on a host reachable only over SSH as real web pages in the browser, and
-> annotate them.
+> Open files that live on a host reachable only over SSH as real web pages in the browser.
 
 The store wants one purpose and this is one. Everything the extension does — routing alias
-hostnames, holding the control token, drawing notes — exists to put remote files on a real
-origin and let a reader mark them up.
+hostnames, holding the control token, listing the hosts ssh already knows — exists to put
+remote files on a real origin.
 
 ## Short description
 
-The limit is 132 characters; this is 101.
+The limit is 132 characters; this is 96.
 
-> Read and annotate files on a host reachable only over SSH — rendered as real pages, not
-> previews.
+> Open files on a host reachable only over SSH as real web pages, rendered natively rather
+> than previewed.
 
 ## Detailed description
 
@@ -53,15 +52,12 @@ The limit is 132 characters; this is 101.
 > only thing that does: pages served from a remote host are treated as untrusted code, and ask
 > the extension to act on their behalf rather than being handed credentials.
 >
-> It also draws annotations. Notes are per-author append-only files kept beside the document on
-> your own host, so two people annotating one page write to different files and neither can
-> lose the other's work. Highlights use the CSS Custom Highlight API and the panel lives in a
-> closed shadow root, so the page you came to read is never modified.
+> A dashboard lists the hosts your `~/.ssh/config` already reaches, with the user, hostname,
+> port and ProxyJump that `ssh -G` resolves for each. Clicking one serves it; clicking a site
+> opens it.
 >
-> Four things are said rather than hidden, because each means a note is not saying what it
-> appears to: a note that could not be placed, a note whose quoted text has changed and which
-> was placed by position instead, a log whose filename claims an author the file's owner
-> contradicts, and a line the daemon could not parse.
+> Nothing is injected into a page: there is no content script, so what loads is the site,
+> unchanged. Nothing is written to your host either — the daemon has no write path at all.
 >
 > The daemon is separate and you run it yourself: `cargo install ssh-browser`. Source for both
 > halves is at https://github.com/QAtlasHub/ssh-browser.
@@ -84,28 +80,13 @@ The form asks for one per permission. Keep these in step with `../PRIVACY.md`.
 **`storage`**
 
 > Remembers the local daemon's port, its control token, the configured hostname suffix and the
-> alias names the daemon reported, so the user does not retype a 64-character token on every
-> page. Local to the profile, and never transmitted anywhere but 127.0.0.1.
-
-**`scripting`**
-
-> Registers the annotation content script at runtime for the user's configured suffix only.
-> At runtime rather than declared in the manifest precisely to avoid a static match pattern:
-> the suffix is the user's to choose, so anything declared in advance would have to cover
-> every site.
+> alias names the daemon reported, so the user does not retype a 64-character token every
+> time. Local to the profile, and never transmitted anywhere but 127.0.0.1.
 
 **`host_permissions: http://127.0.0.1/*`**
 
 > The extension's only network destination. This is the user's own daemon, which they started
 > themselves, listening on loopback.
-
-**`optional_host_permissions: http://*/*`**
-
-> Requested when the user clicks Connect, never at install. The suffix is not known until the
-> daemon reports it, so this is the narrowest pattern that can be *declared* in advance. What
-> is actually *requested* is `http://*.<the user's suffix>/*` — with the default configuration
-> that is `http://*.ssh-browser/*` — and that is what the browser's prompt names. Declining
-> leaves reading working and turns annotation off.
 
 **Remote code**
 

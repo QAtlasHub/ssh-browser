@@ -33,10 +33,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::annot;
 use crate::cache::{self, Cache};
 use crate::control::{self, Token};
 use crate::fs::sftp::SftpFs;
@@ -270,14 +268,6 @@ pub struct Origin {
     /// is one setting for every alias: an origin that looked different from its neighbour
     /// for no reason the reader chose would be a bug rather than a feature.
     theme: RwLock<String>,
-    /// Whose annotations this daemon writes.
-    ///
-    /// Configured rather than discovered. The SFTP transport never runs a shell, so the
-    /// remote account name is not something this process can ask for; guessing it from a
-    /// home directory path would be a guess presented as a fact. What it is checked
-    /// against is the owner a listing reports, which catches a configured name the remote
-    /// does not actually write as — see `annot::Attribution`.
-    author: String,
 }
 
 /// A listening socket and the origin that will answer on it.
@@ -316,7 +306,6 @@ impl Origin {
         suffix: String,
         port: u16,
         token: Token,
-        author: String,
         theme: String,
     ) -> Result<Bound> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -331,17 +320,9 @@ impl Origin {
             pac::is_suffix(&suffix),
             "suffix {suffix:?} must be lowercase letters, digits, hyphens and dots"
         );
-        // The author becomes a filename, and the only check on it used to live inside the
-        // write path. A typo therefore started a daemon that read pages perfectly well and
-        // then answered the reader's first note with a 500. It is configuration, so it is
+        // Refused here rather than at the first listing: it is configuration, so it is
         // refused where the rest of the configuration is.
-        // Refused here rather than at the first listing, for the same reason the author name
-        // is: it is configuration, so it is refused where the rest of the configuration is.
         theme::check(&theme)?;
-        ensure!(
-            annot::is_safe_name(&author),
-            "author {author:?} must be letters, digits, dots, dashes or underscores: it becomes a filename"
-        );
 
         let mut sessions = HashMap::new();
         let mut routes = Vec::new();
@@ -395,7 +376,6 @@ impl Origin {
                 cache: Cache::default(),
                 token,
                 theme: RwLock::new(theme),
-                author,
             }),
             listener,
         })
@@ -524,7 +504,7 @@ impl Origin {
             ) {
                 return refusal;
             }
-            return self.control(method, path, query, body).await;
+            return self.control(method, path, body).await;
         }
 
         if path == "/proxy.pac" {
@@ -751,13 +731,7 @@ impl Origin {
         }
     }
 
-    async fn control(
-        &self,
-        method: &Method,
-        path: &str,
-        query: Option<&str>,
-        body: &[u8],
-    ) -> Response<Full<Bytes>> {
+    async fn control(&self, method: &Method, path: &str, body: &[u8]) -> Response<Full<Bytes>> {
         match (method, control::route_of(path)) {
             (&Method::GET, "hello") => {
                 let aliases = self.alias_names().await;
@@ -768,8 +742,6 @@ impl Origin {
             (&Method::POST, "close") => self.close_alias(body).await,
             (&Method::GET, "theme") => self.show_theme().await,
             (&Method::POST, "theme") => self.set_theme(body).await,
-            (&Method::GET, "annotations") => self.list_annotations(query).await,
-            (&Method::POST, "annotations") => self.add_annotation(body).await,
             (&Method::GET, route) => {
                 control::text(StatusCode::NOT_FOUND, format!("no control route {route:?}"))
             }
@@ -778,32 +750,6 @@ impl Origin {
                 format!("{method} is not allowed on {route:?}"),
             ),
         }
-    }
-
-    /// Turn `<alias>/<path>` into a session and an absolute path.
-    ///
-    /// Runs the same guards the read path runs, and the symlink one matters more here: a
-    /// write that reached through a symlinked directory could place a file outside the
-    /// alias base entirely.
-    async fn resolve_doc(&self, doc: &str) -> Result<(Arc<Session>, String), (StatusCode, String)> {
-        let (alias, rest) = doc.split_once('/').unwrap_or((doc, ""));
-        let Some(session) = self.session(alias).await else {
-            return Err((StatusCode::NOT_FOUND, format!("no alias named {alias:?}")));
-        };
-        let resolved = match guard::resolve(&session.base, &format!("/{rest}")) {
-            Ok(p) => p,
-            Err(e) => return Err((StatusCode::FORBIDDEN, format!("{e:#}"))),
-        };
-
-        let chain = components(&session.base, &resolved);
-        // A failure here shows up as the symlink check below finding nothing to check,
-        // and then as the write failing with the remote's own reason. There is no better
-        // answer to give from here.
-        let held = self.held_listings(&session, &chain).await;
-        if let Some(at) = first_symlink(&held, &chain) {
-            return Err((StatusCode::FORBIDDEN, format!("refusing symlink at {at}")));
-        }
-        Ok((session, resolved))
     }
 
     /// `GET /_control/hosts`
@@ -1148,97 +1094,6 @@ impl Origin {
             current: &ask.name,
             remembered,
         })
-    }
-
-    /// `GET /_control/annotations?doc=<alias>/<path>`
-    async fn list_annotations(&self, query: Option<&str>) -> Response<Full<Bytes>> {
-        let Some(doc) = param(query, "doc") else {
-            return control::text(
-                StatusCode::BAD_REQUEST,
-                "annotations needs a doc parameter, e.g. ?doc=docs/index.html",
-            );
-        };
-        let (session, resolved) = match self.resolve_doc(doc).await {
-            Ok(v) => v,
-            Err((status, detail)) => return control::text(status, detail),
-        };
-
-        match annot::Store::new(&session.fs).load(&resolved).await {
-            Ok(loaded) => control::json(&AnnotationsBody {
-                doc: resolved,
-                annotations: loaded.annotations,
-                skipped: loaded.skipped,
-            }),
-            Err(e) => control::text(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        }
-    }
-
-    /// `POST /_control/annotations`
-    ///
-    /// The request carries no author. The author is this daemon's, so a caller cannot
-    /// write as somebody else however it words the request.
-    async fn add_annotation(&self, body: &[u8]) -> Response<Full<Bytes>> {
-        let request: AddBody = match serde_json::from_slice(body) {
-            Ok(r) => r,
-            Err(e) => {
-                return control::text(StatusCode::BAD_REQUEST, format!("malformed request: {e}"));
-            }
-        };
-
-        let (session, resolved) = match self.resolve_doc(&request.doc).await {
-            Ok(v) => v,
-            Err((status, detail)) => return control::text(status, detail),
-        };
-
-        // The id is minted here when adding, rather than accepted, so it cannot name an
-        // author other than the one doing the writing. For an update or a delete the
-        // caller has to name the record, and the store checks that the name belongs to
-        // this author before anything is written.
-        let id = match (request.op, request.id) {
-            (annot::Op::Add, None) => match annot::new_id(&self.author) {
-                Ok(id) => id,
-                Err(e) => {
-                    return control::text(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
-                }
-            },
-            (annot::Op::Add, Some(_)) => {
-                return control::text(
-                    StatusCode::BAD_REQUEST,
-                    "an id is minted by the daemon; do not send one when adding",
-                );
-            }
-            (_, Some(id)) => id,
-            (_, None) => {
-                return control::text(StatusCode::BAD_REQUEST, "an update or a delete needs an id");
-            }
-        };
-
-        // The timestamp is the daemon's too. A caller that could choose it could reorder
-        // someone's log, and position in the file is what actually decides anything.
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-
-        let record = annot::Record {
-            op: request.op,
-            id: id.clone(),
-            at,
-            body: request.body,
-            selectors: request.selectors,
-            reply_to: request.reply_to,
-        };
-
-        match annot::Store::new(&session.fs)
-            .append(&resolved, &self.author, &record)
-            .await
-        {
-            Ok(()) => control::json(&AddedBody {
-                id,
-                at,
-                author: &self.author,
-            }),
-            Err(e) => control::text(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        }
     }
 
     async fn autoindex_of(
@@ -1676,48 +1531,6 @@ impl Origin {
         s.push_str("</ul></body></html>");
         s
     }
-}
-
-#[derive(Serialize)]
-struct AnnotationsBody {
-    doc: String,
-    annotations: Vec<annot::Annotation>,
-    /// Lines that could not be parsed, reported rather than hidden.
-    skipped: usize,
-}
-
-#[derive(Serialize)]
-struct AddedBody<'a> {
-    id: String,
-    at: u64,
-    author: &'a str,
-}
-
-/// No author field, deliberately: see `add_annotation`.
-#[derive(Deserialize)]
-struct AddBody {
-    doc: String,
-    op: annot::Op,
-    /// Absent when adding — the daemon mints it. Required when updating or deleting.
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    body: Option<String>,
-    #[serde(default)]
-    selectors: Option<serde_json::Value>,
-    #[serde(default)]
-    reply_to: Option<String>,
-}
-
-/// One raw value out of a query string.
-///
-/// Deliberately not percent-decoded here: `guard::resolve` decodes the path it is handed,
-/// and decoding twice would turn a literal `%2e%2e` in a filename into a traversal.
-fn param<'q>(query: Option<&'q str>, want: &str) -> Option<&'q str> {
-    query?.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == want).then_some(value)
-    })
 }
 
 /// Every step from the alias base down to the file, as `(directory to list, name to
@@ -2311,11 +2124,6 @@ mod tests {
             .expect("request builds")
     }
 
-    async fn json_of(res: Response<Full<Bytes>>) -> serde_json::Value {
-        let bytes = body_of(res).await;
-        serde_json::from_slice(&bytes).expect("a control response is json")
-    }
-
     fn ranged(path: &str, range: &str) -> Request<Empty<Bytes>> {
         Request::builder()
             .uri(format!("http://docs.ssh-browser{path}"))
@@ -2349,7 +2157,6 @@ mod tests {
             cache,
             theme: RwLock::new(theme::DEFAULT.to_string()),
             token: Token::from_hex(TEST_TOKEN),
-            author: "souta".to_string(),
         }
     }
 
@@ -2772,7 +2579,6 @@ mod tests {
             "ssh-browser".to_string(),
             port,
             Token::from_hex(TEST_TOKEN),
-            "souta".to_string(),
             theme::DEFAULT.to_string(),
         )
         .await;
@@ -2902,7 +2708,6 @@ mod tests {
                 permissions: Some(if dir { 0o040755 } else { 0o100644 }),
                 ..Attrs::default()
             },
-            owner: None,
         }
     }
 
@@ -3569,190 +3374,6 @@ mod tests {
         let res = origin.handle(loopback("/docs/a.html", None)).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(&body_of(res).await[..], b"hello");
-    }
-
-    /// The round trip the extension will make: write one, read it back.
-    #[tokio::test]
-    async fn an_annotation_written_through_control_comes_back_out() {
-        let origin = origin_with(one_page()).await;
-
-        let added = origin
-            .handle(control_post(
-                "/_control/annotations",
-                Some(TEST_TOKEN),
-                r#"{"doc":"docs/a.html","op":"add","body":"a note"}"#,
-            ))
-            .await;
-        assert_eq!(added.status(), StatusCode::OK);
-        let added = json_of(added).await;
-        let id = added["id"].as_str().expect("an id was minted").to_string();
-        assert!(
-            id.starts_with("souta:"),
-            "the id must name the daemon's author, got {id}"
-        );
-        assert_eq!(added["author"], "souta");
-
-        let listed = origin
-            .handle(loopback(
-                "/_control/annotations?doc=docs/a.html",
-                Some(TEST_TOKEN),
-            ))
-            .await;
-        assert_eq!(listed.status(), StatusCode::OK);
-        let listed = json_of(listed).await;
-        assert_eq!(listed["skipped"], 0);
-        let annotations = listed["annotations"].as_array().expect("an array");
-        assert_eq!(annotations.len(), 1);
-        assert_eq!(annotations[0]["body"], "a note");
-        assert_eq!(annotations[0]["id"], id.as_str());
-        assert_eq!(annotations[0]["author"], "souta");
-        // This fixture's remote reports no owner, so the honest answer is that nobody
-        // checked. The field must be there saying so rather than absent, because an
-        // extension cannot tell an absent field from a daemon that verified and approved.
-        assert_eq!(annotations[0]["attribution"]["state"], "unchecked");
-    }
-
-    /// The wire shape the extension reads for a forged log: a tagged state and the name of
-    /// the account that actually owns the file.
-    #[tokio::test]
-    async fn a_mismatched_author_reaches_the_extension_as_json() {
-        let dir = "/srv/.ssh-browser/a.html/ann";
-        let log = b"{\"op\":\"add\",\"id\":\"alice:1\",\"at\":10,\"body\":\"is this alice?\"}\n";
-        let origin = origin_with(
-            one_page()
-                .dir(dir, vec![("alice.jsonl", file_attrs(log.len() as u64, 1))])
-                .owner(&format!("{dir}/alice.jsonl"), "bob")
-                .file(&format!("{dir}/alice.jsonl"), log),
-        )
-        .await;
-
-        let listed = origin
-            .handle(loopback(
-                "/_control/annotations?doc=docs/a.html",
-                Some(TEST_TOKEN),
-            ))
-            .await;
-        assert_eq!(listed.status(), StatusCode::OK);
-        let listed = json_of(listed).await;
-        let annotations = listed["annotations"].as_array().expect("an array");
-        assert_eq!(annotations.len(), 1, "the note is served, not censored");
-        assert_eq!(annotations[0]["author"], "alice");
-        assert_eq!(annotations[0]["attribution"]["state"], "mismatched");
-        assert_eq!(annotations[0]["attribution"]["owner"], "bob");
-    }
-
-    #[tokio::test]
-    async fn writing_an_annotation_without_the_token_is_refused() {
-        let origin = origin_with(one_page()).await;
-        let res = origin
-            .handle(control_post(
-                "/_control/annotations",
-                None,
-                r#"{"doc":"docs/a.html","op":"add","body":"a note"}"#,
-            ))
-            .await;
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// An id chosen by the caller could name a different author, which the store would
-    /// then refuse. Refusing the id outright removes the possibility instead of catching
-    /// it later.
-    #[tokio::test]
-    async fn an_add_may_not_carry_an_id() {
-        let origin = origin_with(one_page()).await;
-        let res = origin
-            .handle(control_post(
-                "/_control/annotations",
-                Some(TEST_TOKEN),
-                r#"{"doc":"docs/a.html","op":"add","id":"alice:1","body":"x"}"#,
-            ))
-            .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn an_update_without_an_id_is_refused() {
-        let origin = origin_with(one_page()).await;
-        let res = origin
-            .handle(control_post(
-                "/_control/annotations",
-                Some(TEST_TOKEN),
-                r#"{"doc":"docs/a.html","op":"update","body":"x"}"#,
-            ))
-            .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn listing_annotations_needs_a_doc() {
-        let origin = origin_with(one_page()).await;
-        let res = origin
-            .handle(loopback("/_control/annotations", Some(TEST_TOKEN)))
-            .await;
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn an_unknown_alias_is_a_404() {
-        let origin = origin_with(one_page()).await;
-        let res = origin
-            .handle(loopback(
-                "/_control/annotations?doc=nope/a.html",
-                Some(TEST_TOKEN),
-            ))
-            .await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// A traversal in the doc parameter must not place a log outside the alias base.
-    #[tokio::test]
-    async fn a_traversal_in_the_doc_parameter_is_refused() {
-        let origin = origin_with(one_page()).await;
-        let res = origin
-            .handle(control_post(
-                "/_control/annotations",
-                Some(TEST_TOKEN),
-                r#"{"doc":"docs/../../etc/passwd","op":"add","body":"x"}"#,
-            ))
-            .await;
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-    }
-
-    /// The same symlink rule the read path uses, and it matters more here: a write that
-    /// reached through a symlinked directory could place a file outside the base entirely.
-    #[tokio::test]
-    async fn writing_through_a_symlinked_directory_is_refused() {
-        let origin = origin_with(
-            FakeRemote::new()
-                .dir("/srv", vec![("link", symlink_attrs())])
-                .dir("/srv/link", vec![("inside.html", file_attrs(2, 1))])
-                .file("/srv/link/inside.html", b"hi"),
-        )
-        .await;
-
-        let res = origin
-            .handle(control_post(
-                "/_control/annotations",
-                Some(TEST_TOKEN),
-                r#"{"doc":"docs/link/inside.html","op":"add","body":"x"}"#,
-            ))
-            .await;
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-    }
-
-    /// A document nobody has annotated is an empty list, not an error.
-    #[tokio::test]
-    async fn an_unannotated_document_lists_empty() {
-        let origin = origin_with(one_page()).await;
-        let res = origin
-            .handle(loopback(
-                "/_control/annotations?doc=docs/a.html",
-                Some(TEST_TOKEN),
-            ))
-            .await;
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = json_of(res).await;
-        assert_eq!(body["annotations"].as_array().expect("array").len(), 0);
     }
 
     /// The form souta asked for: bring the home directory into the config rather than

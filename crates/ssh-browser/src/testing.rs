@@ -13,8 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::fs::Entry;
 use crate::fs::sftp::SftpFs;
 use crate::sftp::wire::{
-    Attrs, CLOSE, DATA, Dec, Enc, FXF_CREAT, HANDLE, INIT, MKDIR, NAME, OPEN, OPENDIR, READ,
-    READDIR, REALPATH, STATUS, VERSION, WRITE,
+    Attrs, CLOSE, DATA, Dec, Enc, HANDLE, INIT, NAME, OPEN, OPENDIR, READ, READDIR, REALPATH,
+    STATUS, VERSION,
 };
 use crate::sftp::{read_frame, write_frame};
 
@@ -53,12 +53,6 @@ pub fn symlink_attrs() -> Attrs {
 pub struct FakeRemote {
     dirs: HashMap<String, Vec<Entry>>,
     files: HashMap<String, Vec<u8>>,
-    /// The account this remote is reached as, when it reports owners at all.
-    ///
-    /// A file a WRITE creates is owned by this account. That is what makes a daemon
-    /// configured with an author name the remote does not actually write as visible in a
-    /// test, which is the one situation `SECURITY.md` could not previously claim to catch.
-    reached_as: Option<String>,
     /// Directories this remote refuses to open, and the status it refuses with.
     ///
     /// Without this the only refusal a test could produce was "no such file" — the one
@@ -103,34 +97,13 @@ impl FakeRemote {
                 .map(|(name, attrs)| Entry {
                     name: name.to_string(),
                     attrs,
-                    owner: None,
                 })
                 .collect(),
         );
         self
     }
 
-    /// The account this remote is reached as, so a WRITE creates a file owned by it.
-    pub fn reached_as(mut self, who: &str) -> Self {
-        self.reached_as = Some(who.to_string());
-        self
-    }
-
-    /// Declare who a listing reports as the owner of one already-declared path.
-    ///
-    /// Panics if the path has no listing entry yet. Doing nothing instead would let a test
     /// believe it had arranged a mismatch when it had arranged nothing at all.
-    pub fn owner(mut self, path: &str, who: &str) -> Self {
-        let (parent, name) = path.rsplit_once('/').expect("an owner needs a full path");
-        let entry = self
-            .dirs
-            .get_mut(parent)
-            .and_then(|entries| entries.iter_mut().find(|e| e.name == name))
-            .unwrap_or_else(|| panic!("no listing entry for {path}; declare it with dir() first"));
-        entry.owner = Some(who.to_string());
-        self
-    }
-
     /// Declare a file body. The listing entry is declared separately on purpose: a
     /// listing that promises a file the remote then refuses is a real situation, and
     /// the origin layer has to survive it.
@@ -164,7 +137,7 @@ fn path_of(handle: &[u8]) -> Option<String> {
     Some(path.to_string())
 }
 
-async fn serve<R, W>(mut remote: FakeRemote, mut r: R, mut w: W)
+async fn serve<R, W>(remote: FakeRemote, mut r: R, mut w: W)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -217,13 +190,9 @@ where
             }
             OPEN => {
                 let path = utf8(d.str().expect("open path"));
-                let flags = d.u32().expect("open flags");
-                // A create flag makes the file exist, as it does on a real server. Without
-                // this an append could never write a log that did not already exist.
-                let creating = flags & FXF_CREAT != 0;
-                if creating {
-                    remote.files.entry(path.clone()).or_default();
-                }
+                // Read and discarded: this daemon only ever opens for reading, so there is
+                // no create flag left to honour.
+                d.u32().expect("open flags");
                 if remote.files.contains_key(&path) {
                     serial += 1;
                     (
@@ -253,38 +222,6 @@ where
                     (DATA, Enc::new().u32(id).str(&body[offset..end]).done())
                 }
             }
-            WRITE => {
-                let handle = d.str().expect("write handle").to_vec();
-                let path = path_of(&handle).expect("write handle shape");
-                // The offset is read and ignored: the client opened in append mode, and a
-                // real server places the data at the end regardless of what it says.
-                d.u64().expect("write offset");
-                let data = d.str().expect("write data").to_vec();
-                remote
-                    .files
-                    .entry(path.clone())
-                    .or_default()
-                    .extend_from_slice(&data);
-
-                // Made visible to a listing too, because a listing is how the reader finds
-                // the file at all. A fake that wrote without listing would let a broken
-                // reader pass.
-                if let Some((parent, name)) = path.rsplit_once('/') {
-                    let size = remote.files.get(&path).map_or(0, Vec::len) as u64;
-                    let entries = remote.dirs.entry(parent.to_string()).or_default();
-                    match entries.iter_mut().find(|e| e.name == name) {
-                        Some(e) => e.attrs.size = Some(size),
-                        // A file this remote creates belongs to the account it is reached
-                        // as, whatever the writer decided to call the file.
-                        None => entries.push(Entry {
-                            name: name.to_string(),
-                            attrs: file_attrs(size, 1),
-                            owner: remote.reached_as.clone(),
-                        }),
-                    }
-                }
-                (STATUS, status(id, SSH_FX_OK, "ok"))
-            }
             REALPATH => {
                 d.str().expect("realpath path");
                 match &remote.home {
@@ -299,7 +236,6 @@ where
                             &[Entry {
                                 name: home.clone(),
                                 attrs: dir_attrs(),
-                                owner: remote.reached_as.clone(),
                             }],
                         ),
                     ),
@@ -308,11 +244,6 @@ where
                         status(id, 4, "this remote was not given a home directory"),
                     ),
                 }
-            }
-            MKDIR => {
-                let path = utf8(d.str().expect("mkdir path"));
-                remote.dirs.entry(path).or_default();
-                (STATUS, status(id, SSH_FX_OK, "ok"))
             }
             CLOSE => {
                 d.str().expect("close handle");
@@ -342,25 +273,20 @@ fn status(id: u32, code: u32, message: &str) -> Vec<u8> {
 /// SIZE | PERMISSIONS | ACMODTIME, in the order the fields are written below.
 const WRITTEN_ATTRS: u32 = 0x0000_0001 | 0x0000_0004 | 0x0000_0008;
 
-/// The `ls -l`-shaped longname a real server sends, so that the client's owner parse is
-/// exercised rather than bypassed.
+/// The `ls -l`-shaped longname a real server sends.
 ///
-/// An entry with no owner gets the bare filename instead. That is what a server reporting
-/// nothing useful looks like on the wire, and it is what the client has to decline to parse
-/// rather than read an owner out of.
+/// Nothing reads it any more — the client skips the field — but it is on the wire, so a
+/// decoder that stopped emitting it would be tested against a shape no server produces.
 ///
 /// The date is a fixed string. A real one would suggest the client reads it, and it does
 /// not: the column is ambiguous between a time and a year depending on the file's age.
 fn longname(e: &Entry) -> String {
-    match &e.owner {
-        Some(who) => format!(
-            "{} 1 {who} {who} {:>8} Jan  1 00:00 {}",
-            mode_column(&e.attrs),
-            e.attrs.size.unwrap_or(0),
-            e.name
-        ),
-        None => e.name.clone(),
-    }
+    format!(
+        "{} 1 nobody nobody {:>8} Jan  1 00:00 {}",
+        mode_column(&e.attrs),
+        e.attrs.size.unwrap_or(0),
+        e.name
+    )
 }
 
 fn mode_column(attrs: &Attrs) -> &'static str {

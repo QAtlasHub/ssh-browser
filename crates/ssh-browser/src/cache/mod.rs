@@ -31,7 +31,7 @@ struct Listing {
     /// `listing_entries` hands back an `Entry`, and an `Entry` with no owner asserts that
     /// the remote did not report one. Dropping it here would make the cache quietly say
     /// something false about the remote rather than something incomplete about itself.
-    entries: HashMap<String, (Attrs, Option<String>)>,
+    entries: HashMap<String, Attrs>,
     fetched: Instant,
 }
 
@@ -118,7 +118,7 @@ impl Cache {
         if listing.fetched.elapsed() >= self.ttl {
             return None;
         }
-        listing.entries.get(name).map(|(attrs, _)| *attrs)
+        listing.entries.get(name).copied()
     }
 
     /// A fresh listing as entries, for rendering a directory index.
@@ -135,10 +135,9 @@ impl Cache {
             listing
                 .entries
                 .iter()
-                .map(|(name, (attrs, owner))| Entry {
+                .map(|(name, attrs)| Entry {
                     name: name.clone(),
                     attrs: *attrs,
-                    owner: owner.clone(),
                 })
                 .collect(),
         )
@@ -147,7 +146,7 @@ impl Cache {
     pub fn put_listing(&self, dir: &str, entries: &[Entry]) {
         let map = entries
             .iter()
-            .map(|e| (e.name.clone(), (e.attrs, e.owner.clone())))
+            .map(|e| (e.name.clone(), e.attrs))
             .collect::<HashMap<_, _>>();
         self.listings
             .lock()
@@ -251,7 +250,6 @@ mod tests {
         Entry {
             name: name.to_string(),
             attrs: a,
-            owner: Some("souta".to_string()),
         }
     }
 

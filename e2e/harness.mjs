@@ -81,15 +81,11 @@ export async function startDaemon(port) {
   return { child, token, log: () => log };
 }
 
-/// A copy of the built extension with the alias hosts already granted.
+/// A copy of the built extension, in a directory of its own.
 ///
-/// The shipped manifest asks for them through `optional_host_permissions`, and the dashboard
-/// requests them on the first click in it. That request raises a permission bubble, which is
-/// browser chrome and not something a script can click.
-///
-/// Worth being plain about what this covers. Everything downstream of the grant is exercised
-/// for real: the worker, the token header, the content script, the annotation round trip. The
-/// act of *requesting* the permission is not, and stays a manual step.
+/// Copied rather than loaded in place so that a run cannot leave anything behind in the
+/// checkout. Nothing is patched into the manifest any more: the extension asks for
+/// `http://127.0.0.1/*` and nothing else, so there is no permission bubble to get past.
 export async function extensionWithPermissionGranted() {
   const dist = join(repo, "extension", "dist");
   let manifest;
@@ -103,9 +99,8 @@ export async function extensionWithPermissionGranted() {
 
   const dir = await mkdtemp(join(tmpdir(), "ssh-browser-ext-"));
   await cp(dist, dir, { recursive: true });
-  manifest.host_permissions = [...(manifest.host_permissions ?? []), `http://*.${SUFFIX}/*`];
-  delete manifest.optional_host_permissions;
-  await writeFile(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2));
+  // Read only to fail early and clearly when the build is missing; nothing is changed.
+  void manifest;
   return dir;
 }
 
@@ -147,22 +142,15 @@ export function loadExtension(dir) {
   return [`--disable-extensions-except=${dir}`, `--load-extension=${dir}`];
 }
 
-/// The id `background.ts` registers the annotation script under.
-const CONTENT_SCRIPT_ID = "alias-pages";
-
-/// Open the dashboard, point it at the daemon, and wait until the content script is
-/// registered.
+/// Open the dashboard, point it at the daemon, and wait until it has connected.
 ///
 /// No token is typed. The dashboard asks the daemon for one, which the daemon hands over to
-/// anything that is not a page — so the first-run paste is gone, and so is the field the
-/// old popup version of this filled in.
+/// anything that is not a page.
 ///
-/// Waiting on the registration rather than on the page's text, because the text is set
-/// before the registration happens. A wait that accepted the first status line won a race
-/// most of the time and lost it whenever anything else was slow — a flake that looks
-/// exactly like a broken content script.
-///
-/// The registration is the thing the caller depends on, so it is the thing to wait for.
+/// Waiting on the daemon line rather than on a fixed delay, and by *port*: on a machine
+/// already running a daemon on the default port the dashboard connects to that one on load,
+/// so "there is a daemon line" is true before the click and a wait for it returns
+/// immediately — with the wrong daemon's sites behind it.
 export async function connectThroughDashboard(browser, port) {
   const worker =
     browser.serviceWorkers()[0] ??
@@ -191,21 +179,6 @@ export async function connectThroughDashboard(browser, port) {
   // Connecting from settings leaves you in settings, which is right for a reader and wrong
   // for a test that wants the sites. Going back is the click they would make.
   await dashboard.click(".back");
-
-  const deadline = Date.now() + 20_000;
-  for (;;) {
-    const ids = await worker.evaluate(() =>
-      chrome.scripting.getRegisteredContentScripts().then((s) => s.map((x) => x.id)),
-    );
-    if (ids.includes(CONTENT_SCRIPT_ID)) {
-      break;
-    }
-    if (Date.now() > deadline) {
-      const said = await dashboard.textContent("#status");
-      throw new Error(`the content script was never registered; the dashboard said: ${said}`);
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
 
   return { dashboard, extensionId };
 }

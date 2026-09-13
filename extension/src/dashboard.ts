@@ -527,40 +527,10 @@ async function start(): Promise<void> {
   el("daemon").textContent = `${reply.detail} on 127.0.0.1:${port}`;
   say("");
 
-  // Registered only if the permission is already held. Asking for it needs a user gesture,
-  // which a page load is not, so the request is made on the first click instead — and kept
-  // out of here so that a refusal does not stop the sites appearing. Reading a site works
-  // without it.
-  const origins = [`http://*.${reply.suffix}/*`];
-  if (await chrome.permissions.contains({ origins })) {
-    await send({ kind: "register", suffix: reply.suffix });
-  }
-
   if (await refresh()) {
     route();
   }
 }
-
-// Asked on a click rather than on load, because a permission request needs a user gesture.
-el("view").addEventListener(
-  "click",
-  () => {
-    void (async () => {
-      const { suffix } = (await chrome.storage.local.get("suffix")) as { suffix?: string };
-      if (suffix === undefined || suffix === "") {
-        return;
-      }
-      const origins = [`http://*.${suffix}/*`];
-      if (await chrome.permissions.contains({ origins })) {
-        return;
-      }
-      if (await chrome.permissions.request({ origins })) {
-        await send({ kind: "register", suffix });
-      }
-    })();
-  },
-  { capture: true, once: true },
-);
 
 window.addEventListener("hashchange", route);
 
