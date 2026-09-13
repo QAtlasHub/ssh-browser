@@ -189,12 +189,22 @@ a **site** — otherwise a board at `out/ft_demo/index.html` never appears at al
 directory you are standing in has no HTML in it. An HTML file leads the files for the same
 reason.
 
-The palette is a **theme**, chosen in the dashboard's settings and applied by the daemon, so
-every site it serves looks the same in every browser pointed at it. Five to start — `auto`
-(follows the system), `light`, `dark`, `paper`, `slate` — and adding one is a palette rather
-than a second copy of the layout, because every rule is written against a theme's custom
-properties. `[server] theme` sets the starting one; a later choice is remembered beside the
-control token rather than written back into your config file.
+The palette is a **[base16] scheme**, chosen in the dashboard's settings and applied by the
+daemon, so every site it serves looks the same in every browser pointed at it. Seventeen are
+vendored, in light and dark pairs — Default, GitHub, Catppuccin, Gruvbox, Solarized, Rosé
+Pine, One, plus Nord, Tokyo Night and Dracula — and `auto` follows your system with base16's
+own reference pair.
+
+base16 rather than something invented here because it is the standard for exactly this: a
+spec, several hundred schemes behind it, and sixteen hex values per file. Adding one is
+dropping a `.yaml` into `crates/ssh-browser/themes/` and adding a line, since every rule in
+the listing is written against the properties built from those sixteen. What each slot
+becomes is written out in [themes/README.md](crates/ssh-browser/themes/README.md).
+
+`[server] theme` sets the starting one; a later choice is remembered beside the control token
+rather than written back into your config file.
+
+[base16]: https://github.com/tinted-theming/home/blob/main/styling.md
 
 Finding those costs one extra round trip per listing. It is spent on a directory view and
 never on a page load, and it is one batch however many subdirectories there are. The listings

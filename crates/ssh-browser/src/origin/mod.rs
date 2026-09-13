@@ -1086,14 +1086,16 @@ impl Origin {
     /// `GET /_control/theme` -- what listings look like, and what else they could.
     async fn show_theme(&self) -> Response<Full<Bytes>> {
         #[derive(serde::Serialize)]
-        struct Choice {
-            name: &'static str,
-            label: &'static str,
+        struct Choice<'a> {
+            name: &'a str,
+            label: &'a str,
+            /// `light`, `dark`, or `system`, so the dashboard can group them.
+            variant: &'a str,
         }
         #[derive(serde::Serialize)]
         struct Themes<'a> {
             current: &'a str,
-            themes: Vec<Choice>,
+            themes: Vec<Choice<'a>>,
         }
         // The list comes from the daemon rather than being written out again in the
         // dashboard. Two copies of it is how a theme gets added and stays invisible.
@@ -1102,8 +1104,9 @@ impl Origin {
             themes: theme::all()
                 .iter()
                 .map(|t| Choice {
-                    name: t.name,
-                    label: t.label,
+                    name: &t.name,
+                    label: &t.label,
+                    variant: t.variant,
                 })
                 .collect(),
         })
@@ -2085,6 +2088,7 @@ grid-template-columns:14px 14px 1fr auto auto;line-height:22px;padding-right:12p
 text-decoration:none;white-space:nowrap}\
 .row:hover{background:var(--hover)}\
 .row.here{background:var(--sel)}\
+.row.here .size,.row.here .when{color:var(--dim)}\
 .row:focus-visible{outline:1px solid var(--accent);outline-offset:-1px}\
 .tw{color:var(--dim);font-size:11px;line-height:22px;text-align:center;\
 transition:transform .1s linear}\

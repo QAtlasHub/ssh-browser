@@ -35,7 +35,7 @@ interface Reply {
   unusable?: { host: string; why: string }[];
   url?: string;
   current?: string;
-  themes?: { name: string; label: string }[];
+  themes?: { name: string; label: string; variant: string }[];
 }
 
 function el<T extends HTMLElement>(id: string): T {
@@ -258,12 +258,28 @@ async function renderConfig(): Promise<void> {
   const select = document.createElement("select");
   select.id = "theme";
   select.setAttribute("aria-label", "theme");
+  // Grouped by what they are, because seventeen names in one list is a list rather than a
+  // choice. The daemon says which is which; guessing from the name would be wrong for
+  // exactly the schemes whose names do not say.
+  const groups = new Map<string, HTMLElement>();
   for (const t of themes.themes ?? []) {
     const option = document.createElement("option");
     option.value = t.name;
     option.textContent = t.label;
     option.selected = t.name === themes.current;
-    select.append(option);
+
+    if (t.variant === "system") {
+      select.append(option);
+      continue;
+    }
+    let group = groups.get(t.variant);
+    if (!group) {
+      group = document.createElement("optgroup");
+      (group as HTMLOptGroupElement).label = t.variant;
+      groups.set(t.variant, group);
+      select.append(group);
+    }
+    group.append(option);
   }
   select.addEventListener("change", () => {
     void (async () => {
@@ -277,8 +293,9 @@ async function renderConfig(): Promise<void> {
     node(
       "p",
       "note",
-      "What a directory listing looks like. It is the daemon's setting, so it applies to " +
-        "every site it serves and to any browser pointed at them.",
+      "What a directory listing looks like. These are base16 schemes, so they are the " +
+        "same palettes an editor or a terminal would use. It is the daemon's setting, so " +
+        "it applies to every site it serves and to any browser pointed at them.",
     ),
   );
 

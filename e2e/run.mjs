@@ -463,9 +463,9 @@ async function main() {
     // would pass with the choice going nowhere.
     await dashboard.click("#to-config");
     await dashboard.waitForSelector("#theme");
-    await dashboard.selectOption("#theme", "slate");
+    await dashboard.selectOption("#theme", "gruvbox-dark-hard");
     await dashboard.waitForFunction(
-      () => (document.getElementById("status")?.textContent ?? "").includes("slate"),
+      () => (document.getElementById("status")?.textContent ?? "").includes("gruvbox"),
       null,
       { timeout: 10_000 },
     );
@@ -482,9 +482,10 @@ async function main() {
     );
     await themed.close();
     check("choosing a theme changes what a listing looks like", () =>
-      // slate's --bg. Read off the rendered page, so this fails if the variable is set and
-      // the layout does not use it just as surely as if the choice never arrived.
-      assert.equal(painted, "rgb(20, 24, 31)"),
+      // gruvbox-dark-hard's base00, which base16 defines as the background. Read off the
+      // rendered page, so this fails if the variable is set and the layout does not use it
+      // just as surely as if the choice never arrived.
+      assert.equal(painted, "rgb(29, 32, 33)"),
     );
 
     await dashboard.click(".back").catch(() => {});
