@@ -9,7 +9,7 @@ The two halves ship through different channels, and only one of them has shipped
 is on crates.io as [`ssh-browser`](https://crates.io/crates/ssh-browser); the extension goes
 through a browser store and has not been submitted. No surface is stable.
 
-## [Unreleased]
+## [0.1.0] - 2026-09-13
 
 ### Added
 

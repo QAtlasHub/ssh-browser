@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ssh-browser",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Read and annotate files on a host reachable only over SSH.",
   "minimum_chrome_version": "116",
   "permissions": [
