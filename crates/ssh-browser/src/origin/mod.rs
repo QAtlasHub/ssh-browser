@@ -16,7 +16,7 @@ pub mod mime;
 pub mod pac;
 pub mod range;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -572,7 +572,7 @@ impl Origin {
         // can change it.
         let chain = components(&session.base, &file);
         if chain.is_empty() {
-            return self.autoindex_of(session, path, &resolved).await;
+            return self.autoindex_of(session, alias, path, &resolved).await;
         }
         let last = chain.len() - 1;
 
@@ -607,7 +607,7 @@ impl Origin {
                 // Absent. For a directory request that only means there is no
                 // index.html, so fall through to a listing of the directory itself.
                 if i == last && wants_dir {
-                    return self.autoindex_of(session, path, &resolved).await;
+                    return self.autoindex_of(session, alias, path, &resolved).await;
                 }
                 return fail(StatusCode::NOT_FOUND, format!("not found: {path}"));
             };
@@ -627,7 +627,7 @@ impl Origin {
         if attrs.is_dir() {
             if wants_dir {
                 // `<dir>/index.html` is itself a directory. Fall back to a listing.
-                return self.autoindex_of(session, path, &resolved).await;
+                return self.autoindex_of(session, alias, path, &resolved).await;
             }
             // Without the trailing slash every relative link on the page below
             // would resolve one level too high.
@@ -1145,25 +1145,95 @@ impl Origin {
     async fn autoindex_of(
         &self,
         session: &Session,
+        alias: &str,
         path: &str,
         resolved: &str,
     ) -> Response<Full<Bytes>> {
-        if let Some(entries) = self.cache.listing_entries(resolved) {
-            return plain_ok(
-                "text/html; charset=utf-8",
-                Bytes::from(autoindex(path, &entries)),
-            );
+        // Taken from the resolved path rather than from the request, so the crumbs show a
+        // filename as it is spelled on disk rather than percent-escaped. `resolved` always
+        // begins with the base, because that is what resolving it against the base means.
+        let rel = resolved.strip_prefix(&session.base).unwrap_or("");
+        let entries = match self.cache.listing_entries(resolved) {
+            Some(entries) => entries,
+            None => match session.fs.list_dir(resolved).await {
+                Ok(entries) => {
+                    self.cache.put_listing(resolved, &entries);
+                    entries
+                }
+                Err(e) => return fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}")),
+            },
+        };
+        let sites = self.sites_among(session, resolved, &entries).await;
+        plain_ok(
+            "text/html; charset=utf-8",
+            Bytes::from(autoindex(alias, rel, &entries, &sites)),
+        )
+    }
+
+    /// Which of these subdirectories are themselves sites.
+    ///
+    /// A directory holding an `index.html` is served *as* that page, so it is a site rather
+    /// than a folder, and saying so is what souta actually asked for. Grouping the HTML in
+    /// one listing does not find a Pinax board, because a board is `out/ft_demo/index.html`
+    /// and the directory you are standing in has no HTML in it at all.
+    ///
+    /// One extra round trip, because every listing is issued together -- not one per
+    /// subdirectory. It is spent on a directory listing and never on a page load, so the
+    /// round-trip invariant for serving a page is untouched.
+    ///
+    /// It is also not purely a cost: the listings it fetches are the ones the next click
+    /// needs, so stepping into any of these subdirectories afterwards costs nothing.
+    async fn sites_among(
+        &self,
+        session: &Session,
+        dir: &str,
+        entries: &[Entry],
+    ) -> HashSet<String> {
+        /// Beyond this, the scan is buying less than it costs: a directory with hundreds of
+        /// subdirectories is not one somebody is scanning by eye for a report.
+        const MAX_SCAN: usize = 64;
+
+        let names: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.attrs.is_dir() && e.name != "." && e.name != ".." && !hidden(&e.name))
+            .map(|e| e.name.as_str())
+            .take(MAX_SCAN)
+            .collect();
+        if names.is_empty() {
+            return HashSet::new();
         }
-        match session.fs.list_dir(resolved).await {
-            Ok(entries) => {
-                self.cache.put_listing(resolved, &entries);
-                plain_ok(
-                    "text/html; charset=utf-8",
-                    Bytes::from(autoindex(path, &entries)),
-                )
+
+        let paths: Vec<String> = names.iter().map(|n| format!("{dir}/{n}")).collect();
+        // Already-known listings are not asked for again. Going back up a level is the
+        // ordinary case and would otherwise re-list every sibling.
+        let missing: Vec<String> = paths
+            .iter()
+            .filter(|p| self.cache.listing_entries(p).is_none())
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            for (path, got) in missing.iter().zip(session.fs.list_dirs(&missing).await) {
+                if let Ok(entries) = got {
+                    self.cache.put_listing(path, &entries);
+                }
+                // A subdirectory that cannot be listed is simply not a site. It is not an
+                // error for this page: the reader asked for the directory they are in, and
+                // a permission problem one level down is theirs to meet when they click.
             }
-            Err(e) => fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}")),
         }
+
+        names
+            .iter()
+            .zip(paths.iter())
+            .filter(|(_, path)| {
+                self.cache.listing_entries(path).is_some_and(|listing| {
+                    listing
+                        .iter()
+                        .any(|e| e.name == "index.html" && !e.attrs.is_dir())
+                })
+            })
+            .map(|(name, _)| (*name).to_string())
+            .collect()
     }
 
     /// Read what an HTML page is about to ask for, in one batch.
@@ -1623,32 +1693,259 @@ fn hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 
-fn autoindex(path: &str, entries: &[Entry]) -> String {
+/// Which of the three groups a listing puts an entry in, and the order they come in.
+///
+/// Pages first, which souta asked for outright. A directory of generated output exists
+/// *for* its HTML — a Pinax board sits in `out/` among the files that produced it — and
+/// one alphabetical list buries the one thing somebody came to open.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+enum Group {
+    Page,
+    Folder,
+    File,
+}
+
+impl Group {
+    fn heading(self) -> &'static str {
+        match self {
+            Group::Page => "pages",
+            Group::Folder => "folders",
+            Group::File => "files",
+        }
+    }
+}
+
+fn group_of(e: &Entry, sites: &HashSet<String>) -> Group {
+    if e.attrs.is_dir() {
+        // A directory holding an `index.html` is served *as* that page, so it belongs with
+        // the pages rather than with the folders. It is the only way a Pinax board turns up
+        // in a listing at all: the board is `out/ft_demo/index.html`, and `out/` contains no
+        // HTML of its own.
+        if sites.contains(&e.name) {
+            Group::Page
+        } else {
+            Group::Folder
+        }
+    } else if matches!(extension_of(&e.name).as_deref(), Some("html" | "htm")) {
+        Group::Page
+    } else {
+        Group::File
+    }
+}
+
+/// The lowercased extension, taken from the name.
+fn extension_of(name: &str) -> Option<String> {
+    let dot = name.rfind('.')?;
+    // A leading dot is a hidden name rather than an extension, and a trailing one is not an
+    // extension at all. Neither is served, but neither should be labelled as a type either.
+    if dot == 0 || dot + 1 == name.len() {
+        return None;
+    }
+    Some(name[dot + 1..].to_ascii_lowercase())
+}
+
+/// Bytes, the way a file manager shows them.
+///
+/// Binary multiples with the labels that actually mean them. Calling 1024 bytes `kB` is the
+/// lie everyone tells, and this is a tool for people who would notice.
+fn human_size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut v = n as f64 / 1024.0;
+    let mut unit = 0;
+    while v >= 1024.0 && unit + 1 < UNITS.len() {
+        v /= 1024.0;
+        unit += 1;
+    }
+    // One decimal below ten and none above, so a column of sizes stays a column:
+    // `9.4 MiB` and `312 MiB`, not `312.0 MiB`.
+    if v < 10.0 {
+        format!("{v:.1} {}", UNITS[unit])
+    } else {
+        format!("{v:.0} {}", UNITS[unit])
+    }
+}
+
+/// `2026-09-13 05:44`, in UTC.
+///
+/// UTC because it is the only thing that can be said truthfully. SFTP reports seconds since
+/// the epoch and says nothing about a zone; the remote's zone is not something this
+/// transport can ask for, and using *this* machine's would stamp a file with an offset
+/// belonging to a different computer. The column says so once, in the footer.
+fn utc_stamp(secs: u32) -> String {
+    let secs = i64::from(secs);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let rest = secs.rem_euclid(86_400);
+    let (hh, mm) = (rest / 3600, (rest % 3600) / 60);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+/// Howard Hinnant's `civil_from_days`: exact for every day this could be handed, and it
+/// needs no calendar crate. Adding a dependency to print a date in a directory listing
+/// would be a poor trade in a daemon that reads other people's filesystems.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1);
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// The listing's own stylesheet.
+///
+/// Inline, and this is the one page where that is right: it is the daemon's own, not the
+/// remote's. Nothing is ever added to a document the reader came for — that rule is what
+/// the annotation overlay's closed shadow root exists to keep.
+const LISTING_CSS: &str = "\
+:root{--fg:#1c1c1c;--dim:#6b6b6b;--line:#e6e6e6;--bg:#fff;--accent:#0a7d33;--hover:#fafafa}\
+@media(prefers-color-scheme:dark){:root{--fg:#e8e8e8;--dim:#9a9a9a;--line:#2c2c2c;\
+--bg:#181818;--accent:#5ec77f;--hover:#222}}\
+*{box-sizing:border-box}\
+body{background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,sans-serif;\
+margin:0 auto;max-width:860px;padding:28px 20px 64px}\
+a{color:inherit;text-decoration:none}\
+nav{font-size:13px;margin-bottom:8px;overflow-wrap:anywhere}\
+nav a{color:var(--dim)}\
+nav a:hover{color:var(--fg);text-decoration:underline}\
+nav a.here{color:var(--fg);font-weight:600}\
+nav i{color:var(--line);font-style:normal;padding:0 4px}\
+h2{align-items:baseline;border-bottom:1px solid var(--line);color:var(--dim);display:flex;\
+font-size:11px;font-weight:600;gap:8px;letter-spacing:.08em;margin:28px 0 2px;\
+padding-bottom:6px;text-transform:uppercase}\
+h2 b{color:var(--line);font-weight:400}\
+.row{align-items:baseline;border-bottom:1px solid var(--line);display:grid;gap:12px;\
+grid-template-columns:3.2rem 1fr auto auto;margin:0 -8px;padding:8px}\
+.row:hover{background:var(--hover)}\
+.kind{color:var(--dim);font-family:ui-monospace,SFMono-Regular,monospace;font-size:10px;\
+letter-spacing:.06em;overflow:hidden;text-align:right;text-transform:uppercase}\
+.page .kind{color:var(--accent)}\
+.name{overflow-wrap:anywhere}\
+.page .name{font-weight:600}\
+.size,.when{color:var(--dim);font-family:ui-monospace,SFMono-Regular,monospace;\
+font-size:12px;white-space:nowrap}\
+.empty,footer{color:var(--dim);font-size:12px;margin-top:28px}\
+@media(max-width:560px){.row{grid-template-columns:3.2rem 1fr auto}.when{display:none}}";
+
+/// A directory, as a page.
+///
+/// `rel` is the decoded path below the alias base, so the crumbs can show what the reader
+/// typed rather than its percent-escaped spelling, and the links can be escaped once here.
+fn autoindex(alias: &str, rel: &str, entries: &[Entry], sites: &HashSet<String>) -> String {
     let mut visible: Vec<&Entry> = entries
         .iter()
         // `.` and `..` are already gone by the time a path resolves; these are the real
         // dot-names. Listing what the next click would be refused is worse than silence.
         .filter(|e| e.name != "." && e.name != ".." && !hidden(&e.name))
         .collect();
-    visible.sort_by(|a, b| (!a.attrs.is_dir(), &a.name).cmp(&(!b.attrs.is_dir(), &b.name)));
+    visible.sort_by(|a, b| (group_of(a, sites), &a.name).cmp(&(group_of(b, sites), &b.name)));
 
-    let mut s = String::from("<!doctype html><html><head><meta charset=\"utf-8\"><title>");
-    s.push_str(&escape(path));
-    s.push_str("</title></head><body><h1>");
-    s.push_str(&escape(path));
-    s.push_str("</h1><ul><li><a href=\"../\">../</a></li>");
-    for e in visible {
-        let slash = if e.attrs.is_dir() { "/" } else { "" };
-        s.push_str("<li><a href=\"");
+    let segments: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    let title = if segments.is_empty() {
+        alias.to_string()
+    } else {
+        format!("{} \u{b7} {alias}", segments.join("/"))
+    };
+
+    let mut s = String::from("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    s.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
+    s.push_str(&escape(&title));
+    s.push_str("</title><style>");
+    s.push_str(LISTING_CSS);
+    s.push_str("</style></head><body><nav>");
+
+    // The crumbs replace the lone `../` this used to carry. Every level is one click rather
+    // than one click each, and the alias is the root of them, so where you are is legible
+    // without reading the address bar.
+    let mut href = String::from("/");
+    s.push_str(&crumb(&href, alias, segments.is_empty()));
+    for (i, segment) in segments.iter().enumerate() {
+        href.push_str(&url_escape(segment));
+        href.push('/');
+        s.push_str("<i>/</i>");
+        s.push_str(&crumb(&href, segment, i + 1 == segments.len()));
+    }
+    s.push_str("</nav>");
+
+    if visible.is_empty() {
+        s.push_str("<p class=\"empty\">This directory is empty.</p>");
+    }
+
+    let mut current: Option<Group> = None;
+    for e in &visible {
+        let group = group_of(e, sites);
+        if current != Some(group) {
+            let n = visible
+                .iter()
+                .filter(|o| group_of(o, sites) == group)
+                .count();
+            s.push_str("<h2>");
+            s.push_str(group.heading());
+            s.push_str("<b>");
+            s.push_str(&n.to_string());
+            s.push_str("</b></h2>");
+            current = Some(group);
+        }
+
+        let is_dir = e.attrs.is_dir();
+        let slash = if is_dir { "/" } else { "" };
+        s.push_str(if group == Group::Page {
+            "<a class=\"row page\" href=\""
+        } else {
+            "<a class=\"row\" href=\""
+        });
         s.push_str(&url_escape(&e.name));
         s.push_str(slash);
-        s.push_str("\">");
+        s.push_str("\"><span class=\"kind\">");
+        s.push_str(&escape(&match (is_dir, extension_of(&e.name)) {
+            // "site" rather than "dir": it is the difference between somewhere to look and
+            // something to read, and it is the whole reason the scan above is paid for.
+            (true, _) if sites.contains(&e.name) => "site".to_string(),
+            (true, _) => "dir".to_string(),
+            (false, Some(ext)) => ext,
+            (false, None) => String::new(),
+        }));
+        s.push_str("</span><span class=\"name\">");
         s.push_str(&escape(&e.name));
         s.push_str(slash);
-        s.push_str("</a></li>");
+        s.push_str("</span><span class=\"size\">");
+        // A directory's size is its own bookkeeping rather than its contents', so printing
+        // it would say something true about a number nobody wants.
+        if !is_dir {
+            s.push_str(&e.attrs.size.map(human_size).unwrap_or_default());
+        }
+        s.push_str("</span><span class=\"when\">");
+        s.push_str(&e.attrs.mtime.map(utc_stamp).unwrap_or_default());
+        s.push_str("</span></a>");
     }
-    s.push_str("</ul></body></html>");
+
+    if !visible.is_empty() {
+        s.push_str("<footer>");
+        s.push_str(&visible.len().to_string());
+        s.push_str(if visible.len() == 1 {
+            " entry"
+        } else {
+            " entries"
+        });
+        s.push_str(" \u{b7} times are UTC</footer>");
+    }
+    s.push_str("</body></html>");
     s
+}
+
+fn crumb(href: &str, text: &str, here: bool) -> String {
+    format!(
+        "<a{} href=\"{}\">{}</a>",
+        if here { " class=\"here\"" } else { "" },
+        escape(href),
+        escape(text)
+    )
 }
 
 /// Remote filenames are untrusted input that lands inside our own origin, so the
@@ -2312,34 +2609,126 @@ mod tests {
         }
     }
 
+    /// A listing with nothing marked as a site, which is every test that is not about the
+    /// scan. The scan needs a remote; these do not.
+    fn listing(alias: &str, rel: &str, entries: &[Entry]) -> String {
+        autoindex(alias, rel, entries, &HashSet::new())
+    }
+
     #[test]
     fn a_hostile_filename_cannot_inject_script_into_our_origin() {
-        let page = autoindex("/", &[entry("<script>alert(1)</script>", false)]);
+        let page = listing("docs", "", &[entry("<script>alert(1)</script>", false)]);
         assert!(!page.contains("<script>alert"));
         assert!(page.contains("&lt;script&gt;"));
     }
 
+    /// souta's ask, and the reason this order exists: a directory of generated output is
+    /// *for* its HTML, and one alphabetical list buries the board under everything that
+    /// produced it.
     #[test]
-    fn listings_put_directories_first_then_sort_by_name() {
-        let page = autoindex(
-            "/",
+    fn listings_put_pages_first_then_folders_then_files() {
+        let page = listing(
+            "docs",
+            "",
             &[
                 entry("b.txt", false),
                 entry("z-dir", true),
                 entry("a.txt", false),
+                entry("report.html", false),
             ],
         );
+        let html = page.find("report.html").expect("page listed");
         let dir = page.find("z-dir").expect("dir listed");
         let a = page.find("a.txt").expect("a listed");
         let b = page.find("b.txt").expect("b listed");
-        assert!(dir < a, "directories come first");
-        assert!(a < b, "files sort by name");
+        assert!(html < dir, "pages come before folders");
+        assert!(dir < a, "folders come before files");
+        assert!(a < b, "and each group sorts by name");
+    }
+
+    /// The grouping is by what the name *is*, so a file whose extension merely contains
+    /// `html` is a file. `.htm` is the one other spelling worth accepting.
+    #[test]
+    fn only_html_counts_as_a_page() {
+        let page = listing(
+            "docs",
+            "",
+            &[
+                entry("a.htm", false),
+                entry("b.html.bak", false),
+                entry("c.xhtml", false),
+            ],
+        );
+        let pages = page.find("pages").expect("a pages section");
+        let files = page.find("files").expect("a files section");
+        assert!(pages < page.find("a.htm").expect("htm listed"));
+        assert!(files < page.find("b.html.bak").expect("bak listed"));
+        assert!(files < page.find("c.xhtml").expect("xhtml listed"));
     }
 
     #[test]
     fn hrefs_are_url_escaped() {
-        let page = autoindex("/", &[entry("a b#c.html", false)]);
+        let page = listing("docs", "", &[entry("a b#c.html", false)]);
         assert!(page.contains("href=\"a%20b%23c.html\""));
+    }
+
+    /// Every level is one click, and the alias is the root of them. The old listing
+    /// carried a lone `../`, so climbing three levels took three page loads.
+    #[test]
+    fn the_crumbs_name_every_level_and_start_at_the_alias() {
+        let page = listing("panza", "/Vault/infra/Pinax.jl", &[]);
+        assert!(page.contains("href=\"/\">panza</a>"), "{page}");
+        assert!(page.contains("href=\"/Vault/\">Vault</a>"), "{page}");
+        assert!(page.contains("href=\"/Vault/infra/\">infra</a>"), "{page}");
+        assert!(
+            page.contains("class=\"here\" href=\"/Vault/infra/Pinax.jl/\">Pinax.jl</a>"),
+            "the last crumb is where you are: {page}"
+        );
+    }
+
+    /// A name needing escapes appears decoded in the crumb and escaped in its href. The
+    /// two used to be the same string, which is how one of them was always wrong.
+    #[test]
+    fn a_crumb_reads_as_the_name_and_links_as_the_escape() {
+        let page = listing("docs", "/a b/c", &[]);
+        assert!(page.contains("href=\"/a%20b/\">a b</a>"), "{page}");
+    }
+
+    #[test]
+    fn sizes_read_the_way_a_file_manager_shows_them() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(999), "999 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1536), "1.5 KiB");
+        // One decimal below ten and none above, so a column of them stays a column.
+        assert_eq!(human_size(10 * 1024 * 1024), "10 MiB");
+        assert_eq!(human_size(9_961_472), "9.5 MiB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    /// Checked against dates that are known independently of the algorithm, including the
+    /// epoch itself and a leap day, which is where a calendar implementation goes wrong.
+    #[test]
+    fn timestamps_are_the_utc_civil_date() {
+        assert_eq!(utc_stamp(0), "1970-01-01 00:00");
+        assert_eq!(utc_stamp(86_399), "1970-01-01 23:59");
+        assert_eq!(utc_stamp(86_400), "1970-01-02 00:00");
+        // 2000-02-29, a leap day in a century year that is a leap year.
+        assert_eq!(utc_stamp(951_782_400), "2000-02-29 00:00");
+        // 2100 is divisible by 4 and by 100 but not by 400, so it is *not* a leap year and
+        // the day after 2100-02-28 is 2100-03-01. Getting this wrong is the classic way a
+        // hand-rolled calendar fails, and the two constants below are one day apart.
+        assert_eq!(utc_stamp(4_107_456_000), "2100-02-28 00:00");
+        assert_eq!(utc_stamp(4_107_542_400), "2100-03-01 00:00");
+        assert_eq!(utc_stamp(1_757_745_840), "2025-09-13 06:44");
+    }
+
+    /// A listing of nothing says so. An empty page with a heading over it reads as a
+    /// failure rather than as an empty directory.
+    #[test]
+    fn an_empty_directory_says_it_is_empty() {
+        let page = listing("docs", "/nothing", &[]);
+        assert!(page.contains("This directory is empty"), "{page}");
     }
 
     #[test]
@@ -3206,6 +3595,86 @@ mod tests {
         assert_eq!(
             origin.handle(get("/a.html", None)).await.status(),
             StatusCode::OK
+        );
+    }
+
+    /// souta's actual problem, in miniature. `out/` contains no HTML of its own; the board
+    /// is `out/ft_demo/index.html`. Grouping the HTML in one listing would never surface
+    /// it, so a directory that *is* a page has to say so.
+    #[tokio::test]
+    async fn a_directory_holding_an_index_is_listed_as_a_site() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir("/srv", vec![("ft-demo", dir_attrs()), ("src", dir_attrs())])
+                .dir("/srv/ft-demo", vec![("index.html", file_attrs(5, 1))])
+                .dir("/srv/src", vec![("main.jl", file_attrs(5, 1))])
+                .file("/srv/ft-demo/index.html", b"board"),
+        )
+        .await;
+
+        let body = String::from_utf8(body_of(origin.handle(get("/", None)).await).await.to_vec())
+            .expect("utf-8");
+        assert!(body.contains("site"), "the site kind is shown: {body}");
+
+        let pages = body.find("pages").expect("a pages section");
+        let demo = body.find("ft-demo/").expect("the site listed");
+        let folders = body.find("folders").expect("a folders section");
+        let src = body.find("src/").expect("the folder listed");
+        assert!(pages < demo, "the site sits under pages");
+        assert!(demo < folders, "and above the folders");
+        assert!(folders < src, "which is where a plain directory goes");
+    }
+
+    /// The invariant, on the one page that pays for the scan. One listing for the directory
+    /// and one batch for all of its subdirectories, whether there are two or twenty -- not
+    /// one round trip each, which is what a loop would cost and what would make browsing a
+    /// deep tree unusable over a real link.
+    #[tokio::test]
+    async fn the_site_scan_costs_the_same_however_many_subdirectories() {
+        async fn trips_for(n: usize) -> u64 {
+            let names: Vec<String> = (0..n).map(|i| format!("d{i:02}")).collect();
+            let mut remote = FakeRemote::new().dir(
+                "/srv",
+                names.iter().map(|s| (s.as_str(), dir_attrs())).collect(),
+            );
+            for name in &names {
+                remote = remote.dir(&format!("/srv/{name}"), vec![("a.txt", file_attrs(1, 1))]);
+            }
+            let origin = origin_with(remote).await;
+            let before = trips(&origin).await;
+            assert_eq!(origin.handle(get("/", None)).await.status(), StatusCode::OK);
+            trips(&origin).await - before
+        }
+
+        let few = trips_for(2).await;
+        let many = trips_for(20).await;
+        assert_eq!(
+            few, many,
+            "{many} round trips for twenty subdirectories against {few} for two"
+        );
+    }
+
+    /// And stepping into one of them is free afterwards, because the scan already fetched
+    /// exactly the listing that click needs. The extra round trip is not purely a cost.
+    #[tokio::test]
+    async fn the_scan_leaves_the_next_click_paid_for() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir("/srv", vec![("sub", dir_attrs())])
+                .dir("/srv/sub", vec![("a.txt", file_attrs(1, 1))]),
+        )
+        .await;
+        assert_eq!(origin.handle(get("/", None)).await.status(), StatusCode::OK);
+
+        let before = trips(&origin).await;
+        assert_eq!(
+            origin.handle(get("/sub/", None)).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            trips(&origin).await,
+            before,
+            "the listing the scan fetched should still be the one that answers"
         );
     }
 }

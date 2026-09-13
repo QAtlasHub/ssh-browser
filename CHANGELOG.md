@@ -28,6 +28,18 @@ through a browser store and has not been submitted. No surface is stable.
   clicking a site opens that site's own page, where its root can be changed and it can be
   stopped. The framing is deployment because that is what the product is: a directory only
   reachable over ssh, made to look like a site on a host without being deployed to one.
+- Directory listings are laid out rather than bulleted: breadcrumbs for every level, a type
+  label, size and modification time per entry, and a dark mode. Sizes are binary multiples
+  with the labels that mean them (`KiB`), and times are UTC because the remote's zone is not
+  something this transport can ask for.
+- **HTML comes first in a listing**, in a `pages` section above the folders and files. A
+  directory holding an `index.html` is served *as* that page, so it is listed as a site and
+  sorted with the pages: without that, a generated board at `out/ft_demo/index.html` never
+  appears, because the directory you are standing in has no HTML in it at all.
+  Finding them costs one extra round trip per listing, spent on a directory view and never
+  on a page load, and bounded to one batch however many subdirectories there are. It is not
+  purely a cost either: the listings it fetches are the ones the next click needs, so
+  stepping into any of them afterwards is free.
 - `POST /_control/close` stops serving an alias. It is also how a root gets changed: the
   daemon refuses to reopen under a second base while the first is live, so closing first is
   what makes that an act somebody chose rather than one that happened to them.

@@ -170,6 +170,24 @@ a button to stop serving it.
 There is nothing to paste. The extension asks the daemon for its control token, and the
 daemon hands that to anything except a page — see [SECURITY.md](SECURITY.md).
 
+### What a directory looks like
+
+Breadcrumbs for every level, and three sections: **pages**, then folders, then files. Size
+and modification time on each entry; times are UTC, because SFTP reports seconds since the
+epoch and says nothing about a zone, and using this machine's would stamp a file with an
+offset belonging to a different computer.
+
+Pages come first because that is what a directory of generated output is *for*. A directory
+holding an `index.html` is served as that page, so it is listed as a **site** and sorted with
+the pages — otherwise a board at `out/ft_demo/index.html` never appears in a listing at all,
+since the directory you are standing in has no HTML in it.
+
+Finding those costs one extra round trip per listing. It is spent on a directory view and
+never on a page load, and it is one batch however many subdirectories there are. The listings
+it fetches are the ones the next click needs, so stepping into any of them is free
+afterwards: measured on a host 18 ms away, a cold listing of 17 subdirectories is 92 ms and a
+revisit is 1 ms.
+
 
 `extension/` builds with `npm ci && npm run build` and loads unpacked from
 `extension/dist`. Give it the port and the control token the daemon printed; it applies
