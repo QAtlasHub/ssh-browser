@@ -738,6 +738,7 @@ impl Origin {
             }
             (&Method::GET, "hosts") => self.list_hosts().await,
             (&Method::POST, "open") => self.open_host(body).await,
+            (&Method::POST, "close") => self.close_alias(body).await,
             (&Method::GET, "annotations") => self.list_annotations(query).await,
             (&Method::POST, "annotations") => self.add_annotation(body).await,
             (&Method::GET, route) => {
@@ -978,6 +979,60 @@ impl Origin {
             }))
         };
         self.opened(&known.alias, &known.host, &session.base)
+    }
+
+    /// `POST /_control/close` -- stop serving an alias.
+    ///
+    /// The other half of `open`, and what makes changing where an alias is rooted possible
+    /// at all: reopening under a second base is refused while the first is live, because
+    /// it would change what an origin means underneath any page open in it. Closing first
+    /// makes that an act somebody chose rather than something that happened to them.
+    ///
+    /// Also the only way to give back an ssh connection without stopping the daemon.
+    async fn close_alias(&self, body: &[u8]) -> Response<Full<Bytes>> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Ask {
+            alias: String,
+        }
+
+        let ask: Ask = match serde_json::from_slice(body) {
+            Ok(ask) => ask,
+            Err(e) => {
+                return control::text(
+                    StatusCode::BAD_REQUEST,
+                    format!("close needs a JSON body naming an alias: {e}"),
+                );
+            }
+        };
+
+        // Removed under the write lock, so two callers cannot both believe they closed it.
+        // Dropping the `Arc` is what ends the ssh session, and a request already in flight
+        // holds one — so the connection goes when the last reader is done with it rather
+        // than out from under them.
+        let gone = self.sessions.write().await.remove(&ask.alias);
+        match gone {
+            Some(session) => {
+                #[derive(serde::Serialize)]
+                struct Closed<'a> {
+                    alias: &'a str,
+                    host: &'a str,
+                    base: &'a str,
+                }
+                control::json(&Closed {
+                    alias: &ask.alias,
+                    host: &session.host,
+                    base: &session.base,
+                })
+            }
+            // Distinguished from success on purpose. "Closed something" and "there was
+            // nothing to close" look identical to a caller that is told neither, and the
+            // second usually means the alias was spelled wrong.
+            None => control::text(
+                StatusCode::NOT_FOUND,
+                format!("no alias named {:?} is open", ask.alias),
+            ),
+        }
     }
 
     fn opened(&self, alias: &str, host: &str, base: &str) -> Response<Full<Bytes>> {
@@ -3097,5 +3152,60 @@ mod tests {
             .body(Full::new(Bytes::new()))
             .expect("request builds");
         assert_eq!(origin.handle(req).await.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The other half of `open`, and the way a base gets changed: close, then reopen.
+    #[tokio::test]
+    async fn an_alias_can_be_closed_and_is_then_gone() {
+        let origin = origin_with(one_page()).await;
+        assert_eq!(
+            origin.handle(get("/a.html", None)).await.status(),
+            StatusCode::OK
+        );
+
+        let res = origin
+            .handle(control_post(
+                "/_control/close",
+                Some(TEST_TOKEN),
+                r#"{"alias":"docs"}"#,
+            ))
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // The origin stops answering, rather than answering with stale bytes out of the
+        // cache. An alias that is closed but still serving would be the worst of both.
+        assert_eq!(
+            origin.handle(get("/a.html", None)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Kept apart from success. Told neither, a caller cannot tell "closed it" from
+    /// "there was nothing there", and the second usually means a typo.
+    #[tokio::test]
+    async fn closing_an_alias_that_is_not_open_says_so() {
+        let origin = origin_with(one_page()).await;
+        let res = origin
+            .handle(control_post(
+                "/_control/close",
+                Some(TEST_TOKEN),
+                r#"{"alias":"nope"}"#,
+            ))
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn closing_an_alias_needs_the_token() {
+        let origin = origin_with(one_page()).await;
+        let res = origin
+            .handle(control_post("/_control/close", None, r#"{"alias":"docs"}"#))
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // And it must not have happened anyway.
+        assert_eq!(
+            origin.handle(get("/a.html", None)).await.status(),
+            StatusCode::OK
+        );
     }
 }

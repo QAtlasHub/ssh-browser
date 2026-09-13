@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ssh-browser</title>
+    <style>
+      :root {
+        --line: #e3e3e3;
+        --dim: #666;
+        --bad: #b00020;
+        --good: #0a7d33;
+      }
+      body {
+        font:
+          14px/1.6 system-ui,
+          sans-serif;
+        margin: 0 auto;
+        max-width: 720px;
+        padding: 32px 20px 64px;
+      }
+      h1 {
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        margin: 0 0 24px;
+      }
+      h2 {
+        border-bottom: 1px solid var(--line);
+        color: var(--dim);
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        margin: 32px 0 12px;
+        padding-bottom: 6px;
+        text-transform: uppercase;
+      }
+      #status {
+        margin-bottom: 16px;
+      }
+      #status:empty {
+        display: none;
+      }
+      #status.bad {
+        color: var(--bad);
+      }
+      ul {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+      li > button {
+        background: none;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        cursor: pointer;
+        display: block;
+        font: inherit;
+        margin-bottom: 8px;
+        padding: 12px 14px;
+        text-align: left;
+        width: 100%;
+      }
+      li > button:hover {
+        background: #fafafa;
+        border-color: #c9c9c9;
+      }
+      li > button:disabled {
+        cursor: progress;
+        opacity: 0.55;
+      }
+      .name {
+        font-size: 15px;
+        font-weight: 600;
+      }
+      /* The site's own name, which is a hostname label and is meant to read as one. The
+         section headings above it are upper-cased as labels; doing that to `yukawa-mercury`
+         would be shouting somebody's host name back at them. */
+      .site-name {
+        border: 0;
+        font-size: 20px;
+        letter-spacing: 0;
+        margin: 0 0 4px;
+        padding: 0;
+        text-transform: none;
+      }
+      .url {
+        color: var(--good);
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 13px;
+      }
+      .where {
+        color: var(--dim);
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 12px;
+      }
+      .bad-host {
+        color: var(--bad);
+        font-size: 12px;
+      }
+      .empty {
+        color: var(--dim);
+      }
+      .back {
+        color: var(--dim);
+        display: inline-block;
+        margin-bottom: 16px;
+        text-decoration: none;
+      }
+      .back:hover {
+        text-decoration: underline;
+      }
+      .site-url {
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 18px;
+        overflow-wrap: anywhere;
+      }
+      dl {
+        display: grid;
+        gap: 4px 16px;
+        grid-template-columns: max-content 1fr;
+        margin: 0;
+      }
+      dt {
+        color: var(--dim);
+        font-size: 12px;
+      }
+      dd {
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 13px;
+        margin: 0;
+        overflow-wrap: anywhere;
+      }
+      .act {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+      }
+      .act input {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        flex: 1 1 240px;
+        font: inherit;
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        padding: 7px 10px;
+      }
+      .act button,
+      .open-site {
+        background: none;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        cursor: pointer;
+        font: inherit;
+        padding: 7px 14px;
+        text-decoration: none;
+      }
+      .act button:hover,
+      .open-site:hover {
+        background: #fafafa;
+      }
+      .danger {
+        border-color: #e8c4c9 !important;
+        color: var(--bad);
+      }
+      .note {
+        color: var(--dim);
+        font-size: 12px;
+        margin: 8px 0 0;
+      }
+      footer {
+        border-top: 1px solid var(--line);
+        color: var(--dim);
+        font-size: 12px;
+        margin-top: 40px;
+        padding-top: 12px;
+      }
+      footer input {
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        font: inherit;
+        padding: 2px 6px;
+        width: 6em;
+      }
+      kbd {
+        background: #f2f2f2;
+        border: 1px solid var(--line);
+        border-radius: 3px;
+        font: inherit;
+        padding: 0 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ssh-browser</h1>
+    <div id="status"></div>
+    <div id="view"></div>
+    <footer>
+      <span id="daemon"></span>
+      <label> port <input id="port" type="number" min="1" max="65535" value="7391" /> </label>
+      &middot; in the address bar: <kbd>ssh</kbd> then Tab, then an alias and a path
+    </footer>
+    <script type="module" src="dashboard.js"></script>
+  </body>
+</html>

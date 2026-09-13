@@ -37,7 +37,8 @@ import {
   SUFFIX,
   TOKEN_HEADER,
   browserOptions,
-  connectThroughPopup,
+  connectThroughDashboard,
+  HOST,
   BASE,
   extensionWithPermissionGranted,
   loadExtension,
@@ -301,71 +302,114 @@ async function main() {
       assert.equal(local.headingColour, "rgb(0, 128, 64)"),
     );
 
-    console.log("\nthe extension");
-    const { popup } = await connectThroughPopup(browser, PORT);
-    const status = await popup.textContent("#status");
-    // Waited for, not assumed. The popup connects, registers the content script, *then*
-    // asks for the host list, and `connectThroughPopup` returns on the registration — so
-    // reading the rows straight afterwards is a race that passes most of the time. It
+    console.log("\nthe dashboard");
+    const { dashboard } = await connectThroughDashboard(browser, PORT);
+    // Waited for, not assumed. The dashboard connects, registers the content script, *then*
+    // asks what is being served, and `connectThroughDashboard` returns on the registration
+    // -- so reading the rows straight afterwards is a race that passes most of the time. It
     // passed for me once before I noticed, which is the worst way for it to behave.
-    await popup.waitForSelector("#hosts button");
-    const rows = await popup.$$eval("#hosts button", (bs) => bs.map((b) => b.textContent ?? ""));
+    const rowFor = `#view button[data-alias="${ALIAS}"]`;
+    await dashboard.waitForSelector(rowFor);
 
-    check("the popup connects and names the daemon", () =>
-      assert.match(status ?? "", /connected to ssh-browser/),
+    const daemonLine = await dashboard.textContent("#daemon");
+    check("it connects and names the daemon", () =>
+      assert.match(daemonLine ?? "", /connected to ssh-browser/),
     );
-    // The alias is served but is not named in any ssh_config — `e2e` is not a Host, it is
-    // a name given on the command line. Listing only ssh_config's hosts would leave it
-    // live and visible nowhere, which is the sort of invisible state this is meant not to
-    // have. So the check is that what is *open* appears, not that a host does.
-    check("it lists what is actually being served", () => {
-      const mine = rows.filter((t) => t.includes(ALIAS));
-      assert.equal(mine.length, 1, `expected one row for ${ALIAS}, got: ${rows.join(" | ")}`);
-      assert.match(mine[0], /open/);
-      // Against the *resolved* base, not the configured one: `~/x` is served at
-      // `/home/you/x`, and the row should name where the alias actually points rather
-      // than repeating what was typed. Dropping the tilde makes the tail comparable
-      // whichever form was given.
-      const tail = BASE.startsWith("~") ? BASE.slice(1) : BASE;
-      assert.ok(mine[0].endsWith(tail), `the row should name the base ${tail}: ${mine[0]}`);
+
+    // The alias is served but is named in no ssh_config -- `e2e` is not a Host, it is a
+    // name given on the command line. Listing only ssh_config's hosts would leave it live
+    // and visible nowhere, which is the sort of invisible state this is meant not to have.
+    // So the check is that what is *being served* appears, not that a host does.
+    const row = (await dashboard.textContent(rowFor)) ?? "";
+    // Against the *resolved* root, not the configured one: `~/x` is served at `/home/you/x`,
+    // and the row should name where the site actually is rather than repeating what was
+    // typed. Dropping the tilde makes the tail comparable whichever form was given.
+    const tail = BASE.startsWith("~") ? BASE.slice(1) : BASE;
+    check("the site is listed with its URL and where it is served from", () => {
+      assert.ok(
+        row.includes(`http://${ALIAS}.${SUFFIX}/`),
+        `the row should carry the site URL: ${row}`,
+      );
+      assert.ok(row.endsWith(tail), `the row should name the root ${tail}: ${row}`);
     });
 
-    // Nothing to paste is the point: the popup asked the daemon for the token, and the
+    // Nothing to paste is the point: the dashboard asked the daemon for the token, and the
     // daemon hands it to anything that is not a page. A field for it would mean the old
     // flow had merely been hidden.
-    const tokenField = await popup.$("#token");
-    check("the popup has no token field to fill in", () => assert.equal(tokenField, null));
+    const tokenField = await dashboard.$("#token");
+    check("there is no token field to fill in", () => assert.equal(tokenField, null));
 
-    // Clicking a host that is not open yet makes the daemon ssh to it, which is a real
-    // side effect on somebody's real machine. So it is opt-in by name rather than picking
-    // whatever happened to be first in the config, and says so when it is not run — a
-    // check that quietly does nothing is worse than one that is absent.
+    // souta's flow: dashboard -> the alias -> the thing you do with it.
+    await dashboard.click(rowFor);
+    await dashboard.waitForSelector("#open-site");
+    const facts = (await dashboard.textContent("#view")) ?? "";
+    const rootValue = await dashboard.inputValue("#root");
+    const aliasHash = new URL(dashboard.url()).hash;
+    check("clicking a site opens its own page", () => {
+      assert.equal(aliasHash, `#${ALIAS}`);
+      assert.ok(facts.includes(HOST), `the page should name the ssh host: ${facts}`);
+      // The root box is pre-filled with where it is actually rooted, so changing it is an
+      // edit rather than a retype. An empty box would invite `~` being typed over a root
+      // that was not the home directory.
+      assert.ok(rootValue.endsWith(tail), `the root box should hold ${tail}: ${rootValue}`);
+    });
+
+    const siteTab = browser.waitForEvent("page", { timeout: 30_000 });
+    await dashboard.click("#open-site");
+    const site = await siteTab;
+    await site.waitForLoadState("domcontentloaded");
+    const siteHost = new URL(site.url()).host;
+    // What the root serves is the site's own `index.html` when there is one, and a listing
+    // when there is not -- which is what a host does, and is the whole claim. The listing
+    // case is checked in "serving" above; this is the other one.
+    const landed = await site.evaluate(() => ({
+      heading: document.querySelector("h1")?.textContent ?? "",
+      title: document.title,
+    }));
+    check("and the site opens on the alias origin", () =>
+      assert.equal(siteHost, `${ALIAS}.${SUFFIX}`),
+    );
+    check("serving the remote's own index page at the root", () => {
+      assert.equal(landed.heading, "served over ssh");
+      assert.equal(landed.title, "ssh-browser e2e");
+    });
+    await site.close();
+
+    // Clicking a host that is not being served yet makes the daemon ssh to it, which is a
+    // real side effect on somebody's real machine. So it is opt-in by name rather than
+    // picking whatever happened to be first in the config, and says so when it is not run
+    // -- a check that quietly does nothing is worse than one that is absent.
     const clickable = process.env["SSH_BROWSER_E2E_OPEN_HOST"];
     if (clickable === undefined) {
       console.log(
-        "  skip  opening a host by clicking it " +
+        "  skip  serving a host by clicking it, and stopping it again " +
           "(set SSH_BROWSER_E2E_OPEN_HOST=<ssh_config host> to run it)",
       );
     } else {
-      // By the alias attribute rather than by text. `hasText` matched the wrong row: the
-      // open alias names its ssh host in the line underneath, so a search for "panza"
-      // found the `e2e` row and clicked that instead.
-      const row = popup.locator(`#hosts button[data-alias="${clickable}"]`);
-      const opened = browser.waitForEvent("page", { timeout: 60_000 });
-      await row.click();
-      const tab = await opened;
-      await tab.waitForLoadState("domcontentloaded");
-      check("opening a host by clicking it lands on its origin", () =>
-        assert.equal(new URL(tab.url()).host, `${clickable}.${SUFFIX}`),
+      await dashboard.click(".back");
+      const hostRow = `#view button[data-alias="${clickable}"]`;
+      await dashboard.waitForSelector(hostRow);
+      await dashboard.click(hostRow);
+      await dashboard.waitForSelector("#open-site", { timeout: 60_000 });
+      const servedHash = new URL(dashboard.url()).hash;
+      check("serving a host by clicking it lands on its own page", () =>
+        assert.equal(servedHash, `#${clickable}`),
       );
-      // The point of the whole exercise: what opens is a directory you can walk, not a
-      // file listing in a viewer.
-      const entries = await tab.$$eval("a", (as) => as.map((a) => a.getAttribute("href")));
-      check("and what it lands on is a directory tree", () =>
-        assert.ok(entries.length > 0, "the landing page should list entries to click"),
+
+      // And taking it down puts it back among the hosts. The run must not leave a
+      // connection open that it started.
+      await dashboard.click("#stop");
+      await dashboard.waitForSelector(hostRow);
+      const afterStop = (await dashboard.textContent("#view")) ?? "";
+      check("stopping it puts it back among the hosts you can serve", () =>
+        assert.ok(
+          afterStop.includes("hosts you can serve"),
+          `expected the list again, got: ${afterStop.slice(0, 120)}`,
+        ),
       );
-      await tab.close();
     }
+
+    await dashboard.click(".back").catch(() => {});
 
     // A filename that needs percent-escaping, which is where the two directions of the
     // annotation API can disagree about which document they mean. They did: a note was written

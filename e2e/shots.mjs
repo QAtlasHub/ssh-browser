@@ -8,7 +8,7 @@
 //
 // Writes 1280×800 images to e2e/shots/, which is one of the two sizes the store accepts.
 //
-// The control token is read from the daemon's own output and never printed here. In the popup
+// The control token is read from the daemon's own output and never printed here. In the dashboard
 // shot its field is `type="password"`, so it photographs as dots.
 
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -23,7 +23,7 @@ import {
   SUFFIX,
   TOKEN_HEADER,
   browserOptions,
-  connectThroughPopup,
+  connectThroughDashboard,
   extensionWithPermissionGranted,
   loadExtension,
   startDaemon,
@@ -53,20 +53,20 @@ try {
     args: loadExtension(extension),
   });
 
-  const { popup } = await connectThroughPopup(browser, PORT);
+  const { dashboard } = await connectThroughDashboard(browser, PORT);
 
-  // The popup is 320px wide by design, so a raw screenshot would be a narrow strip on a wide
-  // canvas. Centring it on a neutral ground is presentation rather than fiction: every pixel
-  // of the popup is the real one, laid out by its own stylesheet.
-  await popup.setViewportSize(VIEW);
-  await popup.addStyleTag({
-    content: `
-      html { background: #eceae3; }
-      body { margin: 240px auto; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.18); border-radius: 8px; }
-    `,
-  });
-  await popup.screenshot({ path: join(OUT, "1-connect.png") });
-  console.log("  shots/1-connect.png    the popup, connected");
+  // The dashboard lays itself out on a full page, so there is nothing to centre and no
+  // stylesheet to add. Every pixel is the real one.
+  await dashboard.setViewportSize(VIEW);
+  await dashboard.waitForSelector("#view button");
+  await dashboard.screenshot({ path: join(OUT, "1-sites.png") });
+  console.log("  shots/1-sites.png      the dashboard: what is served, and what could be");
+
+  // And one site's own page, which is where the per-site things are.
+  await dashboard.click(`#view button[data-alias="${ALIAS}"]`);
+  await dashboard.waitForSelector("#open-site");
+  await dashboard.screenshot({ path: join(OUT, "2-site.png") });
+  console.log("  shots/2-site.png       one site: its URL, its root, and how to stop it");
 
   // A note to photograph. Written through the control API rather than by driving the panel,
   // because the picture wanted is of a note being *shown*; how it got there is the subject of
@@ -93,8 +93,8 @@ try {
   // The highlight is the evidence the note arrived and anchored, so waiting for it is also
   // what stops the shot being taken half a beat early.
   await page.waitForFunction(() => CSS.highlights.size > 0, { timeout: 20_000 });
-  await page.screenshot({ path: join(OUT, "2-annotated.png") });
-  console.log("  shots/2-annotated.png  a page served over ssh, with a note on it");
+  await page.screenshot({ path: join(OUT, "4-annotated.png") });
+  console.log("  shots/4-annotated.png  a page served over ssh, with a note on it");
 
   const listing = await browser.newPage();
   await listing.setViewportSize(VIEW);

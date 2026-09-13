@@ -159,10 +159,16 @@ a file that asked for https is the one outcome that looks like success.
 
 ### The extension
 
-Open the popup and it lists the hosts your `~/.ssh/config` can reach, with what `ssh -G`
-resolved for each. Click one and it opens, and you land on its directory tree. There is
-nothing to paste: the extension asks the daemon for its control token, and the daemon hands
-that to anything except a page — see [SECURITY.md](SECURITY.md).
+Clicking the toolbar icon opens a dashboard. It lists the sites being served — each with
+its URL and where on the remote it is rooted — and under them the hosts your `~/.ssh/config`
+can reach, with what `ssh -G` resolved for each.
+
+Clicking a host serves it. Clicking a site opens that site's own page, which is where the
+per-site things are: its URL, the host and root it comes from, a box to change the root, and
+a button to stop serving it.
+
+There is nothing to paste. The extension asks the daemon for its control token, and the
+daemon hands that to anything except a page — see [SECURITY.md](SECURITY.md).
 
 
 `extension/` builds with `npm ci && npm run build` and loads unpacked from
@@ -260,9 +266,10 @@ repointing the proxy are not things to do to the browser you keep your life in.
 Verified that way against Brave 152 and against a real host, extension included. Run against one, it caught the daemon
 announcing `listening on 127.0.0.1:PORT` before it had taken the port.
 
-The extension is in the harness too, loaded unpacked into the same browser. The popup
-connects, the content script runs on an alias page, and a note written through the control
-API comes back and anchors — on a filename with a space in it, which is where the read and
+The extension is in the harness too, loaded unpacked into the same browser. The dashboard
+connects and lists what is served, clicking a site opens its page and clicking through to the
+site lands on the alias origin with the remote's own index page, the content script runs on
+an alias page, and a note written through the control API comes back and anchors — on a filename with a space in it, which is where the read and
 write paths once disagreed about which document they meant.
 
 The harness covers, in one run: the PAC's routing decisions; the refusals (`403` for a
@@ -271,9 +278,9 @@ rebinding `Host`, `403` for percent-encoded traversal, `405` for writing to an a
 (weak validator, `304` on revisit, directory listing, `301` for a missing trailing slash,
 `206` for a byte range); the browser comparison above; and the extension.
 
-One thing it does not cover: the permission *request*. The popup asks for the alias hosts on
-the Connect click, and that raises a permission bubble, which is browser chrome a test cannot
-click. The harness grants the permission up front instead, so everything downstream of the
+One thing it does not cover: the permission *request*. The dashboard asks for the alias
+hosts on the first click in it, and that raises a permission bubble, which is browser chrome
+a test cannot click. The harness grants the permission up front instead, so everything downstream of the
 grant is exercised for real and the asking is not.
 
 Not there yet: collaborative editing of documents themselves.
