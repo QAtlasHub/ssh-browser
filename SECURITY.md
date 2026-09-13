@@ -90,6 +90,32 @@ Writes are appends. A log has exactly one writer by construction, which is the o
 arrangement that is safe without a lock, and it is why the format is per-author logs
 rather than one shared file.
 
+## What is never served
+
+Any path component beginning with a dot, at any depth, and they are left out of listings too.
+
+The reason is what an origin is. An alias base is one origin, so a page under it can read
+everything else under it with `fetch` — the base is the blast radius, and giving a page an
+origin is the entire product. On a home directory nearly everything worth stealing sits behind
+a dot: `.ssh`, `.aws`, `.netrc`, a `.git` whose remote URL carries a token. One downloaded HTML
+file, one cloned repository with a report in it, and the rest of the tree is readable and
+postable anywhere.
+
+Refusing them costs a reader nearly nothing, and it is what makes pointing an alias at a home
+directory a reasonable thing to do at all.
+
+Decided before anything is asked of the remote, because unlike a symlink it needs nothing from
+the remote to decide — and deciding later would mean asking the remote to open `.ssh` in order
+to then refuse it. The prefetcher applies the same rule, so a page naming `.ssh/id_ed25519` in
+an `<img src>` cannot get it read on the strength of the request that would refuse it never
+being made.
+
+The annotation sidecar is itself a dot directory and is unaffected: annotations are read
+through the control API, which does not come this way.
+
+This is not a permission system. Everything else under the base is readable by anything else
+under the base, and that is what an origin means.
+
 ## Who a log really belongs to
 
 A log's filename is the only thing naming its author, so the filename is checked against

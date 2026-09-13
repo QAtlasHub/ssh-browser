@@ -356,6 +356,16 @@ impl Origin {
         }
         let last = chain.len() - 1;
 
+        // Settled before anything is asked of the remote, because unlike a symlink this needs
+        // nothing from the remote to decide — and deciding it later would mean asking the
+        // remote to open `.ssh` in order to then refuse it.
+        if let Some((_, name)) = chain.iter().find(|(_, n)| hidden(n)) {
+            return fail(
+                StatusCode::FORBIDDEN,
+                format!("refusing {name}: names beginning with a dot are not served"),
+            );
+        }
+
         self.warm_ancestor_listings(session, &chain).await;
 
         // Symlinks are settled before anything else, so the answer cannot depend on
@@ -704,6 +714,12 @@ impl Origin {
             };
             let chain = components(&session.base, &resolved);
             if chain.is_empty() {
+                continue;
+            }
+            // The same rule the request path applies, applied here too — a page naming
+            // `.ssh/id_ed25519` in an `<img src>` must not get it read into the cache on the
+            // strength of the request that would refuse it never being made.
+            if chain.iter().any(|(_, n)| hidden(n)) {
                 continue;
             }
             // Checked against what is already known before anything new is listed. Without
@@ -1095,10 +1111,26 @@ fn redirect(to: &str) -> Response<Full<Bytes>> {
 }
 
 /// Listing for a directory that has no index.html.
+/// A name this daemon will not serve.
+///
+/// Anything beginning with a dot. An alias base is one origin, so a page under it can read
+/// everything else under it with `fetch` — the base is the blast radius. On a home directory
+/// almost everything worth stealing sits behind a dot: `.ssh`, `.aws`, `.netrc`, a `.git`
+/// whose remote URL carries a token. Refusing them costs a reader nearly nothing, and it is
+/// what makes pointing an alias at a home directory a reasonable thing to do at all.
+///
+/// The annotation sidecar is itself a dot directory and is unaffected, because annotations are
+/// read through the control API and never arrive here.
+fn hidden(name: &str) -> bool {
+    name.starts_with('.')
+}
+
 fn autoindex(path: &str, entries: &[Entry]) -> String {
     let mut visible: Vec<&Entry> = entries
         .iter()
-        .filter(|e| e.name != "." && e.name != "..")
+        // `.` and `..` are already gone by the time a path resolves; these are the real
+        // dot-names. Listing what the next click would be refused is worse than silence.
+        .filter(|e| e.name != "." && e.name != ".." && !hidden(&e.name))
         .collect();
     visible.sort_by(|a, b| (!a.attrs.is_dir(), &a.name).cmp(&(!b.attrs.is_dir(), &b.name)));
 
@@ -1647,6 +1679,100 @@ mod tests {
         assert!(
             !text.contains(NOWHERE),
             "the ssh host was reached before the port was taken: {text}"
+        );
+    }
+
+    /// What makes a home directory a reasonable base: the things worth stealing there are
+    /// behind a dot, and a dot is refused at any depth.
+    #[tokio::test]
+    async fn a_dot_name_is_never_served() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir(
+                    "/srv",
+                    vec![
+                        ("Vault", dir_attrs()),
+                        (".ssh", dir_attrs()),
+                        (".netrc", file_attrs(9, 1)),
+                    ],
+                )
+                .dir("/srv/.ssh", vec![("id_ed25519", file_attrs(9, 1))])
+                .dir("/srv/Vault", vec![(".git", dir_attrs())])
+                .dir("/srv/Vault/.git", vec![("config", file_attrs(9, 1))])
+                .file("/srv/.ssh/id_ed25519", b"a-secret-")
+                .file("/srv/.netrc", b"a-secret-")
+                .file("/srv/Vault/.git/config", b"a-secret-"),
+        )
+        .await;
+
+        for path in [
+            "/.ssh/id_ed25519",
+            "/.netrc",
+            // At depth, and behind a directory that is itself perfectly ordinary.
+            "/Vault/.git/config",
+            // The directory itself, not only what is under it.
+            "/.ssh/",
+        ] {
+            assert_eq!(
+                origin.handle(get(path, None)).await.status(),
+                StatusCode::FORBIDDEN,
+                "{path}"
+            );
+        }
+    }
+
+    /// And they are not advertised either. Listing what the next click would refuse is worse
+    /// than not listing it.
+    #[tokio::test]
+    async fn a_listing_does_not_mention_dot_names() {
+        let origin = origin_with(FakeRemote::new().dir(
+            "/srv",
+            vec![
+                ("Vault", dir_attrs()),
+                (".ssh", dir_attrs()),
+                (".obsidian", dir_attrs()),
+            ],
+        ))
+        .await;
+
+        let body = body_of(origin.handle(get("/", None)).await).await;
+        let listing = String::from_utf8_lossy(&body);
+        assert!(listing.contains("Vault"), "the ordinary entry is listed");
+        assert!(!listing.contains(".ssh"), "got: {listing}");
+        assert!(!listing.contains(".obsidian"), "got: {listing}");
+    }
+
+    /// The prefetcher must not become the way around it. A page is untrusted input, and this
+    /// is the one part of the daemon that acts on what a page says.
+    #[tokio::test]
+    async fn a_page_cannot_prefetch_a_dot_name() {
+        let html = "<!doctype html><html><body><img src=\".ssh/id_ed25519\"></body></html>";
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir(
+                    "/srv",
+                    vec![
+                        ("index.html", file_attrs(html.len() as u64, 100)),
+                        (".ssh", dir_attrs()),
+                    ],
+                )
+                .dir("/srv/.ssh", vec![("id_ed25519", file_attrs(9, 1))])
+                .file("/srv/index.html", html.as_bytes())
+                .file("/srv/.ssh/id_ed25519", b"a-secret-"),
+        )
+        .await;
+
+        assert_eq!(
+            origin.handle(get("/index.html", None)).await.status(),
+            StatusCode::OK
+        );
+        assert!(
+            !origin.cache.has_listing("/srv/.ssh"),
+            "the page got the daemon to list a directory it will not serve"
+        );
+        assert_eq!(
+            origin.handle(get("/.ssh/id_ed25519", None)).await.status(),
+            StatusCode::FORBIDDEN
         );
     }
 
