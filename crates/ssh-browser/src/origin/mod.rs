@@ -151,6 +151,15 @@ struct OpenAlias {
     host: String,
     base: String,
     url: String,
+    /// Remote round trips this session has cost since it opened.
+    ///
+    /// The central claim of this daemon is a round-trip count, and until this was reported
+    /// the counter behind it existed only for unit tests against a fake remote — so nobody
+    /// could check the claim against their own host and their own site, which is the only
+    /// place it can be wrong in a way that matters. Read it twice and subtract.
+    ///
+    /// Monotonic and per session, so it resets when an alias is closed and reopened.
+    trips: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -703,7 +712,41 @@ impl Origin {
             }
         }
 
-        let mut got = session.fs.read_batch(std::slice::from_ref(&file)).await;
+        // The length the listing already gave is what turns this from a poll into one round
+        // trip. `read_batch` cannot know how long a file is, so it asks for 32 KiB at a time
+        // until a short read tells it to stop: one round trip per chunk index. `read_ranges`
+        // is handed the length and issues every chunk before awaiting any, so the file costs
+        // one however long it is. The prefetcher has always done this; the request a reader
+        // actually waits on did not.
+        //
+        // It is the direct path that needs it most, because the files that reach it are the
+        // ones the prefetcher could not have warmed: the page itself, which has to be read
+        // before it can be scanned, and anything a script fetches at runtime. Measured
+        // against real Documenter output — a 700 KB `index.html` and a 2 MB
+        // `search_index.js`, neither of them visible to an HTML scan — the page cost 95
+        // remote round trips before this and 26 after. What remains is listings, which
+        // expire before a slow page has finished loading; that is a separate problem.
+        let mut got = match size {
+            0 => session.fs.read_batch(std::slice::from_ref(&file)).await,
+            size => {
+                let req = RangeReq {
+                    path: file.clone(),
+                    offset: 0,
+                    len: size,
+                };
+                let mut ranged = session.fs.read_ranges(std::slice::from_ref(&req)).await;
+                match ranged.pop() {
+                    Some(Ok(body)) if body.len() as u64 == size => vec![Ok(body)],
+                    // Anything else means the listing no longer describes the file, or the
+                    // read failed. Falling back to the poll rather than answering with what
+                    // arrived: a body shorter than the length it is served with is precisely
+                    // the silent truncation this daemon must not produce, and the poll finds
+                    // the real length or the real error. It costs a round trip in a case that
+                    // is a race, and nothing in the case that is not.
+                    _ => session.fs.read_batch(std::slice::from_ref(&file)).await,
+                }
+            }
+        };
         match got.pop() {
             Some(Ok(body)) => {
                 let body = Bytes::from(body);
@@ -794,6 +837,7 @@ impl Origin {
                     host: s.host.clone(),
                     base: s.base.clone(),
                     url: format!("http://{alias}.{}/", self.suffix),
+                    trips: s.fs.round_trips(),
                 })
                 .collect();
             open.sort_by(|a, b| a.alias.cmp(&b.alias));
@@ -2469,6 +2513,39 @@ mod tests {
         assert_eq!(cost(1024).await, cost(200 * 1024).await);
     }
 
+    /// And so does a file asked for directly, which is the one a reader waits on.
+    ///
+    /// The test above covers the prefetcher. The direct path had the same defect and no test,
+    /// and it is the path that matters more: the files that reach it are exactly the ones a
+    /// prefetch could not have warmed — the page itself, which has to be read before it can
+    /// be scanned, and anything a script fetches at runtime.
+    ///
+    /// Found by pointing `e2e/probe.mjs` at real Documenter output, where a 700 KB
+    /// `index.html` and a 2 MB `search_index.js` between them took the page to 95 remote
+    /// round trips, and 26 once this was fixed. No unit test here could have found it,
+    /// because every fixture in this file is three bytes long.
+    #[tokio::test]
+    async fn a_large_file_asked_for_directly_costs_what_a_small_one_costs() {
+        async fn cost(bytes: usize) -> u64 {
+            let origin = origin_with(
+                FakeRemote::new()
+                    .dir("/srv", vec![("big.bin", file_attrs(bytes as u64, 1))])
+                    .file("/srv/big.bin", &vec![b'x'; bytes]),
+            )
+            .await;
+
+            let before = trips(&origin).await;
+            let res = origin.handle(get("/big.bin", None)).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            // Every byte, not merely a successful status: a range read that stopped early
+            // would otherwise pass this as a cheap request.
+            assert_eq!(body_of(res).await.len(), bytes);
+            trips(&origin).await - before
+        }
+
+        assert_eq!(cost(1024).await, cost(500 * 1024).await);
+    }
+
     /// A listing that understates a file's length must not turn into an empty `200`.
     ///
     /// The prefetch reads a range, and a range is exactly as long as it was told to be. A
@@ -3470,6 +3547,45 @@ mod tests {
         assert!(
             parsed.get("unusable").is_some_and(|u| u.is_array()),
             "{text}"
+        );
+    }
+
+    /// The round-trip count is reachable at runtime, and moves.
+    ///
+    /// The claim this daemon is built on is a round-trip count, and the counter behind it
+    /// used to be visible only to unit tests holding a `FakeRemote` — which makes the claim
+    /// checkable against the fake and nowhere else. Reporting it lets `e2e/probe.mjs` read
+    /// it for a real page on a real host, which is the only place it can be wrong in a way
+    /// a reader would notice.
+    ///
+    /// Asserted as a strict increase rather than as a number. The number is the subject of
+    /// other tests, and pinning it here would make this fail for every unrelated change to
+    /// how a page is fetched. What must not pass is a field wired to a constant, which
+    /// would report the invariant as perfect forever.
+    #[tokio::test]
+    async fn the_host_list_reports_round_trips_and_they_grow() {
+        let origin = origin_with(one_page()).await;
+
+        async fn trips_now(origin: &Origin) -> u64 {
+            let res = origin
+                .handle(loopback("/_control/hosts", Some(TEST_TOKEN)))
+                .await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let text = String::from_utf8(body_of(res).await.to_vec()).expect("utf-8");
+            let parsed: serde_json::Value = serde_json::from_str(&text).expect("json");
+            let open = parsed["open"].as_array().expect("open is an array");
+            assert_eq!(open.len(), 1, "{text}");
+            open[0]["trips"].as_u64().expect("trips is a number")
+        }
+
+        let before = trips_now(&origin).await;
+        let res = origin.handle(get("/a.html", None)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let after = trips_now(&origin).await;
+
+        assert!(
+            after > before,
+            "serving a page reported no round trips ({before} -> {after})"
         );
     }
 

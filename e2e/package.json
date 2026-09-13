@@ -7,7 +7,8 @@
   "scripts": {
     "browser": "playwright install --with-deps chromium",
     "e2e": "node run.mjs",
-    "shots": "node shots.mjs"
+    "shots": "node shots.mjs",
+    "probe": "node probe.mjs"
   },
   "devDependencies": {
     "playwright": "^1.56.1"
