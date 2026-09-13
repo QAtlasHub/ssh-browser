@@ -181,12 +181,13 @@
         padding: 2px 6px;
         width: 6em;
       }
-      kbd {
-        background: #f2f2f2;
+      select {
+        background: none;
         border: 1px solid var(--line);
-        border-radius: 3px;
+        border-radius: 6px;
+        color: inherit;
         font: inherit;
-        padding: 0 4px;
+        padding: 7px 10px;
       }
     </style>
   </head>
@@ -194,11 +195,7 @@
     <h1>ssh-browser</h1>
     <div id="status"></div>
     <div id="view"></div>
-    <footer>
-      <span id="daemon"></span>
-      <label> port <input id="port" type="number" min="1" max="65535" value="7391" /> </label>
-      &middot; in the address bar: <kbd>ssh</kbd> then Tab, then an alias and a path
-    </footer>
+    <footer><span id="daemon"></span></footer>
     <script type="module" src="dashboard.js"></script>
   </body>
 </html>

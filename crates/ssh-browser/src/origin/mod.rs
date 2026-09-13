@@ -44,6 +44,7 @@ use crate::fs::{Entry, RangeReq, RemoteFs};
 use crate::prefetch;
 use crate::sftp::wire::Attrs;
 use crate::ssh_config;
+use crate::theme;
 
 /// A file worth holding whole. Anything larger is served by range and not cached: a
 /// seek into a video must not pull the entire file, and holding one would evict every
@@ -263,6 +264,12 @@ pub struct Origin {
     sessions: RwLock<HashMap<String, Arc<Session>>>,
     cache: Cache,
     token: Token,
+    /// What a directory listing looks like.
+    ///
+    /// Behind a lock because it is chosen from the dashboard while the daemon runs, and it
+    /// is one setting for every alias: an origin that looked different from its neighbour
+    /// for no reason the reader chose would be a bug rather than a feature.
+    theme: RwLock<String>,
     /// Whose annotations this daemon writes.
     ///
     /// Configured rather than discovered. The SFTP transport never runs a shell, so the
@@ -310,6 +317,7 @@ impl Origin {
         port: u16,
         token: Token,
         author: String,
+        theme: String,
     ) -> Result<Bound> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let listener = TcpListener::bind(addr)
@@ -327,6 +335,9 @@ impl Origin {
         // write path. A typo therefore started a daemon that read pages perfectly well and
         // then answered the reader's first note with a 500. It is configuration, so it is
         // refused where the rest of the configuration is.
+        // Refused here rather than at the first listing, for the same reason the author name
+        // is: it is configuration, so it is refused where the rest of the configuration is.
+        theme::check(&theme)?;
         ensure!(
             annot::is_safe_name(&author),
             "author {author:?} must be letters, digits, dots, dashes or underscores: it becomes a filename"
@@ -383,6 +394,7 @@ impl Origin {
                 sessions: RwLock::new(sessions),
                 cache: Cache::default(),
                 token,
+                theme: RwLock::new(theme),
                 author,
             }),
             listener,
@@ -739,6 +751,8 @@ impl Origin {
             (&Method::GET, "hosts") => self.list_hosts().await,
             (&Method::POST, "open") => self.open_host(body).await,
             (&Method::POST, "close") => self.close_alias(body).await,
+            (&Method::GET, "theme") => self.show_theme().await,
+            (&Method::POST, "theme") => self.set_theme(body).await,
             (&Method::GET, "annotations") => self.list_annotations(query).await,
             (&Method::POST, "annotations") => self.add_annotation(body).await,
             (&Method::GET, route) => {
@@ -1051,6 +1065,70 @@ impl Origin {
         })
     }
 
+    /// `GET /_control/theme` -- what listings look like, and what else they could.
+    async fn show_theme(&self) -> Response<Full<Bytes>> {
+        #[derive(serde::Serialize)]
+        struct Choice {
+            name: &'static str,
+            label: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct Themes<'a> {
+            current: &'a str,
+            themes: Vec<Choice>,
+        }
+        // The list comes from the daemon rather than being written out again in the
+        // dashboard. Two copies of it is how a theme gets added and stays invisible.
+        control::json(&Themes {
+            current: &self.theme.read().await,
+            themes: theme::all()
+                .iter()
+                .map(|t| Choice {
+                    name: t.name,
+                    label: t.label,
+                })
+                .collect(),
+        })
+    }
+
+    /// `POST /_control/theme` -- choose one, and remember it.
+    async fn set_theme(&self, body: &[u8]) -> Response<Full<Bytes>> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Ask {
+            name: String,
+        }
+        let ask: Ask = match serde_json::from_slice(body) {
+            Ok(ask) => ask,
+            Err(e) => {
+                return control::text(
+                    StatusCode::BAD_REQUEST,
+                    format!("theme needs a JSON body naming one: {e}"),
+                );
+            }
+        };
+        // Checked before anything is changed, so a typo leaves the daemon as it was rather
+        // than half-moved to a theme that does not exist.
+        if let Err(e) = theme::check(&ask.name) {
+            return control::text(StatusCode::BAD_REQUEST, format!("{e:#}"));
+        }
+
+        *self.theme.write().await = ask.name.clone();
+        // Remembered on a best effort. Failing to write a file under the runtime directory
+        // must not undo a change the reader can already see on the next listing, so it is
+        // reported beside the result rather than instead of it.
+        let remembered = theme::remember(&ask.name).is_ok();
+        #[derive(serde::Serialize)]
+        struct Chose<'a> {
+            current: &'a str,
+            remembered: bool,
+        }
+        control::json(&Chose {
+            current: &ask.name,
+            remembered,
+        })
+    }
+
     /// `GET /_control/annotations?doc=<alias>/<path>`
     async fn list_annotations(&self, query: Option<&str>) -> Response<Full<Bytes>> {
         let Some(doc) = param(query, "doc") else {
@@ -1166,7 +1244,13 @@ impl Origin {
         let sites = self.sites_among(session, resolved, &entries).await;
         plain_ok(
             "text/html; charset=utf-8",
-            Bytes::from(autoindex(alias, rel, &entries, &sites)),
+            Bytes::from(autoindex(
+                alias,
+                rel,
+                &entries,
+                &sites,
+                &self.theme.read().await,
+            )),
         )
     }
 
@@ -1693,43 +1777,46 @@ fn hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 
-/// Which of the three groups a listing puts an entry in, and the order they come in.
+/// Where an entry sorts, before its name is considered.
 ///
-/// Pages first, which souta asked for outright. A directory of generated output exists
-/// *for* its HTML — a Pinax board sits in `out/` among the files that produced it — and
-/// one alphabetical list buries the one thing somebody came to open.
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-enum Group {
-    Page,
-    Folder,
-    File,
-}
-
-impl Group {
-    fn heading(self) -> &'static str {
-        match self {
-            Group::Page => "pages",
-            Group::Folder => "folders",
-            Group::File => "files",
-        }
+/// Directories first and no headings over them — souta's call, and it is how a file tree
+/// has worked since long before anybody wrote one down. Within each half the thing you came
+/// to open rises: a directory that *is* a page, and then an HTML file.
+///
+/// A Pinax board is `out/ft_demo/index.html`, so the directory holding it is what has to
+/// rise. Sorting the HTML alone would never move anything, because the directory you are
+/// standing in has no HTML in it at all.
+fn rank(e: &Entry, sites: &HashSet<String>) -> (u8, u8) {
+    if e.attrs.is_dir() {
+        (0, u8::from(!sites.contains(&e.name)))
+    } else {
+        (1, u8::from(!is_page(&e.name)))
     }
 }
 
-fn group_of(e: &Entry, sites: &HashSet<String>) -> Group {
-    if e.attrs.is_dir() {
-        // A directory holding an `index.html` is served *as* that page, so it belongs with
-        // the pages rather than with the folders. It is the only way a Pinax board turns up
-        // in a listing at all: the board is `out/ft_demo/index.html`, and `out/` contains no
-        // HTML of its own.
-        if sites.contains(&e.name) {
-            Group::Page
-        } else {
-            Group::Folder
-        }
-    } else if matches!(extension_of(&e.name).as_deref(), Some("html" | "htm")) {
-        Group::Page
-    } else {
-        Group::File
+fn is_page(name: &str) -> bool {
+    matches!(extension_of(name).as_deref(), Some("html" | "htm"))
+}
+
+/// Which colour an entry's marker takes.
+///
+/// Families rather than extensions, because the point is to be readable without being read:
+/// a `.toml` and a `.png` should not look the same, but `.toml` and `.json` may. This is
+/// the one thing an editor's file tree does that a plain list does not.
+fn family(name: &str) -> &'static str {
+    match extension_of(name).as_deref() {
+        Some("html" | "htm") => "k-page",
+        Some("md" | "txt" | "rst" | "tex" | "bib" | "pdf" | "org" | "adoc") => "k-doc",
+        Some("json" | "toml" | "yaml" | "yml" | "csv" | "tsv" | "xml" | "ini" | "lock") => "k-data",
+        Some(
+            "rs" | "jl" | "py" | "ts" | "js" | "mjs" | "sh" | "c" | "h" | "cpp" | "go" | "rb"
+            | "lua" | "css" | "scss" | "lean" | "hs" | "java" | "kt" | "swift" | "sql",
+        ) => "k-code",
+        Some(
+            "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "avif" | "ico" | "mp4" | "webm"
+            | "mov" | "mp3" | "wav",
+        ) => "k-media",
+        _ => "k-plain",
     }
 }
 
@@ -1798,53 +1885,71 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// The listing's own stylesheet.
+/// The listing's layout.
+///
+/// Written entirely against the custom properties a theme supplies, so a new palette is
+/// a new theme rather than a second copy of these rules. See `crate::theme`.
 ///
 /// Inline, and this is the one page where that is right: it is the daemon's own, not the
-/// remote's. Nothing is ever added to a document the reader came for — that rule is what
-/// the annotation overlay's closed shadow root exists to keep.
+/// remote's. Nothing is ever added to a document the reader came for.
+///
+/// Dense rows, no rules between them, and no headings — an editor's file tree rather
+/// than a table. The first version had an upper-cased heading over each group and a border
+/// under every row, and souta's verdict was 「みずらい」.
 const LISTING_CSS: &str = "\
-:root{--fg:#1c1c1c;--dim:#6b6b6b;--line:#e6e6e6;--bg:#fff;--accent:#0a7d33;--hover:#fafafa}\
-@media(prefers-color-scheme:dark){:root{--fg:#e8e8e8;--dim:#9a9a9a;--line:#2c2c2c;\
---bg:#181818;--accent:#5ec77f;--hover:#222}}\
 *{box-sizing:border-box}\
-body{background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,sans-serif;\
-margin:0 auto;max-width:860px;padding:28px 20px 64px}\
-a{color:inherit;text-decoration:none}\
-nav{font-size:13px;margin-bottom:8px;overflow-wrap:anywhere}\
-nav a{color:var(--dim)}\
+html{background:var(--bg)}\
+body{color:var(--fg);font:13px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0}\
+header{background:var(--bg);border-bottom:1px solid var(--line);padding:9px 16px;\
+position:sticky;top:0;z-index:1}\
+nav{font-size:12px;overflow-wrap:anywhere}\
+nav a{color:var(--dim);text-decoration:none}\
 nav a:hover{color:var(--fg);text-decoration:underline}\
 nav a.here{color:var(--fg);font-weight:600}\
-nav i{color:var(--line);font-style:normal;padding:0 4px}\
-h2{align-items:baseline;border-bottom:1px solid var(--line);color:var(--dim);display:flex;\
-font-size:11px;font-weight:600;gap:8px;letter-spacing:.08em;margin:28px 0 2px;\
-padding-bottom:6px;text-transform:uppercase}\
-h2 b{color:var(--line);font-weight:400}\
-.row{align-items:baseline;border-bottom:1px solid var(--line);display:grid;gap:12px;\
-grid-template-columns:3.2rem 1fr auto auto;margin:0 -8px;padding:8px}\
+nav i{color:var(--faint);font-style:normal;padding:0 5px}\
+main{padding:4px 0}\
+.row{align-items:center;color:inherit;display:grid;gap:10px;\
+grid-template-columns:16px 1fr auto auto;line-height:22px;padding:0 16px;\
+text-decoration:none}\
 .row:hover{background:var(--hover)}\
-.kind{color:var(--dim);font-family:ui-monospace,SFMono-Regular,monospace;font-size:10px;\
-letter-spacing:.06em;overflow:hidden;text-align:right;text-transform:uppercase}\
-.page .kind{color:var(--accent)}\
-.name{overflow-wrap:anywhere}\
-.page .name{font-weight:600}\
-.size,.when{color:var(--dim);font-family:ui-monospace,SFMono-Regular,monospace;\
-font-size:12px;white-space:nowrap}\
-.empty,footer{color:var(--dim);font-size:12px;margin-top:28px}\
-@media(max-width:560px){.row{grid-template-columns:3.2rem 1fr auto}.when{display:none}}";
+.row:focus-visible{background:var(--sel);outline:none}\
+.g{font-size:10px;line-height:1;text-align:center}\
+.dir .g{color:var(--dim)}\
+.site .g,.site .name{color:var(--accent)}\
+.site .name,.dir .name{font-weight:500}\
+.k-page .g,.k-page .name{color:var(--k-page)}\
+.k-doc .g{color:var(--k-doc)}\
+.k-data .g{color:var(--k-data)}\
+.k-code .g{color:var(--k-code)}\
+.k-media .g{color:var(--k-media)}\
+.k-plain .g{color:var(--k-plain)}\
+.name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
+.size,.when{color:var(--faint);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\
+font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}\
+.size{min-width:4.5rem;text-align:right}\
+footer{border-top:1px solid var(--line);color:var(--faint);font-size:11px;\
+margin-top:6px;padding:8px 16px}\
+.empty{color:var(--faint);padding:14px 16px}\
+@media(max-width:560px){.when{display:none}.size{min-width:0}}";
 
 /// A directory, as a page.
 ///
 /// `rel` is the decoded path below the alias base, so the crumbs can show what the reader
 /// typed rather than its percent-escaped spelling, and the links can be escaped once here.
-fn autoindex(alias: &str, rel: &str, entries: &[Entry], sites: &HashSet<String>) -> String {
+fn autoindex(
+    alias: &str,
+    rel: &str,
+    entries: &[Entry],
+    sites: &HashSet<String>,
+    theme: &str,
+) -> String {
     let mut visible: Vec<&Entry> = entries
         .iter()
         // `.` and `..` are already gone by the time a path resolves; these are the real
         // dot-names. Listing what the next click would be refused is worse than silence.
         .filter(|e| e.name != "." && e.name != ".." && !hidden(&e.name))
         .collect();
-    visible.sort_by(|a, b| (group_of(a, sites), &a.name).cmp(&(group_of(b, sites), &b.name)));
+    visible.sort_by(|a, b| (rank(a, sites), &a.name).cmp(&(rank(b, sites), &b.name)));
 
     let segments: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
     let title = if segments.is_empty() {
@@ -1857,8 +1962,10 @@ fn autoindex(alias: &str, rel: &str, entries: &[Entry], sites: &HashSet<String>)
     s.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
     s.push_str(&escape(&title));
     s.push_str("</title><style>");
+    // The palette first, then the layout that reads it.
+    s.push_str(&theme::css_for(theme));
     s.push_str(LISTING_CSS);
-    s.push_str("</style></head><body><nav>");
+    s.push_str("</style></head><body><header><nav>");
 
     // The crumbs replace the lone `../` this used to carry. Every level is one click rather
     // than one click each, and the alias is the root of them, so where you are is legible
@@ -1871,46 +1978,33 @@ fn autoindex(alias: &str, rel: &str, entries: &[Entry], sites: &HashSet<String>)
         s.push_str("<i>/</i>");
         s.push_str(&crumb(&href, segment, i + 1 == segments.len()));
     }
-    s.push_str("</nav>");
+    s.push_str("</nav></header><main>");
 
     if visible.is_empty() {
         s.push_str("<p class=\"empty\">This directory is empty.</p>");
     }
 
-    let mut current: Option<Group> = None;
     for e in &visible {
-        let group = group_of(e, sites);
-        if current != Some(group) {
-            let n = visible
-                .iter()
-                .filter(|o| group_of(o, sites) == group)
-                .count();
-            s.push_str("<h2>");
-            s.push_str(group.heading());
-            s.push_str("<b>");
-            s.push_str(&n.to_string());
-            s.push_str("</b></h2>");
-            current = Some(group);
-        }
-
         let is_dir = e.attrs.is_dir();
+        let site = is_dir && sites.contains(&e.name);
         let slash = if is_dir { "/" } else { "" };
-        s.push_str(if group == Group::Page {
-            "<a class=\"row page\" href=\""
-        } else {
-            "<a class=\"row\" href=\""
+
+        s.push_str("<a class=\"row ");
+        s.push_str(match (is_dir, site) {
+            // A directory holding an `index.html` is served *as* that page, so it is marked
+            // as somewhere to read rather than somewhere to look. It is the whole reason
+            // the scan above is paid for.
+            (true, true) => "site",
+            (true, false) => "dir",
+            (false, _) => family(&e.name),
         });
+        s.push_str("\" href=\"");
         s.push_str(&url_escape(&e.name));
         s.push_str(slash);
-        s.push_str("\"><span class=\"kind\">");
-        s.push_str(&escape(&match (is_dir, extension_of(&e.name)) {
-            // "site" rather than "dir": it is the difference between somewhere to look and
-            // something to read, and it is the whole reason the scan above is paid for.
-            (true, _) if sites.contains(&e.name) => "site".to_string(),
-            (true, _) => "dir".to_string(),
-            (false, Some(ext)) => ext,
-            (false, None) => String::new(),
-        }));
+        // A triangle for something to walk into, a square for something to open. With the
+        // headings gone this glyph and its colour carry the whole distinction.
+        s.push_str("\"><span class=\"g\">");
+        s.push_str(if is_dir { "\u{25b8}" } else { "\u{25aa}" });
         s.push_str("</span><span class=\"name\">");
         s.push_str(&escape(&e.name));
         s.push_str(slash);
@@ -1924,6 +2018,7 @@ fn autoindex(alias: &str, rel: &str, entries: &[Entry], sites: &HashSet<String>)
         s.push_str(&e.attrs.mtime.map(utc_stamp).unwrap_or_default());
         s.push_str("</span></a>");
     }
+    s.push_str("</main>");
 
     if !visible.is_empty() {
         s.push_str("<footer>");
@@ -2052,6 +2147,7 @@ mod tests {
             port: 7391,
             sessions: RwLock::new(sessions),
             cache: Cache::default(),
+            theme: RwLock::new(theme::DEFAULT.to_string()),
             token: Token::from_hex(TEST_TOKEN),
             author: "souta".to_string(),
         }
@@ -2477,6 +2573,7 @@ mod tests {
             port,
             Token::from_hex(TEST_TOKEN),
             "souta".to_string(),
+            theme::DEFAULT.to_string(),
         )
         .await;
 
@@ -2612,7 +2709,7 @@ mod tests {
     /// A listing with nothing marked as a site, which is every test that is not about the
     /// scan. The scan needs a remote; these do not.
     fn listing(alias: &str, rel: &str, entries: &[Entry]) -> String {
-        autoindex(alias, rel, entries, &HashSet::new())
+        autoindex(alias, rel, entries, &HashSet::new(), theme::DEFAULT)
     }
 
     #[test]
@@ -2622,11 +2719,10 @@ mod tests {
         assert!(page.contains("&lt;script&gt;"));
     }
 
-    /// souta's ask, and the reason this order exists: a directory of generated output is
-    /// *for* its HTML, and one alphabetical list buries the board under everything that
-    /// produced it.
+    /// Directories first and no headings, which is souta's call. Within the files the HTML
+    /// rises, which is the other half of what they asked for.
     #[test]
-    fn listings_put_pages_first_then_folders_then_files() {
+    fn directories_come_first_and_pages_lead_the_files() {
         let page = listing(
             "docs",
             "",
@@ -2637,17 +2733,22 @@ mod tests {
                 entry("report.html", false),
             ],
         );
-        let html = page.find("report.html").expect("page listed");
         let dir = page.find("z-dir").expect("dir listed");
+        let html = page.find("report.html").expect("page listed");
         let a = page.find("a.txt").expect("a listed");
         let b = page.find("b.txt").expect("b listed");
-        assert!(html < dir, "pages come before folders");
-        assert!(dir < a, "folders come before files");
-        assert!(a < b, "and each group sorts by name");
+        assert!(
+            dir < html,
+            "directories come first, whatever they are called"
+        );
+        assert!(html < a, "then the pages, ahead of the other files");
+        assert!(a < b, "and the rest by name");
+        // No headings at all. They are what souta called 「みずらい」.
+        assert!(!page.contains("<h2"), "{page}");
     }
 
-    /// The grouping is by what the name *is*, so a file whose extension merely contains
-    /// `html` is a file. `.htm` is the one other spelling worth accepting.
+    /// A page is decided by what the name *is*, so a file whose extension merely contains
+    /// `html` is an ordinary file. `.htm` is the one other spelling worth accepting.
     #[test]
     fn only_html_counts_as_a_page() {
         let page = listing(
@@ -2659,11 +2760,16 @@ mod tests {
                 entry("c.xhtml", false),
             ],
         );
-        let pages = page.find("pages").expect("a pages section");
-        let files = page.find("files").expect("a files section");
-        assert!(pages < page.find("a.htm").expect("htm listed"));
-        assert!(files < page.find("b.html.bak").expect("bak listed"));
-        assert!(files < page.find("c.xhtml").expect("xhtml listed"));
+        let htm = page.find("a.htm").expect("htm listed");
+        let bak = page.find("b.html.bak").expect("bak listed");
+        let xhtml = page.find("c.xhtml").expect("xhtml listed");
+        assert!(htm < bak && htm < xhtml, "only the .htm leads: {page}");
+        // And it is coloured as one, which is the only signal left now that the headings
+        // are gone.
+        assert!(
+            page.contains("class=\"row k-page\" href=\"a.htm\""),
+            "{page}"
+        );
     }
 
     #[test]
@@ -3614,15 +3720,15 @@ mod tests {
 
         let body = String::from_utf8(body_of(origin.handle(get("/", None)).await).await.to_vec())
             .expect("utf-8");
-        assert!(body.contains("site"), "the site kind is shown: {body}");
-
-        let pages = body.find("pages").expect("a pages section");
+        // Marked, so it reads as somewhere to open rather than somewhere to look. With no
+        // headings left, the class and its colour are the whole signal.
+        assert!(
+            body.contains("class=\"row site\" href=\"ft-demo/\""),
+            "{body}"
+        );
         let demo = body.find("ft-demo/").expect("the site listed");
-        let folders = body.find("folders").expect("a folders section");
         let src = body.find("src/").expect("the folder listed");
-        assert!(pages < demo, "the site sits under pages");
-        assert!(demo < folders, "and above the folders");
-        assert!(folders < src, "which is where a plain directory goes");
+        assert!(demo < src, "a site leads the other directories: {body}");
     }
 
     /// The invariant, on the one page that pays for the scan. One listing for the directory

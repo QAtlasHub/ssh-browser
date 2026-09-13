@@ -28,7 +28,22 @@ through a browser store and has not been submitted. No surface is stable.
   clicking a site opens that site's own page, where its root can be changed and it can be
   stopped. The framing is deployment because that is what the product is: a directory only
   reachable over ssh, made to look like a site on a host without being deployed to one.
-- Directory listings are laid out rather than bulleted: breadcrumbs for every level, a type
+- Directory listings are an editor's file tree rather than a table: dense rows, no rules
+  between them, no headings, and a marker coloured by file type. Directories come first;
+  within each half the thing you came to open rises, so a site leads the directories and an
+  HTML file leads the files. The first attempt had upper-cased headings over each group and
+  a border under every row, which souta read as 「みずらい」.
+- **Themes.** `crate::theme` holds the palettes and the listing's rules are written entirely
+  against their custom properties, so a new theme is a palette rather than a second copy of
+  the layout. Five to start: `auto` (the default, following the system), `light`, `dark`,
+  `paper`, `slate`. `[server] theme` sets the starting one; `GET`/`POST /_control/theme`
+  reads and changes it while the daemon runs, and a change is remembered beside the control
+  token rather than written back into the hand-written config file.
+- The dashboard has a settings screen: the theme, and which port the daemon is on. Reachable
+  from every screen, including the one that says nothing is listening — the port lives there,
+  so hiding the link when the daemon is unreachable locked out exactly the reader who needed
+  it. Found by the e2e run.
+- Directory listings were laid out rather than bulleted: breadcrumbs for every level, a type
   label, size and modification time per entry, and a dark mode. Sizes are binary multiples
   with the labels that mean them (`KiB`), and times are UTC because the remote's zone is not
   something this transport can ask for.

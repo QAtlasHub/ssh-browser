@@ -172,15 +172,24 @@ daemon hands that to anything except a page — see [SECURITY.md](SECURITY.md).
 
 ### What a directory looks like
 
-Breadcrumbs for every level, and three sections: **pages**, then folders, then files. Size
-and modification time on each entry; times are UTC, because SFTP reports seconds since the
-epoch and says nothing about a zone, and using this machine's would stamp a file with an
-offset belonging to a different computer.
+An editor's file tree rather than a table: breadcrumbs for every level, dense rows with no
+rules between them, and a marker coloured by file type. Size and modification time on each
+entry; times are UTC, because SFTP reports seconds since the epoch and says nothing about a
+zone, and using this machine's would stamp a file with an offset belonging to a different
+computer.
 
-Pages come first because that is what a directory of generated output is *for*. A directory
-holding an `index.html` is served as that page, so it is listed as a **site** and sorted with
-the pages — otherwise a board at `out/ft_demo/index.html` never appears in a listing at all,
-since the directory you are standing in has no HTML in it.
+Directories come first. Within each half the thing you came to open rises: a directory
+holding an `index.html` is served as that page, so it leads the directories and is marked as
+a **site** — otherwise a board at `out/ft_demo/index.html` never appears in a listing at all,
+since the directory you are standing in has no HTML in it. An HTML file leads the files for
+the same reason.
+
+The palette is a **theme**, chosen in the dashboard's settings and applied by the daemon, so
+every site it serves looks the same in every browser pointed at it. Five to start — `auto`
+(follows the system), `light`, `dark`, `paper`, `slate` — and adding one is a palette rather
+than a second copy of the layout, because every rule is written against a theme's custom
+properties. `[server] theme` sets the starting one; a later choice is remembered beside the
+control token rather than written back into your config file.
 
 Finding those costs one extra round trip per listing. It is spent on a directory view and
 never on a page load, and it is one batch however many subdirectories there are. The listings

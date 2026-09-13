@@ -34,6 +34,8 @@ interface Reply {
   hosts?: KnownHost[];
   unusable?: { host: string; why: string }[];
   url?: string;
+  current?: string;
+  themes?: { name: string; label: string }[];
 }
 
 function el<T extends HTMLElement>(id: string): T {
@@ -85,6 +87,23 @@ function clear(): HTMLElement {
 /// Re-fetched after anything that changes it rather than patched in place: the daemon is
 /// the one that knows what is open, and two ideas about that is one more than can be right.
 let latest: Reply = { ok: false, detail: "" };
+
+/// Which daemon to talk to.
+///
+/// Held here rather than read out of an input, because the input only exists on the
+/// settings view now. A page that had to find a field in order to know where to connect
+/// would stop being able to as soon as it was showing something else.
+let currentPort = 7391;
+
+/// Which render is the current one.
+///
+/// A view that awaits can finish after the reader has already gone somewhere else, and
+/// writing into the page then replaces whatever they are now looking at. Clicking back
+/// immediately after Connect did exactly that: the list appeared and was then overwritten
+/// by the settings screen the previous render was still finishing.
+///
+/// Every route bumps this; every render checks it is still the one before touching the DOM.
+let generation = 0;
 
 // ---------------------------------------------------------------------------
 // The list
@@ -156,6 +175,115 @@ function renderList(): void {
   for (const u of latest.unusable ?? []) {
     view.append(node("p", "note", `${u.host}: ${u.why}`));
   }
+
+  view.append(settingsLink());
+}
+
+/// The way into settings, and it has to exist on every screen.
+///
+/// Including the one that says nothing is listening: the port lives in settings, so a
+/// dashboard that hid the link when it could not connect would be unreachable for exactly
+/// the reader who needed it. That is how it first shipped, and the e2e run found it.
+function settingsLink(): HTMLElement {
+  const settings = document.createElement("a");
+  settings.className = "back";
+  settings.href = "#/config";
+  settings.id = "to-config";
+  settings.textContent = "Settings";
+  const line = document.createElement("p");
+  line.append(settings);
+  return line;
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+
+/// The daemon's settings, not the extension's.
+///
+/// Which is why they are here rather than in a browser preference: the theme decides what
+/// *the daemon* renders a directory listing as, and those pages are served to any browser
+/// pointed at it. Keeping the choice in one place is what stops two browsers disagreeing
+/// about what the same URL looks like.
+async function renderConfig(): Promise<void> {
+  const mine = generation;
+  const view = clear();
+
+  const back = document.createElement("a");
+  back.className = "back";
+  back.href = "#";
+  back.textContent = "← all sites";
+  view.append(back);
+
+  view.append(node("h2", "site-name", "settings"));
+
+  view.append(node("h2", "", "daemon"));
+  const port = document.createElement("div");
+  port.className = "act";
+  const input = document.createElement("input");
+  input.id = "port";
+  input.type = "number";
+  input.min = "1";
+  input.max = "65535";
+  input.value = String(currentPort);
+  input.setAttribute("aria-label", "port");
+  const use = document.createElement("button");
+  use.type = "button";
+  use.id = "use-port";
+  use.textContent = "Connect";
+  use.addEventListener("click", () => {
+    currentPort = Number(input.value);
+    // `start` routes when it is done, which re-renders whatever the reader is looking at by
+    // then. Calling `renderConfig` here instead would put the settings back over a list
+    // they had already navigated to.
+    void start();
+  });
+  port.append(input, use);
+  view.append(port);
+  view.append(node("p", "note", "Where the daemon is listening. The default is 7391."));
+
+  // Everything below needs the daemon, so it is below rather than above: a reader who came
+  // here because nothing was listening should meet the port field first, not an error.
+  const themes = await send({ kind: "theme" });
+  if (mine !== generation) {
+    return;
+  }
+  if (!themes.ok) {
+    view.append(node("p", "note", themes.detail));
+    return;
+  }
+
+  view.append(node("h2", "", "listings"));
+  const picker = document.createElement("div");
+  picker.className = "act";
+  const select = document.createElement("select");
+  select.id = "theme";
+  select.setAttribute("aria-label", "theme");
+  for (const t of themes.themes ?? []) {
+    const option = document.createElement("option");
+    option.value = t.name;
+    option.textContent = t.label;
+    option.selected = t.name === themes.current;
+    select.append(option);
+  }
+  select.addEventListener("change", () => {
+    void (async () => {
+      const chose = await send({ kind: "setTheme", name: select.value });
+      say(chose.detail, !chose.ok);
+    })();
+  });
+  picker.append(select);
+  view.append(picker);
+  view.append(
+    node(
+      "p",
+      "note",
+      "What a directory listing looks like. It is the daemon's setting, so it applies to " +
+        "every site it serves and to any browser pointed at them.",
+    ),
+  );
+
+  view.append(node("h2", "", "address bar"));
+  view.append(node("p", "note", "Type ssh, then Tab, then an alias and a path."));
 }
 
 /// Start serving a host, then go to its page.
@@ -193,6 +321,7 @@ function renderAlias(alias: string): void {
     // Reachable by going back to a site that has since been stopped, or by editing the
     // fragment. Saying which alias is missing beats an empty page.
     view.append(node("p", "empty", `${alias} is not being served.`));
+    view.append(settingsLink());
     return;
   }
 
@@ -277,6 +406,7 @@ function renderAlias(alias: string): void {
   view.append(
     node("p", "note", "Closes the ssh session. The site stops answering until it is served again."),
   );
+  view.append(settingsLink());
 }
 
 /// Close and reopen under a new root.
@@ -335,7 +465,13 @@ async function takeDown(alias: string, button: HTMLButtonElement): Promise<void>
 // ---------------------------------------------------------------------------
 
 function route(): void {
-  const alias = decodeURIComponent(location.hash.replace(/^#/, ""));
+  generation += 1;
+  const hash = location.hash.replace(/^#/, "");
+  if (hash === "/config") {
+    void renderConfig();
+    return;
+  }
+  const alias = decodeURIComponent(hash);
   if (alias === "") {
     renderList();
   } else {
@@ -355,17 +491,23 @@ async function refresh(): Promise<boolean> {
 }
 
 async function start(): Promise<void> {
-  const port = Number(el<HTMLInputElement>("port").value);
+  const port = currentPort;
   await chrome.storage.local.set({ port });
   say("looking for the daemon…");
 
   const reply = await send({ kind: "connect", port });
   if (!reply.ok || reply.suffix === undefined) {
     say(reply.detail, true);
-    clear();
+    el("daemon").textContent = "";
+    // Only when there is nothing else on screen. Calling this while the settings view is
+    // open would wipe the port field out from under somebody typing in it.
+    if (location.hash.replace(/^#/, "") !== "/config") {
+      const view = clear();
+      view.append(settingsLink());
+    }
     return;
   }
-  el("daemon").textContent = `${reply.detail} on 127.0.0.1:${port} · `;
+  el("daemon").textContent = `${reply.detail} on 127.0.0.1:${port}`;
   say("");
 
   // Registered only if the permission is already held. Asking for it needs a user gesture,
@@ -405,16 +547,12 @@ el("view").addEventListener(
 
 window.addEventListener("hashchange", route);
 
-el<HTMLInputElement>("port").addEventListener("change", () => {
-  void start();
-});
-
 // The port is read back first because it says *which* daemon to look for; checking before
 // reading it would check the wrong one and report it as absent.
 void (async () => {
   const { port } = (await chrome.storage.local.get("port")) as { port?: number };
   if (typeof port === "number") {
-    el<HTMLInputElement>("port").value = String(port);
+    currentPort = port;
   }
   await start();
 })();

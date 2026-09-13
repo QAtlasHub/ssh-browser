@@ -24,6 +24,12 @@ pub struct Server {
     pub port: Option<u16>,
     pub suffix: Option<String>,
     pub author: Option<String>,
+    /// What directory listings look like. See `crate::theme`.
+    ///
+    /// The starting value only: a theme chosen later from the dashboard is remembered
+    /// beside the token rather than written back here, because this file is hand-written
+    /// and a daemon that rewrote it would eventually lose somebody's comment.
+    pub theme: Option<String>,
     /// Accepted so that asking for `https` is refused rather than ignored.
     ///
     /// The https mode is designed and not built. Of the three things that could happen to a
@@ -297,6 +303,7 @@ base = "/home/me/public_html"
                 port: Some(1111),
                 suffix: Some("from-file".to_string()),
                 author: Some("from-file".to_string()),
+                theme: None,
                 scheme: None,
             },
             vec![],
@@ -321,6 +328,7 @@ base = "/home/me/public_html"
                 port: Some(1111),
                 suffix: Some("from-file".to_string()),
                 author: None,
+                theme: None,
                 scheme: None,
             },
             vec![],
