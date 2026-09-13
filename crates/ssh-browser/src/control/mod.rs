@@ -161,12 +161,21 @@ pub enum Source {
 /// login session that owned it ends. A config directory would keep it indefinitely, which is
 /// longer than anything here needs.
 fn token_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("token"))
+}
+
+/// Where this daemon keeps the small things it remembers between runs.
+///
+/// Shared with anything else that needs one rather than each picking its own: two
+/// directories chosen by two copies of this logic is how a setting gets written to one
+/// place and read from another.
+pub fn state_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .or_else(|| std::env::var_os("LOCALAPPDATA"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("ssh-browser").join("token"))
+    Some(base.join("ssh-browser"))
 }
 
 #[cfg(unix)]

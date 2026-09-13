@@ -9,6 +9,7 @@ pub mod origin;
 pub mod prefetch;
 pub mod sftp;
 pub mod ssh_config;
+pub mod theme;
 
 #[cfg(test)]
 mod testing;

@@ -68,6 +68,11 @@ try {
   await dashboard.screenshot({ path: join(OUT, "2-site.png") });
   console.log("  shots/2-site.png       one site: its URL, its root, and how to stop it");
 
+  await dashboard.click("#to-config");
+  await dashboard.waitForSelector("#theme");
+  await dashboard.screenshot({ path: join(OUT, "3-settings.png") });
+  console.log("  shots/3-settings.png   settings: what listings look like, and which daemon");
+
   // A note to photograph. Written through the control API rather than by driving the panel,
   // because the picture wanted is of a note being *shown*; how it got there is the subject of
   // the checks rather than of a listing.
@@ -99,8 +104,8 @@ try {
   const listing = await browser.newPage();
   await listing.setViewportSize(VIEW);
   await listing.goto(`http://${ALIAS}.${SUFFIX}/assets/`, { waitUntil: "networkidle" });
-  await listing.screenshot({ path: join(OUT, "3-listing.png") });
-  console.log("  shots/3-listing.png    a directory, at its own origin");
+  await listing.screenshot({ path: join(OUT, "5-listing.png") });
+  console.log("  shots/5-listing.png    a directory, at its own origin");
 } finally {
   await browser?.close();
   child.kill();

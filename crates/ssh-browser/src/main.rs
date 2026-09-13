@@ -7,6 +7,7 @@ use ssh_browser::config;
 use ssh_browser::control::{self, Token};
 use ssh_browser::origin::{Alias, Origin, pac};
 use ssh_browser::ssh_config;
+use ssh_browser::theme;
 
 const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--author NAME] [--new-token] [<alias>=<ssh-host>[:<base>] ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]
   ssh-browser hosts\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"~/docs\"   # or an absolute path; omit for the home directory itself";
@@ -66,6 +67,10 @@ async fn main() -> Result<()> {
         server: config::Server::default(),
         aliases: Vec::new(),
     });
+
+    // Read before `merge` consumes the file, because the theme is not an alias or a port
+    // and has no command-line half to be merged with.
+    let from_file_theme = from_file.server.theme.clone();
 
     let config::Resolved {
         port,
@@ -150,7 +155,13 @@ async fn main() -> Result<()> {
                 1 => eprintln!("taking 127.0.0.1:{port} and connecting over ssh..."),
                 n => eprintln!("taking 127.0.0.1:{port} and connecting {n} hosts over ssh..."),
             }
-            let bound = Origin::bind(aliases, suffix.clone(), port, token, author).await?;
+            // Precedence: a theme chosen from the dashboard, then the config file, then the
+            // default. The remembered one wins because it is the later decision -- somebody
+            // who picked a theme last week did so after writing the file.
+            let theme = theme::remembered()
+                .or_else(|| from_file_theme.clone())
+                .unwrap_or_else(|| theme::DEFAULT.to_string());
+            let bound = Origin::bind(aliases, suffix.clone(), port, token, author, theme).await?;
 
             // Everything from here is true by the time it is said. The routes come from
             // the bound origin rather than from the aliases, because an alias rooted at

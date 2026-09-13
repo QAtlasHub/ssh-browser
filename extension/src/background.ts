@@ -51,6 +51,8 @@ export interface Reply {
   skipped?: number;
   id?: string;
   open?: OpenAlias[];
+  current?: string;
+  themes?: { name: string; label: string }[];
   hosts?: KnownHost[];
   unusable?: { host: string; why: string }[];
   url?: string;
@@ -79,6 +81,8 @@ type Request =
   | { kind: "hosts" }
   | { kind: "open"; host: string; base?: string }
   | { kind: "close"; alias: string }
+  | { kind: "theme" }
+  | { kind: "setTheme"; name: string }
   | { kind: "disconnect" }
   | { kind: "status" }
   | { kind: "register"; suffix: string }
@@ -453,6 +457,47 @@ async function closeAlias(alias: string): Promise<Reply> {
   return { ok: true, detail: `${alias} is no longer served` };
 }
 
+/// What listings look like, and what else they could.
+///
+/// The list of themes comes from the daemon rather than being written out again here. Two
+/// copies of it is how a theme gets added and stays invisible.
+async function getTheme(): Promise<Reply> {
+  const s = await stored();
+  if (!s) {
+    return { ok: false, detail: "not connected" };
+  }
+  const res = await callDaemon(s, "/_control/theme");
+  if (!res.ok) {
+    return { ok: false, detail: `${res.status}: ${await res.text()}` };
+  }
+  const body = (await res.json()) as { current: string; themes: { name: string; label: string }[] };
+  return { ok: true, detail: "", current: body.current, themes: body.themes };
+}
+
+async function setTheme(name: string): Promise<Reply> {
+  const s = await stored();
+  if (!s) {
+    return { ok: false, detail: "not connected" };
+  }
+  const res = await callDaemon(s, "/_control/theme", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    return { ok: false, detail: await res.text() };
+  }
+  const body = (await res.json()) as { current: string; remembered: boolean };
+  return {
+    ok: true,
+    // Said outright when it will not survive a restart, because a setting that silently
+    // forgets is worse than one that was never offered.
+    detail: body.remembered
+      ? `listings are ${body.current}`
+      : `listings are ${body.current}, but it could not be remembered for next time`,
+    current: body.current,
+  };
+}
+
 async function listAnnotations(url: string): Promise<Reply> {
   const resolved = await resolveDoc(url);
   if (!resolved.ok) {
@@ -532,6 +577,10 @@ async function dispatch(message: unknown): Promise<Reply> {
       return openHost(message.host, message.base);
     case "close":
       return closeAlias(message.alias);
+    case "theme":
+      return getTheme();
+    case "setTheme":
+      return setTheme(message.name);
     case "disconnect":
       return disconnect();
     case "status":

@@ -33,7 +33,8 @@ export async function startDaemon(port) {
   // `<config dir>/ssh-browser/config.toml` happens to hold, so a run on a machine that
   // uses ssh-browser for real would connect to every host configured there: slower, and
   // failing for reasons that have nothing to do with the change under test.
-  const empty = join(await mkdtemp(join(tmpdir(), "ssh-browser-e2e-")), "config.toml");
+  const state = await mkdtemp(join(tmpdir(), "ssh-browser-e2e-"));
+  const empty = join(state, "config.toml");
   await writeFile(empty, "");
 
   const child = spawn(
@@ -43,7 +44,18 @@ export async function startDaemon(port) {
       "serve", "--config", empty, "--port", String(port),
       "--suffix", SUFFIX, `${ALIAS}=${HOST}:${BASE}`,
     ],
-    { stdio: ["ignore", "pipe", "pipe"] },
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      // The daemon remembers things between runs — the control token, and now the chosen
+      // theme — under whichever of these it finds first. Pointed at a temporary directory
+      // so a test run cannot change what the daemon somebody actually uses will start with.
+      env: {
+        ...process.env,
+        XDG_RUNTIME_DIR: state,
+        XDG_CONFIG_HOME: state,
+        LOCALAPPDATA: state,
+      },
+    },
   );
 
   let log = "";
@@ -162,10 +174,23 @@ export async function connectThroughDashboard(browser, port) {
   // the same arrival by the only route a test has.
   const dashboard = await browser.newPage();
   await dashboard.goto(`chrome-extension://${extensionId}/dashboard.html`);
+  // The port lives in settings now, which is where a reader would go to change it.
+  await dashboard.click("#to-config");
   await dashboard.fill("#port", String(port));
-  // Dispatched rather than relied upon: the dashboard re-runs on `change`, and whether
-  // `fill` emits one is Playwright's business rather than something this should depend on.
-  await dashboard.dispatchEvent("#port", "change");
+  await dashboard.click("#use-port");
+  // Waited for by port, not merely by the line being non-empty. On a machine already
+  // running a daemon on the default port the dashboard connects to *that* one on load, so
+  // "there is a daemon line" is true before the click and the wait returns immediately —
+  // and the list that follows is the other daemon's. Naming the port is what makes this
+  // wait about the thing it is waiting for.
+  await dashboard.waitForFunction(
+    (want) => (document.getElementById("daemon")?.textContent ?? "").includes(`:${want}`),
+    port,
+    { timeout: 20_000 },
+  );
+  // Connecting from settings leaves you in settings, which is right for a reader and wrong
+  // for a test that wants the sites. Going back is the click they would make.
+  await dashboard.click(".back");
 
   const deadline = Date.now() + 20_000;
   for (;;) {

@@ -409,6 +409,36 @@ async function main() {
       );
     }
 
+    // The theme is the daemon's setting, chosen from the dashboard, and what it decides is
+    // what a *listing* looks like. So the check goes the whole way: pick one here, then
+    // read the colour off a directory served on the alias origin. Anything short of that
+    // would pass with the choice going nowhere.
+    await dashboard.click("#to-config");
+    await dashboard.waitForSelector("#theme");
+    await dashboard.selectOption("#theme", "slate");
+    await dashboard.waitForFunction(
+      () => (document.getElementById("status")?.textContent ?? "").includes("slate"),
+      null,
+      { timeout: 10_000 },
+    );
+
+    // `assets/` rather than the root: the root has an index.html, so it serves that page
+    // rather than a listing, and a listing is what carries the theme.
+    const themed = await browser.newPage();
+    await themed.goto(`http://${ALIAS}.${SUFFIX}/assets/`, { waitUntil: "domcontentloaded" });
+    // From the root element, not the body: the theme paints `html` so the whole viewport is
+    // covered even when the listing is shorter than the window. Reading the body gives
+    // `rgba(0, 0, 0, 0)`, which is what this asked for first.
+    const painted = await themed.evaluate(
+      () => getComputedStyle(document.documentElement).backgroundColor,
+    );
+    await themed.close();
+    check("choosing a theme changes what a listing looks like", () =>
+      // slate's --bg. Read off the rendered page, so this fails if the variable is set and
+      // the layout does not use it just as surely as if the choice never arrived.
+      assert.equal(painted, "rgb(20, 24, 31)"),
+    );
+
     await dashboard.click(".back").catch(() => {});
 
     // A filename that needs percent-escaping, which is where the two directions of the
