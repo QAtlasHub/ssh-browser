@@ -315,43 +315,53 @@ async function main() {
     );
 
     console.log("\ninvariant 2, over a real transport");
-    // The unit test for this holds a fake remote and a three-byte fixture, so it revisits
-    // instantly and can never see the freshness window at all. This is the same claim against
-    // whatever host the run is pointed at, through the real SFTP transport, in a real browser.
+    // The unit test for this holds a fake remote and a three-byte fixture. This is the same
+    // claim against whatever host the run is pointed at, through the real SFTP transport.
     //
-    // The count comes from the daemon rather than from counting requests here: what the
-    // browser asks for and what the remote is asked for are different numbers on purpose, and
-    // counting here would measure the one that is supposed to be large.
+    // Not through the browser, deliberately. A browser revisit is a *different and stronger*
+    // claim — that a whole page costs nothing the second time — and it is not true: against a
+    // real host this fixture costs four round trips on a browser revisit, because a page
+    // fetches things no HTML scan can see and the freshness window is a wall clock a test has
+    // to race. A check asserting zero there asserts something nobody established. What
+    // invariant 2 actually says is about a request, and about a request it is exact.
+    //
+    // The count comes off `hello`, not `hosts`. `hosts` runs `ssh -G` once per configured
+    // host; sampled either side of a measurement it takes long enough to expire the very
+    // listings being measured. Not a hypothesis — the first version of this check used
+    // `hosts`, passed against a real host, and failed in CI for exactly that reason.
     const remoteTrips = async () => {
-      const res = await fetch(`http://127.0.0.1:${PORT}/_control/hosts`, {
+      const res = await fetch(`http://127.0.0.1:${PORT}/_control/hello`, {
         headers: { [TOKEN_HEADER]: token },
       });
-      assert.ok(res.ok, `/_control/hosts said ${res.status}`);
-      const { open } = await res.json();
-      return open.reduce((n, o) => n + o.trips, 0);
+      assert.ok(res.ok, `/_control/hello said ${res.status}`);
+      return (await res.json()).trips;
     };
 
-    const visit = await browser.newPage();
-    const target = `http://${ALIAS}.${SUFFIX}/index.html`;
-    await visit.goto(target, { waitUntil: "networkidle" });
-    const afterFirst = await remoteTrips();
-    // Away and back, which is a revisit. `reload()` is a different gesture — it tells the
-    // browser to re-fetch — and measuring it would not be measuring this claim.
-    await visit.goto("about:blank");
-    await visit.goto(target, { waitUntil: "networkidle" });
-    const afterSecond = await remoteTrips();
-    await visit.close();
+    /// What one request cost the remote, and what came back.
+    const costOf = async (path, headers = {}) => {
+      const before = await remoteTrips();
+      const res = await alias(path, { headers });
+      return { spent: (await remoteTrips()) - before, status: res.status, headers: res.headers };
+    };
 
-    check("the first visit costs the remote something", () =>
-      assert.ok(afterFirst > 0, `nothing was fetched at all (${afterFirst})`),
+    const cold = await costOf("/index.html");
+    const warm = await costOf("/index.html");
+    const sliced = await costOf("/index.html", { Range: "bytes=0-15" });
+    const validated = await costOf("/index.html", { "If-None-Match": cold.headers["etag"] });
+
+    check("the first read of a file costs the remote something", () =>
+      assert.ok(cold.spent > 0, `nothing was fetched at all (${cold.spent})`),
     );
-    check("and a revisit inside the freshness window costs it nothing", () =>
-      assert.equal(
-        afterSecond,
-        afterFirst,
-        "a revisit went to the remote, so it was not answered from cache",
-      ),
-    );
+    check("reading it again costs nothing", () => assert.equal(warm.spent, 0));
+    // Sliced out of the body already held rather than fetched.
+    check("and a range out of it costs nothing", () => {
+      assert.equal(sliced.status, 206);
+      assert.equal(sliced.spent, 0);
+    });
+    check("the browser's own validator is answered here, not there", () => {
+      assert.equal(validated.status, 304);
+      assert.equal(validated.spent, 0);
+    });
 
     console.log("\nwhat an http origin does not buy");
     // Measured rather than reasoned about, and pinned in both directions, because the README
