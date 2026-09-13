@@ -36,7 +36,12 @@ pub struct Server {
 struct AliasEntry {
     name: String,
     host: String,
-    base: String,
+    /// Omitted means the remote's home directory.
+    ///
+    /// The default that makes an alias worth writing at all: a host name and nothing
+    /// else. Resolved by asking the remote, in `Origin::bind`.
+    #[serde(default)]
+    base: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -71,7 +76,7 @@ pub fn parse(text: &str) -> Result<Config> {
 
     let mut aliases = Vec::with_capacity(doc.aliases.len());
     for entry in &doc.aliases {
-        aliases.push(Alias::new(&entry.name, &entry.host, &entry.base)?);
+        aliases.push(Alias::new(&entry.name, &entry.host, entry.base.as_deref())?);
     }
     Ok(Config {
         server: doc.server,
@@ -195,7 +200,7 @@ base = "/home/me/public_html"
         assert_eq!(c.server.author.as_deref(), Some("souta"));
         assert_eq!(c.aliases.len(), 2);
         assert_eq!(c.aliases[0].name(), "docs");
-        assert_eq!(c.aliases[1].base(), "/home/me/public_html");
+        assert_eq!(c.aliases[1].base(), Some("/home/me/public_html"));
     }
 
     #[test]
@@ -257,11 +262,27 @@ base = "/home/me/public_html"
 
     #[test]
     fn a_missing_alias_field_is_refused() {
-        assert!(parse("[[alias]]\nname = \"docs\"\nhost = \"h\"\n").is_err());
+        for bad in [
+            "[[alias]]\nhost = \"h\"\nbase = \"/srv\"\n",
+            "[[alias]]\nname = \"docs\"\nbase = \"/srv\"\n",
+        ] {
+            assert!(parse(bad).is_err(), "should have been refused:\n{bad}");
+        }
+    }
+
+    /// The short form, and the one worth typing: a name and a host, nothing else.
+    ///
+    /// `None` rather than a path, because where the home directory is lives on the remote.
+    /// Filling it in here would mean this machine's home directory, which belongs to a
+    /// different computer.
+    #[test]
+    fn an_alias_without_a_base_means_the_home_directory() {
+        let c = parse("[[alias]]\nname = \"docs\"\nhost = \"h\"\n").expect("parses");
+        assert_eq!(c.aliases[0].base(), None);
     }
 
     fn alias(name: &str, host: &str) -> Alias {
-        Alias::new(name, host, "/srv").expect("a valid alias")
+        Alias::new(name, host, Some("/srv")).expect("a valid alias")
     }
 
     fn file_with(server: Server, aliases: Vec<Alias>) -> Config {
@@ -360,9 +381,9 @@ base = "/home/me/public_html"
 
     #[test]
     fn two_aliases_with_one_name_are_refused() {
-        let docs = |host: &str| Alias::new("docs", host, "/srv").expect("valid");
+        let docs = |host: &str| Alias::new("docs", host, Some("/srv")).expect("valid");
         assert!(ensure_distinct(&[docs("a"), docs("b")]).is_err());
-        let other = Alias::new("other", "b", "/srv").expect("valid");
+        let other = Alias::new("other", "b", Some("/srv")).expect("valid");
         assert!(ensure_distinct(&[docs("a"), other]).is_ok());
     }
 

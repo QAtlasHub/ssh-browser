@@ -13,6 +13,18 @@ through a browser store and has not been submitted. No surface is stable.
 
 ### Added
 
+- `base` may be omitted, or written as `~` or `~/path`, and means the remote account's
+  home directory. Resolved by asking the remote with SFTP `REALPATH` once at startup,
+  because `~` is shell syntax and this transport never runs a shell — expanding it
+  locally would produce the wrong machine's home directory. An absolute base still costs
+  no round trip.
+- `ssh-browser hosts` lists what `~/.ssh/config` already knows how to reach, with the
+  user, hostname, port and `ProxyJump` that `ssh -G` resolves for each. `Include` is
+  followed; patterns like `Host *` are not hosts and are skipped; a name that cannot be a
+  hostname label is reported rather than silently dropped.
+- `GET /_control/hosts` answers the same list, plus whether this daemon is currently
+  serving each one. Answering it connects to nothing.
+
 - Names beginning with a dot are never served, at any depth, and do not appear in listings.
   An alias base is one origin, so a page under it can read everything else under it — the base
   is the blast radius, and on a home directory nearly everything worth stealing is behind a

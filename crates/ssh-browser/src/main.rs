@@ -6,8 +6,10 @@ use anyhow::{Context, Result, bail, ensure};
 use ssh_browser::config;
 use ssh_browser::control::{self, Token};
 use ssh_browser::origin::{Alias, Origin, pac};
+use ssh_browser::ssh_config;
 
-const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--author NAME] [--new-token] [<alias>=<ssh-host>:<base> ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"/srv/docs\"";
+const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--author NAME] [--new-token] [<alias>=<ssh-host>[:<base>] ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]
+  ssh-browser hosts\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"~/docs\"   # or an absolute path; omit for the home directory itself";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -73,6 +75,40 @@ async fn main() -> Result<()> {
     } = config::merge(cli, from_file, default_author())?;
 
     match command.as_str() {
+        // Prints what the extension's host list will show, so a host that does not
+        // appear there can be chased without a browser in the loop.
+        "hosts" => {
+            let found = ssh_config::read()?;
+            if found.hosts.is_empty() && found.unusable.is_empty() {
+                match ssh_config::default_path() {
+                    Some(path) => eprintln!("no hosts in {}", path.display()),
+                    None => eprintln!("no home directory, so no ssh_config to read"),
+                }
+            }
+            for host in &found.hosts {
+                // Resolved by asking ssh, so what is printed is what the transport will
+                // actually do rather than what a second parse of the file concluded.
+                let s = ssh_config::describe(&host.host).await?;
+                let mut parts = Vec::new();
+                if let Some(user) = &s.user {
+                    parts.push(format!("user {user}"));
+                }
+                if let Some(hostname) = &s.hostname {
+                    parts.push(format!("hostname {hostname}"));
+                }
+                if let Some(port) = s.port {
+                    parts.push(format!("port {port}"));
+                }
+                if let Some(jump) = &s.proxy_jump {
+                    parts.push(format!("via {jump}"));
+                }
+                println!("{:<16} {}", host.alias, parts.join("  "));
+            }
+            for skipped in &found.unusable {
+                eprintln!("skipped {}: {}", skipped.host, skipped.why);
+            }
+            Ok(())
+        }
         "pac" => {
             print!("{}", pac::script(&suffix, port)?);
             Ok(())
@@ -80,26 +116,8 @@ async fn main() -> Result<()> {
         "serve" => {
             ensure!(
                 !aliases.is_empty(),
-                "no aliases: give one as <alias>=<ssh-host>:<base>, or put them in a config file\n\n{USAGE}"
+                "no aliases: give one as <alias>=<ssh-host>[:<base>], or put them in a config file\n\n{USAGE}"
             );
-            // Built before the aliases are handed over, and printed after the listener
-            // exists. The old order announced "listening" first, which was a claim about
-            // something that had not happened: taking the port and connecting every host
-            // both happen inside `bind`, so a reader who acted on that line met a refused
-            // connection, and a port already in use produced the announcement followed by
-            // the error saying otherwise.
-            let routes: Vec<String> = aliases
-                .iter()
-                .map(|a| {
-                    format!(
-                        "  http://{}.{suffix}/  ->  {}:{}",
-                        a.name(),
-                        a.host(),
-                        a.base()
-                    )
-                })
-                .collect();
-
             let (token, source) = Token::load_or_generate(new_token)?;
             // Printed as well as written, because a first run has nowhere else to look.
             // To stderr so that piping the daemon's output does not carry it along.
@@ -131,15 +149,19 @@ async fn main() -> Result<()> {
             // handshake instead of a hang. It names the port as well as the hosts because
             // `bind` does both and either can fail: announcing only the ssh half put a
             // "connecting over ssh" line directly above an error about the port.
-            match routes.len() {
+            match aliases.len() {
                 1 => eprintln!("taking 127.0.0.1:{port} and connecting over ssh..."),
                 n => eprintln!("taking 127.0.0.1:{port} and connecting {n} hosts over ssh..."),
             }
             let bound = Origin::bind(aliases, suffix.clone(), port, token, author).await?;
 
-            // Everything from here is true by the time it is said.
+            // Everything from here is true by the time it is said. The routes come from
+            // the bound origin rather than from the aliases, because an alias rooted at
+            // the home directory does not know where it points until the remote has been
+            // asked, and announcing it as "home" would leave the reader to find out which
+            // directory that was.
             eprintln!("listening on 127.0.0.1:{port}");
-            for route in &routes {
+            for route in bound.routes() {
                 eprintln!("{route}");
             }
             eprintln!();
@@ -173,7 +195,10 @@ fn default_author() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Parse `<alias>=<ssh-host>:<absolute-base>`.
+/// Parse `<alias>=<ssh-host>[:<absolute-base>]`.
+///
+/// Without the base it means the remote's home directory, which is the short form worth
+/// typing and the one the extension generates.
 ///
 /// Splitting is this function's job; judging the parts is `Alias::new`'s, which is also what
 /// the configuration file goes through. The rules used to live here, where a second entry
@@ -181,9 +206,10 @@ fn default_author() -> String {
 fn parse_alias(spec: &str) -> Result<Alias> {
     let (name, rest) = spec
         .split_once('=')
-        .with_context(|| format!("expected <alias>=<ssh-host>:<base>, got {spec:?}"))?;
-    let (host, base) = rest
-        .split_once(':')
-        .with_context(|| format!("expected <ssh-host>:<base> after the =, got {rest:?}"))?;
+        .with_context(|| format!("expected <alias>=<ssh-host>[:<base>], got {spec:?}"))?;
+    let (host, base) = match rest.split_once(':') {
+        Some((host, base)) => (host, Some(base)),
+        None => (rest, None),
+    };
     Alias::new(name, host, base).with_context(|| format!("in {spec:?}"))
 }

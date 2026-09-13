@@ -14,7 +14,7 @@ use crate::fs::Entry;
 use crate::fs::sftp::SftpFs;
 use crate::sftp::wire::{
     Attrs, CLOSE, DATA, Dec, Enc, FXF_CREAT, HANDLE, INIT, MKDIR, NAME, OPEN, OPENDIR, READ,
-    READDIR, STATUS, VERSION, WRITE,
+    READDIR, REALPATH, STATUS, VERSION, WRITE,
 };
 use crate::sftp::{read_frame, write_frame};
 
@@ -65,11 +65,23 @@ pub struct FakeRemote {
     /// refusal a caller is entitled to read as an ordinary empty answer. The whole class of
     /// failures that must *not* read as empty therefore had no way to be exercised at all.
     refuses: HashMap<String, u32>,
+    /// What REALPATH of "." answers, if this remote has been told.
+    ///
+    /// Unset is a refusal rather than a plausible-looking default, so a test that
+    /// depends on the home directory has to say what it is. A default would let a test
+    /// pass while asserting nothing about the value it was handed.
+    home: Option<String>,
 }
 
 impl FakeRemote {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Declare what REALPATH of "." answers — the account's home directory.
+    pub fn home(mut self, path: &str) -> Self {
+        self.home = Some(path.to_string());
+        self
     }
 
     /// Refuse to open a directory, for a reason that is not absence.
@@ -272,6 +284,30 @@ where
                     }
                 }
                 (STATUS, status(id, SSH_FX_OK, "ok"))
+            }
+            REALPATH => {
+                d.str().expect("realpath path");
+                match &remote.home {
+                    // A one-entry NAME page, built by the same encoder a listing uses.
+                    // That is what v3 puts on the wire for this, and going through the
+                    // same encoder is what stops the client's decoder from being tested
+                    // against a shape only this file produces.
+                    Some(home) => (
+                        NAME,
+                        names(
+                            id,
+                            &[Entry {
+                                name: home.clone(),
+                                attrs: dir_attrs(),
+                                owner: remote.reached_as.clone(),
+                            }],
+                        ),
+                    ),
+                    None => (
+                        STATUS,
+                        status(id, 4, "this remote was not given a home directory"),
+                    ),
+                }
             }
             MKDIR => {
                 let path = utf8(d.str().expect("mkdir path"));
