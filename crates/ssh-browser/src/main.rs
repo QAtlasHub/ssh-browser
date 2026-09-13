@@ -4,10 +4,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
 use ssh_browser::config;
-use ssh_browser::control::Token;
+use ssh_browser::control::{self, Token};
 use ssh_browser::origin::{Alias, Origin, pac};
 
-const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--author NAME] [<alias>=<ssh-host>:<base> ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"/srv/docs\"";
+const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--author NAME] [--new-token] [<alias>=<ssh-host>:<base> ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"/srv/docs\"";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
 
     let mut named_config: Option<PathBuf> = None;
     let mut cli = config::Overrides::default();
+    let mut new_token = false;
 
     // Driven by an iterator rather than an index, so the number of tokens consumed is the
     // number actually taken. With a hand-kept counter, an arm that forgets its step silently
@@ -42,6 +43,9 @@ async fn main() -> Result<()> {
             "--author" => {
                 cli.author = Some(args.next().context("--author needs a value")?.clone());
             }
+            // A flag rather than a value, so it consumes nothing: rotating is a thing you
+            // do, not a thing you configure.
+            "--new-token" => new_token = true,
             spec => cli.aliases.push(parse_alias(spec)?),
         }
     }
@@ -96,13 +100,25 @@ async fn main() -> Result<()> {
                 })
                 .collect();
 
-            let token = Token::generate()?;
+            let (token, source) = Token::load_or_generate(new_token)?;
             // Printed as well as written, because a first run has nowhere else to look.
             // To stderr so that piping the daemon's output does not carry it along.
             eprintln!("control token: {}", token.as_str());
-            match token.write_to_disk() {
-                Some(path) => eprintln!("  also written to {}", path.display()),
-                None => eprintln!("  (could not be written to disk; copy it from above)"),
+            // Which of the two it is, said outright. Somebody who has already pasted this
+            // into a browser needs to know whether they must do it again, and comparing
+            // sixty-four hex characters by eye is not a way to find out.
+            match source {
+                control::Source::Reused(path) => eprintln!(
+                    "  unchanged since last time, from {} — a browser holding it is still connected",
+                    path.display()
+                ),
+                control::Source::Fresh(Some(path)) => eprintln!(
+                    "  new, and written to {} — paste it into the extension once",
+                    path.display()
+                ),
+                control::Source::Fresh(None) => {
+                    eprintln!("  new, and could not be written to disk; copy it from above");
+                }
             }
             eprintln!(
                 "  the extension sends it as {}",

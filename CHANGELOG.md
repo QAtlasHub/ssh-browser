@@ -11,6 +11,18 @@ through a browser store and has not been submitted. No surface is stable.
 
 ## [Unreleased]
 
+### Fixed
+
+- The control token is reused across daemon restarts instead of being regenerated every time.
+  It was already written to disk, so minting a new one each run took the risk of keeping it
+  there and threw away the only thing that risk buys — and it meant pasting sixty-four
+  characters into the extension every time the daemon came back, which made daily use of the
+  browser half impractical. `--new-token` rotates it deliberately, and the banner says which of
+  the two happened rather than leaving a reader to compare hex by eye.
+- A token file holding something that is not a token is replaced rather than trusted. Accepting
+  one would have produced a daemon nothing could authenticate against: a locked door with no
+  key, visible only as a 401 on every request.
+
 ## [0.0.1] - 2026-09-13
 
 Published to reserve the name, which also makes it the first version anyone can install.
