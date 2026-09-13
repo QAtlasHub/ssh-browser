@@ -13,7 +13,7 @@
 //! which `guard::classify` already separates from alias requests. A proxied request
 //! cannot arrive here at all.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
@@ -95,13 +95,65 @@ impl Token {
         restrict(&path);
         Some(path)
     }
+
+    /// Read a token back, if what is on disk is one.
+    ///
+    /// Length and alphabet are both checked. A file holding something else is not a token
+    /// however much one would like it to be, and accepting it would produce a daemon whose
+    /// token nothing can ever match — a locked door with no key, rather than an error.
+    fn from_disk(path: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let trimmed = text.trim();
+        let looks_right = trimmed.len() == TOKEN_BYTES * 2
+            && trimmed
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+        looks_right.then(|| Self(trimmed.to_string()))
+    }
+
+    /// The token this run will use: last run's, or a new one written down.
+    ///
+    /// Reused by default, because the alternative is what this did before and it made the
+    /// extension unusable. A fresh token every restart means pasting sixty-four characters
+    /// into a popup every time the daemon comes back — and the token was already being
+    /// written to disk, so regenerating took the risk of keeping it there and discarded the
+    /// only thing that risk buys.
+    ///
+    /// `rotate` mints a new one anyway, which is what to reach for if the old one leaked.
+    pub fn load_or_generate(rotate: bool) -> Result<(Self, Source)> {
+        if !rotate {
+            if let Some(path) = token_path() {
+                if let Some(token) = Self::from_disk(&path) {
+                    return Ok((token, Source::Reused(path)));
+                }
+            }
+        }
+        let token = Self::generate()?;
+        let written = token.write_to_disk();
+        Ok((token, Source::Fresh(written)))
+    }
+}
+
+/// Where the token this run is using came from.
+///
+/// Reported rather than left to be inferred, so the startup banner can say which happened.
+/// Otherwise a reader has to compare a hex string against whatever their browser is holding
+/// in order to find out whether they need to paste it again.
+pub enum Source {
+    /// Read back from a previous run, so a browser that already has it stays connected.
+    Reused(PathBuf),
+    /// Newly minted, and written where the path says — or nowhere, if that failed.
+    Fresh(Option<PathBuf>),
 }
 
 /// Where the token file goes, resolved at runtime rather than compiled in.
 ///
-/// The runtime directory is preferred on Unix because it is cleared on logout, which is
-/// the right lifetime for a token belonging to a running process. A config directory
-/// would keep a dead token around indefinitely.
+/// The runtime directory is preferred on Unix because it is cleared on logout. That used to
+/// be the whole argument — a token belonging to a running process should not outlive the
+/// session — and it still holds, but it now cuts the other way as well: the token survives a
+/// daemon restart, so a browser stays connected across one, and stops being valid when the
+/// login session that owned it ends. A config directory would keep it indefinitely, which is
+/// longer than anything here needs.
 fn token_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
@@ -304,6 +356,60 @@ mod tests {
         assert!(body.contains("\"max\":1"));
         assert!(body.contains("\"aliases\":[\"docs\"]"));
         assert!(body.contains("\"daemon\":\""));
+    }
+
+    /// A temporary file, named after the test so parallel runs cannot collide.
+    fn scratch(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("ssh-browser-token-{name}"));
+        std::fs::write(&path, contents).expect("a temp file");
+        path
+    }
+
+    /// The whole point of keeping it: a browser that has the token stays connected across a
+    /// restart, so nobody retypes sixty-four characters to get back to where they were.
+    #[test]
+    fn a_token_survives_the_round_trip_to_disk() {
+        let path = scratch("roundtrip", token().as_str());
+        let back = Token::from_disk(&path).expect("read back");
+        assert!(back.matches(token().as_str()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Anything that is not a token is not accepted as one. Taking it would produce a daemon
+    /// whose token nothing can ever match — a locked door with no key rather than an error,
+    /// and one that only shows up as a 401 on every request.
+    #[test]
+    fn a_file_that_is_not_a_token_is_refused() {
+        let cases = [
+            ("empty", ""),
+            ("short", "0123456789abcdef"),
+            ("long", &"a".repeat(65) as &str),
+            ("not-hex", &"z".repeat(64)),
+            // Uppercase would compare unequal to everything this ever generates, so it is
+            // refused rather than quietly accepted and never matched.
+            ("uppercase", &"A".repeat(64)),
+            ("a sentence", "this file used to hold a token"),
+        ];
+        for (name, contents) in cases {
+            let path = scratch(name, contents);
+            assert!(
+                Token::from_disk(&path).is_none(),
+                "{name:?} should not have read as a token"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Written with a trailing newline by an editor, or by anyone who opened it to look.
+    #[test]
+    fn surrounding_whitespace_does_not_spoil_it() {
+        let path = scratch("whitespace", &format!("\n  {}\t\n", token().as_str()));
+        assert!(
+            Token::from_disk(&path)
+                .expect("read back")
+                .matches(token().as_str())
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

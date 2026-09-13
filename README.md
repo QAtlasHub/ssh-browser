@@ -141,6 +141,19 @@ a file that asked for https is the one outcome that looks like success.
 `extension/dist`. Give it the port and the control token the daemon printed; it applies
 the PAC itself, so `--proxy-pac-url` is not needed as well.
 
+To use it day to day, in Brave or Chrome: turn on Developer mode in `brave://extensions`,
+Load unpacked, and point it at `extension/dist`. It stays across restarts. Start the daemon,
+click the toolbar icon, paste the port and token, and accept the permission prompt — it asks
+for `http://*.<your suffix>/*` and nothing wider.
+
+**That is a one-time paste.** The token is kept in the runtime directory and reused, so a
+daemon that comes back is the same daemon as far as the browser is concerned; the banner says
+`unchanged since last time` when that is what happened. `--new-token` rotates it, which is
+what to reach for if it leaked — and then the extension needs the new one.
+
+The permission prompt is the one step nothing here can test, because a permission bubble is
+browser chrome rather than page content. Everything after it is covered.
+
 The control token lives in the service worker and nowhere else. A page served from an
 alias origin is untrusted code, so content scripts ask the worker to act for them rather
 than being handed the token.
