@@ -172,17 +172,22 @@ daemon hands that to anything except a page — see [SECURITY.md](SECURITY.md).
 
 ### What a directory looks like
 
-An editor's file tree rather than a table: breadcrumbs for every level, dense rows with no
-rules between them, and a marker coloured by file type. Size and modification time on each
-entry; times are UTC, because SFTP reports seconds since the epoch and says nothing about a
-zone, and using this machine's would stamp a file with an offset belonging to a different
-computer.
+An editor's explorer. The whole path is expanded at once with the rest of every level
+beside it, folders have a twisty, each level has an indent guide, and the type is a coloured
+chip. Size and modification time on each entry; times are UTC, because SFTP reports seconds
+since the epoch and says nothing about a zone, and using this machine's would stamp a file
+with an offset belonging to a different computer.
+
+Expanding a folder fetches one level and puts it in place. But every row is a real link to a
+real URL, so a browser with no script at all walks the tree one directory at a time — the
+script is an enhancement, not the mechanism. Showing the ancestors costs nothing: the walk
+that resolved the path already fetched them to check for symlinks.
 
 Directories come first. Within each half the thing you came to open rises: a directory
 holding an `index.html` is served as that page, so it leads the directories and is marked as
-a **site** — otherwise a board at `out/ft_demo/index.html` never appears in a listing at all,
-since the directory you are standing in has no HTML in it. An HTML file leads the files for
-the same reason.
+a **site** — otherwise a board at `out/ft_demo/index.html` never appears at all, since the
+directory you are standing in has no HTML in it. An HTML file leads the files for the same
+reason.
 
 The palette is a **theme**, chosen in the dashboard's settings and applied by the daemon, so
 every site it serves looks the same in every browser pointed at it. Five to start — `auto`

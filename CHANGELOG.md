@@ -28,11 +28,18 @@ through a browser store and has not been submitted. No surface is stable.
   clicking a site opens that site's own page, where its root can be changed and it can be
   stopped. The framing is deployment because that is what the product is: a directory only
   reachable over ssh, made to look like a site on a host without being deployed to one.
-- Directory listings are an editor's file tree rather than a table: dense rows, no rules
-  between them, no headings, and a marker coloured by file type. Directories come first;
-  within each half the thing you came to open rises, so a site leads the directories and an
-  HTML file leads the files. The first attempt had upper-cased headings over each group and
-  a border under every row, which souta read as 「みずらい」.
+- A directory is an editor's explorer rather than a listing. The whole path is expanded at
+  once with the rest of every level beside it, folders have a twisty, each level has an
+  indent guide, and the type is a coloured chip. Directories come first; within each half
+  the thing you came to open rises, so a site leads the directories and an HTML file leads
+  the files.
+  Expanding a folder fetches one level and puts it in place — `?ls` on a directory returns
+  that level as the HTML fragment that goes inside it, so there is exactly one thing that
+  knows how a row is written rather than a second renderer in the page's script. It adds no
+  capability: a page under an alias can already read every path under it.
+  Every row is a real link, so a browser with no script walks the tree one directory at a
+  time exactly as before. Showing the ancestors costs nothing: the walk that resolved the
+  path already fetched them to check for symlinks.
 - **Themes.** `crate::theme` holds the palettes and the listing's rules are written entirely
   against their custom properties, so a new theme is a palette rather than a second copy of
   the layout. Five to start: `auto` (the default, following the system), `light`, `dark`,
@@ -86,6 +93,17 @@ through a browser store and has not been submitted. No surface is stable.
   `<img src>`.
 
 ### Fixed
+
+- A path could 404 with "cannot list" naming a directory that plainly existed. The walk
+  asked the cache whether a listing was there and then asked it for the listing, which is
+  two questions with a gap between them, and the listing cache expires after two seconds —
+  a request landing on the boundary got yes and then no. The listings are taken once and
+  held for the request now, so the gap is gone rather than narrowed. It showed up as about
+  one e2e run in six; a unit test with a zero-length TTL reproduces it every time.
+- A directory the remote refuses now answers with ssh's own reason and a `502` rather than
+  a `404` saying "cannot list", which was this daemon reporting that it did not know. A
+  component that is simply absent is still a plain `404`: absence is not a failure, and
+  blaming the remote for a path somebody typed wrong helps nobody.
 
 - The control token is reused across daemon restarts instead of being regenerated every time.
   It was already written to disk, so minting a new one each run took the risk of keeping it

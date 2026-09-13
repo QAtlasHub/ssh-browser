@@ -478,7 +478,8 @@ impl Origin {
                     .await
             }
             Ok(guard::Target::Alias { alias, path }) => {
-                self.alias(&method, alias, path, &cond).await
+                self.alias(&method, alias, path, &cond, query.as_deref())
+                    .await
             }
         }
     }
@@ -542,7 +543,8 @@ impl Origin {
         }
 
         let (alias, sub) = rest.split_once('/').unwrap_or((rest, ""));
-        self.alias(method, alias, &format!("/{sub}"), cond).await
+        self.alias(method, alias, &format!("/{sub}"), cond, query)
+            .await
     }
 
     async fn alias(
@@ -551,6 +553,7 @@ impl Origin {
         alias: &str,
         path: &str,
         cond: &Conditions,
+        query: Option<&str>,
     ) -> Response<Full<Bytes>> {
         // The alias origin is read-only, and says so rather than quietly serving a POST
         // as if it were a GET. The shape of this answer is part of the boundary: there
@@ -584,7 +587,9 @@ impl Origin {
         // can change it.
         let chain = components(&session.base, &file);
         if chain.is_empty() {
-            return self.autoindex_of(session, alias, path, &resolved).await;
+            return self
+                .autoindex_of(session, alias, path, &resolved, query)
+                .await;
         }
         let last = chain.len() - 1;
 
@@ -598,12 +603,21 @@ impl Origin {
             );
         }
 
-        self.warm_ancestor_listings(session, &chain).await;
+        let held = match self.listings_along(session, &chain).await {
+            Ok(held) => held,
+            // Whatever ssh said, rather than this daemon's word for not knowing.
+            Err((at, why)) => {
+                return fail(
+                    StatusCode::BAD_GATEWAY,
+                    format!("{path}: listing {at} failed: {why}"),
+                );
+            }
+        };
 
         // Symlinks are settled before anything else, so the answer cannot depend on
         // whether the target happens to exist: a symlink is refused either way, and
         // checking it separately is what lets the write path share exactly this rule.
-        if let Some(at) = self.first_symlink(&chain) {
+        if let Some(at) = first_symlink(&held, &chain) {
             return fail(
                 StatusCode::FORBIDDEN,
                 format!("refusing symlink at {at} (its target is not checked)"),
@@ -612,14 +626,13 @@ impl Origin {
 
         let mut found_last = None;
         for (i, (dir, name)) in chain.iter().enumerate() {
-            if !self.cache.has_listing(dir) {
-                return fail(StatusCode::NOT_FOUND, format!("{path}: cannot list {dir}"));
-            }
-            let Some(attrs) = self.cache.attrs_of(dir, name) else {
+            let Some(attrs) = attrs_in(&held, dir, name) else {
                 // Absent. For a directory request that only means there is no
                 // index.html, so fall through to a listing of the directory itself.
                 if i == last && wants_dir {
-                    return self.autoindex_of(session, alias, path, &resolved).await;
+                    return self
+                        .autoindex_of(session, alias, path, &resolved, query)
+                        .await;
                 }
                 return fail(StatusCode::NOT_FOUND, format!("not found: {path}"));
             };
@@ -639,7 +652,9 @@ impl Origin {
         if attrs.is_dir() {
             if wants_dir {
                 // `<dir>/index.html` is itself a directory. Fall back to a listing.
-                return self.autoindex_of(session, alias, path, &resolved).await;
+                return self
+                    .autoindex_of(session, alias, path, &resolved, query)
+                    .await;
             }
             // Without the trailing slash every relative link on the page below
             // would resolve one level too high.
@@ -781,8 +796,11 @@ impl Origin {
         };
 
         let chain = components(&session.base, &resolved);
-        self.warm_ancestor_listings(&session, &chain).await;
-        if let Some(at) = self.first_symlink(&chain) {
+        // A failure here shows up as the symlink check below finding nothing to check,
+        // and then as the write failing with the remote's own reason. There is no better
+        // answer to give from here.
+        let held = self.held_listings(&session, &chain).await;
+        if let Some(at) = first_symlink(&held, &chain) {
             return Err((StatusCode::FORBIDDEN, format!("refusing symlink at {at}")));
         }
         Ok((session, resolved))
@@ -1226,32 +1244,70 @@ impl Origin {
         alias: &str,
         path: &str,
         resolved: &str,
+        query: Option<&str>,
     ) -> Response<Full<Bytes>> {
-        // Taken from the resolved path rather than from the request, so the crumbs show a
+        // Taken from the resolved path rather than from the request, so the tree shows a
         // filename as it is spelled on disk rather than percent-escaped. `resolved` always
         // begins with the base, because that is what resolving it against the base means.
-        let rel = resolved.strip_prefix(&session.base).unwrap_or("");
-        let entries = match self.cache.listing_entries(resolved) {
-            Some(entries) => entries,
-            None => match session.fs.list_dir(resolved).await {
-                Ok(entries) => {
-                    self.cache.put_listing(resolved, &entries);
-                    entries
-                }
-                Err(e) => return fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}")),
-            },
+        let rel = resolved
+            .strip_prefix(&session.base)
+            .unwrap_or("")
+            .to_string();
+        let entries = match self.listing_of(session, resolved).await {
+            Ok(entries) => entries,
+            Err(e) => return fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}")),
         };
         let sites = self.sites_among(session, resolved, &entries).await;
+
+        // `?ls` is one level of the same tree, as the HTML fragment that goes inside it.
+        // It is what the tree fetches when a folder is expanded.
+        //
+        // A fragment rather than JSON so that there is exactly one thing that knows how a
+        // row is written. A JSON reply would mean a second renderer in the page's script,
+        // in another language, which is two places for a class name to be spelled and one
+        // of them to be spelled wrong.
+        //
+        // It is not a new capability either: a page under this alias can already read every
+        // path under it, and this says no more than the listing below does.
+        if query == Some("ls") {
+            let mut out = String::new();
+            render_level(&mut out, &rel, &rows_of(&entries, &sites), &[]);
+            return plain_ok("text/html; charset=utf-8", Bytes::from(out));
+        }
+
+        // The ancestors are already in the cache: the walk that resolved this path warmed
+        // every one of them to check for symlinks. So a tree opened four levels down costs
+        // no more round trips than the listing it replaces.
+        let mut levels = Vec::new();
+        let mut at = session.base.clone();
+        for part in rel.split('/').filter(|p| !p.is_empty()) {
+            if let Some(entries) = self.cache.listing_entries(&at) {
+                let here = at.strip_prefix(&session.base).unwrap_or("").to_string();
+                // Only the level the reader is standing in is scanned for sites, so only it
+                // can mark them. Scanning every level would multiply the one extra round
+                // trip by the depth of the path, which is the thing this is careful not to
+                // do; expanding a folder scans it, so a mark appears where you look.
+                levels.push((here, rows_of(&entries, &HashSet::new())));
+            }
+            at.push('/');
+            at.push_str(part);
+        }
+        levels.push((rel.clone(), rows_of(&entries, &sites)));
+
         plain_ok(
             "text/html; charset=utf-8",
-            Bytes::from(autoindex(
-                alias,
-                rel,
-                &entries,
-                &sites,
-                &self.theme.read().await,
-            )),
+            Bytes::from(autoindex(alias, &rel, &levels, &self.theme.read().await)),
         )
+    }
+
+    /// A directory's entries, from the cache when they are there.
+    async fn listing_of(&self, session: &Session, dir: &str) -> Result<Vec<Entry>> {
+        if let Some(entries) = self.cache.listing_entries(dir) {
+            return Ok(entries);
+        }
+        let entries = session.fs.list_dir(dir).await?;
+        self.cache.put_listing(dir, &entries);
+        Ok(entries)
     }
 
     /// Which of these subdirectories are themselves sites.
@@ -1379,7 +1435,7 @@ impl Origin {
             // this a page could get a directory behind a symlink listed purely by naming it,
             // and the symlink rule exists precisely so that the daemon does not go there.
             // The check runs again after the listings, for components not yet known.
-            if self.first_symlink(&chain).is_some() {
+            if self.first_symlink_cached(&chain).is_some() {
                 continue;
             }
             // And every directory this reference would cause to be listed has to be one the
@@ -1397,15 +1453,18 @@ impl Origin {
         }
 
         let all: Vec<(String, String)> = wanted.iter().flat_map(|(_, c)| c.clone()).collect();
-        self.warm_ancestor_listings(session, &all).await;
+        // Prefetching only ever makes a page faster, so a directory that would not list is
+        // not an error for the request that triggered it: the subresource is fetched the
+        // ordinary way afterwards and fails, or does not, on its own terms.
+        let held = self.held_listings(session, &all).await;
 
         let mut to_read = Vec::new();
         for (resolved, chain) in &wanted {
-            if self.first_symlink(chain).is_some() {
+            if first_symlink(&held, chain).is_some() {
                 continue;
             }
             let (dir, name) = &chain[chain.len() - 1];
-            let Some(attrs) = self.cache.attrs_of(dir, name) else {
+            let Some(attrs) = attrs_in(&held, dir, name) else {
                 continue;
             };
             if attrs.is_dir() {
@@ -1473,25 +1532,58 @@ impl Origin {
     /// One round trip regardless of depth, which is the whole reason `list_dirs` is a batch
     /// rather than a loop. A directory that cannot be listed is simply left absent from the
     /// cache; the caller diagnoses that against the path the request actually named.
-    async fn warm_ancestor_listings(&self, session: &Session, chain: &[(String, String)]) {
-        let mut missing: Vec<String> = chain
-            .iter()
-            .map(|(dir, _)| dir.clone())
-            .filter(|dir| !self.cache.has_listing(dir))
-            .collect();
-        // Deduplicated because the prefetcher passes the chains of many files at once, and
-        // several of them normally share a directory. Listing one twice in a batch costs no
-        // extra round trip but it does cost the remote the work.
-        missing.sort();
-        missing.dedup();
-        if missing.is_empty() {
-            return;
-        }
-        for (dir, result) in missing.iter().zip(session.fs.list_dirs(&missing).await) {
-            if let Ok(entries) = result {
-                self.cache.put_listing(dir, &entries);
+    /// Every directory along a path, taken out of the cache once and then held.
+    ///
+    /// Held, rather than looked up again as the walk goes. The cache has a two-second TTL,
+    /// so asking whether a listing is there and then asking for the listing are two
+    /// questions with a gap between them, and a request arriving on the boundary got `true`
+    /// for the first and `false` for the second. That produced a 404 reading "cannot list"
+    /// about a directory that plainly existed, on roughly one e2e run in six. Taking the
+    /// entries once removes the gap rather than narrowing it.
+    ///
+    /// A failure carries the remote's own reason out. It used to be dropped and reported as
+    /// "cannot list", which is this daemon saying it does not know rather than ssh saying
+    /// why — the difference between a message somebody can act on and one they cannot.
+    async fn listings_along(
+        &self,
+        session: &Session,
+        chain: &[(String, String)],
+    ) -> Result<HashMap<String, Vec<Entry>>, (String, String)> {
+        let mut held: HashMap<String, Vec<Entry>> = HashMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        for (dir, _) in chain {
+            if held.contains_key(dir) {
+                continue;
+            }
+            match self.cache.listing_entries(dir) {
+                Some(entries) => {
+                    held.insert(dir.clone(), entries);
+                }
+                // Deduplicated because the prefetcher passes the chains of many files at
+                // once and several of them normally share a directory. Listing one twice in
+                // a batch costs no extra round trip, but it does cost the remote the work.
+                None if !missing.contains(dir) => missing.push(dir.clone()),
+                None => {}
             }
         }
+        if missing.is_empty() {
+            return Ok(held);
+        }
+        for (dir, result) in missing.iter().zip(session.fs.list_dirs(&missing).await) {
+            match result {
+                Ok(entries) => {
+                    self.cache.put_listing(dir, &entries);
+                    held.insert(dir.clone(), entries);
+                }
+                // Absence is not a failure to report. A component that is not there, or
+                // that is a file being used as a directory, is a 404 and the walk says so
+                // on its own — answering 502 would blame the remote for a path the reader
+                // got wrong. Anything else is the remote refusing, and that reason travels.
+                Err(e) if crate::fs::is_absent(&e) => {}
+                Err(e) => return Err((dir.clone(), format!("{e:#}"))),
+            }
+        }
+        Ok(held)
     }
 
     /// Can this directory be listed without asking the remote to walk through a symlink?
@@ -1518,7 +1610,28 @@ impl Origin {
     /// Shared between reading and writing deliberately. A write that reached through a
     /// symlinked directory could place a file outside the alias base entirely, which is
     /// strictly worse than reading through one, so the two must not be able to drift apart.
-    fn first_symlink(&self, chain: &[(String, String)]) -> Option<String> {
+    /// The same walk for the write path, over listings held for the same reason.
+    ///
+    /// A failure leaves the symlink check with nothing to check, and the write then fails
+    /// with the remote's own reason. There is no better answer to give from here.
+    async fn held_listings(
+        &self,
+        session: &Session,
+        chain: &[(String, String)],
+    ) -> HashMap<String, Vec<Entry>> {
+        self.listings_along(session, chain)
+            .await
+            .unwrap_or_default()
+    }
+}
+
+impl Origin {
+    /// The symlink check over what is *already* cached and nothing more.
+    ///
+    /// The prefetcher runs this before it lists anything, so that a page cannot get a
+    /// directory behind a symlink listed purely by naming it. Deliberately not the held
+    /// version: the question here is what is known without asking.
+    fn first_symlink_cached(&self, chain: &[(String, String)]) -> Option<String> {
         chain.iter().find_map(|(dir, name)| {
             self.cache
                 .attrs_of(dir, name)
@@ -1526,7 +1639,24 @@ impl Origin {
                 .map(|_| format!("{dir}/{name}"))
         })
     }
+}
 
+/// One entry's attrs, out of the listings this request is holding.
+fn attrs_in(held: &HashMap<String, Vec<Entry>>, dir: &str, name: &str) -> Option<Attrs> {
+    held.get(dir)
+        .and_then(|entries| entries.iter().find(|e| e.name == name))
+        .map(|e| e.attrs)
+}
+
+fn first_symlink(held: &HashMap<String, Vec<Entry>>, chain: &[(String, String)]) -> Option<String> {
+    chain.iter().find_map(|(dir, name)| {
+        attrs_in(held, dir, name)
+            .filter(Attrs::is_symlink)
+            .map(|_| format!("{dir}/{name}"))
+    })
+}
+
+impl Origin {
     async fn alias_index(&self) -> String {
         let names = self.alias_names().await;
         let mut s = String::from(
@@ -1777,6 +1907,49 @@ fn hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 
+/// One entry of a directory, ready to be written into a row.
+struct Row {
+    name: String,
+    dir: bool,
+    /// Holds an `index.html`, so it is a site rather than a folder.
+    site: bool,
+    /// Absent for a directory, whose own size is its bookkeeping rather than its contents'.
+    size: Option<String>,
+    modified: Option<String>,
+    /// Which colour its marker takes.
+    kind: &'static str,
+}
+
+/// The rows of one directory, sorted and with the dot-names already gone.
+fn rows_of(entries: &[Entry], sites: &HashSet<String>) -> Vec<Row> {
+    let mut visible: Vec<&Entry> = entries
+        .iter()
+        // `.` and `..` are already gone by the time a path resolves; these are the real
+        // dot-names. Listing what the next click would be refused is worse than silence.
+        .filter(|e| e.name != "." && e.name != ".." && !hidden(&e.name))
+        .collect();
+    visible.sort_by(|a, b| (rank(a, sites), &a.name).cmp(&(rank(b, sites), &b.name)));
+
+    visible
+        .into_iter()
+        .map(|e| {
+            let dir = e.attrs.is_dir();
+            Row {
+                name: e.name.clone(),
+                dir,
+                site: dir && sites.contains(&e.name),
+                size: if dir {
+                    None
+                } else {
+                    e.attrs.size.map(human_size)
+                },
+                modified: e.attrs.mtime.map(utc_stamp),
+                kind: if dir { "dir" } else { family(&e.name) },
+            }
+        })
+        .collect()
+}
+
 /// Where an entry sorts, before its name is considered.
 ///
 /// Directories first and no headings over them — souta's call, and it is how a file tree
@@ -1887,160 +2060,179 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// The listing's layout.
 ///
-/// Written entirely against the custom properties a theme supplies, so a new palette is
-/// a new theme rather than a second copy of these rules. See `crate::theme`.
+/// Written entirely against the custom properties a theme supplies, so a new palette is a
+/// new theme rather than a second copy of these rules. See `crate::theme`.
 ///
-/// Inline, and this is the one page where that is right: it is the daemon's own, not the
-/// remote's. Nothing is ever added to a document the reader came for.
-///
-/// Dense rows, no rules between them, and no headings — an editor's file tree rather
-/// than a table. The first version had an upper-cased heading over each group and a border
-/// under every row, and souta's verdict was 「みずらい」.
+/// An editor's explorer: one line per entry, a twisty on the folders, an indent guide per
+/// level, and a coloured chip for the type. souta asked for this twice — a flat list of one
+/// directory is a listing, and what makes an explorer is the tree.
 const LISTING_CSS: &str = "\
 *{box-sizing:border-box}\
 html{background:var(--bg)}\
 body{color:var(--fg);font:13px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0}\
-header{background:var(--bg);border-bottom:1px solid var(--line);padding:9px 16px;\
-position:sticky;top:0;z-index:1}\
-nav{font-size:12px;overflow-wrap:anywhere}\
-nav a{color:var(--dim);text-decoration:none}\
-nav a:hover{color:var(--fg);text-decoration:underline}\
-nav a.here{color:var(--fg);font-weight:600}\
-nav i{color:var(--faint);font-style:normal;padding:0 5px}\
-main{padding:4px 0}\
-.row{align-items:center;color:inherit;display:grid;gap:10px;\
-grid-template-columns:16px 1fr auto auto;line-height:22px;padding:0 16px;\
-text-decoration:none}\
+header{align-items:baseline;background:var(--bg);border-bottom:1px solid var(--line);\
+display:flex;gap:6px;padding:7px 12px;position:sticky;top:0;z-index:1}\
+header b{font-size:12px;font-weight:600;letter-spacing:.04em}\
+header span{color:var(--dim);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\
+font-size:11px;overflow-wrap:anywhere}\
+#tree{padding:4px 0 40px}\
+ul{list-style:none;margin:0;padding:0}\
+li ul{border-left:1px solid var(--line);margin-left:15px}\
+li>ul{display:none}\
+li.open>ul{display:block}\
+.row{align-items:center;color:inherit;display:grid;gap:6px;\
+grid-template-columns:14px 14px 1fr auto auto;line-height:22px;padding-right:12px;\
+text-decoration:none;white-space:nowrap}\
 .row:hover{background:var(--hover)}\
-.row:focus-visible{background:var(--sel);outline:none}\
-.g{font-size:10px;line-height:1;text-align:center}\
-.dir .g{color:var(--dim)}\
-.site .g,.site .name{color:var(--accent)}\
-.site .name,.dir .name{font-weight:500}\
-.k-page .g,.k-page .name{color:var(--k-page)}\
-.k-doc .g{color:var(--k-doc)}\
-.k-data .g{color:var(--k-data)}\
-.k-code .g{color:var(--k-code)}\
-.k-media .g{color:var(--k-media)}\
-.k-plain .g{color:var(--k-plain)}\
-.name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\
+.row.here{background:var(--sel)}\
+.row:focus-visible{outline:1px solid var(--accent);outline-offset:-1px}\
+.tw{color:var(--dim);font-size:11px;line-height:22px;text-align:center;\
+transition:transform .1s linear}\
+li.open>.row .tw{transform:rotate(90deg)}\
+.ico{border-radius:2px;height:9px;justify-self:center;width:9px}\
+.dir>.ico{background:var(--dim);border-radius:1px 3px 3px 3px}\
+.site>.ico{background:var(--accent);border-radius:1px 3px 3px 3px}\
+.site>.name{color:var(--accent)}\
+.k-page>.ico{background:var(--k-page)}\
+.k-page>.name{color:var(--k-page)}\
+.k-doc>.ico{background:var(--k-doc)}\
+.k-data>.ico{background:var(--k-data)}\
+.k-code>.ico{background:var(--k-code)}\
+.k-media>.ico{background:var(--k-media)}\
+.k-plain>.ico{background:var(--k-plain)}\
+.name{overflow:hidden;text-overflow:ellipsis}\
 .size,.when{color:var(--faint);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\
-font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}\
-.size{min-width:4.5rem;text-align:right}\
-footer{border-top:1px solid var(--line);color:var(--faint);font-size:11px;\
-margin-top:6px;padding:8px 16px}\
-.empty{color:var(--faint);padding:14px 16px}\
-@media(max-width:560px){.when{display:none}.size{min-width:0}}";
+font-size:11px;font-variant-numeric:tabular-nums}\
+.size{text-align:right}\
+.row.busy .tw{opacity:.4}\
+.row.failed .when{color:var(--k-page)}\
+.empty{color:var(--faint);padding:10px 16px}\
+@media(max-width:620px){.when{display:none}}";
 
-/// A directory, as a page.
+/// Expanding a folder, and nothing else.
 ///
-/// `rel` is the decoded path below the alias base, so the crumbs can show what the reader
-/// typed rather than its percent-escaped spelling, and the links can be escaped once here.
-fn autoindex(
-    alias: &str,
-    rel: &str,
-    entries: &[Entry],
-    sites: &HashSet<String>,
-    theme: &str,
-) -> String {
-    let mut visible: Vec<&Entry> = entries
-        .iter()
-        // `.` and `..` are already gone by the time a path resolves; these are the real
-        // dot-names. Listing what the next click would be refused is worse than silence.
-        .filter(|e| e.name != "." && e.name != ".." && !hidden(&e.name))
-        .collect();
-    visible.sort_by(|a, b| (rank(a, sites), &a.name).cmp(&(rank(b, sites), &b.name)));
+/// The daemon's own page, so its script is the daemon's too — nothing is ever added to a
+/// document the reader came for. It is small because the server renders the rows: this asks
+/// for a level and puts it where it goes.
+///
+/// Without it every level costs a page load, and the tree still works that way: every row is
+/// a real link to a real URL, so a browser with no script at all walks the tree one
+/// directory at a time, exactly as the old listing did.
+const LISTING_JS: &str = "\
+const tree=document.getElementById('tree');\
+tree.addEventListener('click',async e=>{\
+const row=e.target.closest('a.row');\
+if(!row||row.dataset.dir!=='1')return;\
+e.preventDefault();\
+const li=row.parentElement;\
+if(li.querySelector(':scope>ul')){li.classList.toggle('open');mark(row);return;}\
+row.classList.add('busy');\
+try{\
+const res=await fetch(row.getAttribute('href')+'?ls');\
+if(!res.ok)throw new Error(res.status);\
+li.insertAdjacentHTML('beforeend',await res.text());\
+li.classList.add('open');mark(row);\
+}catch(err){row.classList.add('failed');\
+row.querySelector('.when').textContent='could not be listed: '+err.message;}\
+finally{row.classList.remove('busy');}\
+});\
+function mark(row){\
+for(const other of tree.querySelectorAll('a.row.here'))other.classList.remove('here');\
+row.classList.add('here');\
+history.replaceState(null,'',row.getAttribute('href'));\
+document.querySelector('header span').textContent=\
+decodeURIComponent(new URL(row.href).pathname);\
+}";
 
-    let segments: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
-    let title = if segments.is_empty() {
-        alias.to_string()
-    } else {
-        format!("{} \u{b7} {alias}", segments.join("/"))
-    };
+/// One level of the tree: a `<ul>` of rows, with the one on the path already expanded.
+///
+/// `open` is the rest of the path from here down, so a level knows which of its folders the
+/// reader is inside. Empty means nothing below is expanded, which is what `?ls` hands back
+/// for a folder somebody has just clicked.
+fn render_level(out: &mut String, path: &str, rows: &[Row], open: &[(String, Vec<Row>)]) {
+    out.push_str("<ul>");
+    for row in rows {
+        let here = format!("{path}/{}", row.name);
+        let deeper = open.first().filter(|(next, _)| *next == here);
 
+        out.push_str(if deeper.is_some() {
+            "<li class=\"open\">"
+        } else {
+            "<li>"
+        });
+        out.push_str("<a class=\"row ");
+        out.push_str(match (row.dir, row.site) {
+            // A directory holding an `index.html` is served *as* that page, so it is marked
+            // as somewhere to read rather than somewhere to look.
+            (true, true) => "site",
+            (true, false) => "dir",
+            (false, _) => row.kind,
+        });
+        // The deepest expanded folder is where the reader is, so the tree opens with it
+        // selected the way an explorer shows the file you have open.
+        if deeper.is_some() && open.len() == 1 {
+            out.push_str(" here");
+        }
+        out.push_str("\" href=\"");
+        out.push_str(path);
+        out.push('/');
+        out.push_str(&url_escape(&row.name));
+        if row.dir {
+            out.push('/');
+        }
+        // Read by the script to tell a folder from a file without picking through classes.
+        out.push_str(if row.dir {
+            "\" data-dir=\"1\"><span class=\"tw\">\u{25b8}</span>"
+        } else {
+            "\"><span class=\"tw\"></span>"
+        });
+        out.push_str("<span class=\"ico\"></span><span class=\"name\">");
+        out.push_str(&escape(&row.name));
+        out.push_str("</span><span class=\"size\">");
+        out.push_str(row.size.as_deref().unwrap_or(""));
+        out.push_str("</span><span class=\"when\">");
+        out.push_str(row.modified.as_deref().unwrap_or(""));
+        out.push_str("</span></a>");
+
+        if let Some((next, rows)) = deeper {
+            render_level(out, next, rows, &open[1..]);
+        }
+        out.push_str("</li>");
+    }
+    out.push_str("</ul>");
+}
+
+/// A directory, as a tree.
+///
+/// `levels` runs from the alias base down to where the reader is, each already sorted, so
+/// the page opens with the whole path expanded and the rest of every level beside it. They
+/// come out of the cache the path walk already filled, so the depth costs no round trips.
+fn autoindex(alias: &str, rel: &str, levels: &[(String, Vec<Row>)], theme: &str) -> String {
+    let shown = if rel.is_empty() { "/" } else { rel };
     let mut s = String::from("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     s.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
-    s.push_str(&escape(&title));
+    s.push_str(&escape(&format!("{shown} \u{b7} {alias}")));
     s.push_str("</title><style>");
     // The palette first, then the layout that reads it.
     s.push_str(&theme::css_for(theme));
     s.push_str(LISTING_CSS);
-    s.push_str("</style></head><body><header><nav>");
+    s.push_str("</style></head><body><header><b>");
+    s.push_str(&escape(alias));
+    s.push_str("</b><span>");
+    s.push_str(&escape(shown));
+    s.push_str("</span></header><div id=\"tree\">");
 
-    // The crumbs replace the lone `../` this used to carry. Every level is one click rather
-    // than one click each, and the alias is the root of them, so where you are is legible
-    // without reading the address bar.
-    let mut href = String::from("/");
-    s.push_str(&crumb(&href, alias, segments.is_empty()));
-    for (i, segment) in segments.iter().enumerate() {
-        href.push_str(&url_escape(segment));
-        href.push('/');
-        s.push_str("<i>/</i>");
-        s.push_str(&crumb(&href, segment, i + 1 == segments.len()));
-    }
-    s.push_str("</nav></header><main>");
-
-    if visible.is_empty() {
-        s.push_str("<p class=\"empty\">This directory is empty.</p>");
+    match levels.split_first() {
+        Some(((path, rows), rest)) if !rows.is_empty() => render_level(&mut s, path, rows, rest),
+        // An alias whose base holds nothing. Saying so beats a blank page, which reads as
+        // something having gone wrong.
+        _ => s.push_str("<p class=\"empty\">This directory is empty.</p>"),
     }
 
-    for e in &visible {
-        let is_dir = e.attrs.is_dir();
-        let site = is_dir && sites.contains(&e.name);
-        let slash = if is_dir { "/" } else { "" };
-
-        s.push_str("<a class=\"row ");
-        s.push_str(match (is_dir, site) {
-            // A directory holding an `index.html` is served *as* that page, so it is marked
-            // as somewhere to read rather than somewhere to look. It is the whole reason
-            // the scan above is paid for.
-            (true, true) => "site",
-            (true, false) => "dir",
-            (false, _) => family(&e.name),
-        });
-        s.push_str("\" href=\"");
-        s.push_str(&url_escape(&e.name));
-        s.push_str(slash);
-        // A triangle for something to walk into, a square for something to open. With the
-        // headings gone this glyph and its colour carry the whole distinction.
-        s.push_str("\"><span class=\"g\">");
-        s.push_str(if is_dir { "\u{25b8}" } else { "\u{25aa}" });
-        s.push_str("</span><span class=\"name\">");
-        s.push_str(&escape(&e.name));
-        s.push_str(slash);
-        s.push_str("</span><span class=\"size\">");
-        // A directory's size is its own bookkeeping rather than its contents', so printing
-        // it would say something true about a number nobody wants.
-        if !is_dir {
-            s.push_str(&e.attrs.size.map(human_size).unwrap_or_default());
-        }
-        s.push_str("</span><span class=\"when\">");
-        s.push_str(&e.attrs.mtime.map(utc_stamp).unwrap_or_default());
-        s.push_str("</span></a>");
-    }
-    s.push_str("</main>");
-
-    if !visible.is_empty() {
-        s.push_str("<footer>");
-        s.push_str(&visible.len().to_string());
-        s.push_str(if visible.len() == 1 {
-            " entry"
-        } else {
-            " entries"
-        });
-        s.push_str(" \u{b7} times are UTC</footer>");
-    }
-    s.push_str("</body></html>");
+    s.push_str("</div><script>");
+    s.push_str(LISTING_JS);
+    s.push_str("</script></body></html>");
     s
-}
-
-fn crumb(href: &str, text: &str, here: bool) -> String {
-    format!(
-        "<a{} href=\"{}\">{}</a>",
-        if here { " class=\"here\"" } else { "" },
-        escape(href),
-        escape(text)
-    )
 }
 
 /// Remote filenames are untrusted input that lands inside our own origin, so the
@@ -2132,6 +2324,10 @@ mod tests {
     /// Build an origin over an in-memory remote. The session is a real `SftpFs`, so
     /// the round trips counted below are the same ones production would pay.
     async fn origin_with(remote: FakeRemote) -> Origin {
+        origin_with_cache(remote, Cache::default()).await
+    }
+
+    async fn origin_with_cache(remote: FakeRemote, cache: Cache) -> Origin {
         let fs = remote.spawn().await;
         let mut sessions = HashMap::new();
         sessions.insert(
@@ -2146,7 +2342,7 @@ mod tests {
             suffix: "ssh-browser".to_string(),
             port: 7391,
             sessions: RwLock::new(sessions),
-            cache: Cache::default(),
+            cache,
             theme: RwLock::new(theme::DEFAULT.to_string()),
             token: Token::from_hex(TEST_TOKEN),
             author: "souta".to_string(),
@@ -2706,10 +2902,11 @@ mod tests {
         }
     }
 
-    /// A listing with nothing marked as a site, which is every test that is not about the
-    /// scan. The scan needs a remote; these do not.
+    /// One directory as a tree with nothing above it, which is every test that is not about
+    /// the ancestors or the site scan. Both of those need a remote; these do not.
     fn listing(alias: &str, rel: &str, entries: &[Entry]) -> String {
-        autoindex(alias, rel, entries, &HashSet::new(), theme::DEFAULT)
+        let levels = vec![(rel.to_string(), rows_of(entries, &HashSet::new()))];
+        autoindex(alias, rel, &levels, theme::DEFAULT)
     }
 
     #[test]
@@ -2767,7 +2964,7 @@ mod tests {
         // And it is coloured as one, which is the only signal left now that the headings
         // are gone.
         assert!(
-            page.contains("class=\"row k-page\" href=\"a.htm\""),
+            page.contains("class=\"row k-page\" href=\"/a.htm\""),
             "{page}"
         );
     }
@@ -2775,29 +2972,135 @@ mod tests {
     #[test]
     fn hrefs_are_url_escaped() {
         let page = listing("docs", "", &[entry("a b#c.html", false)]);
-        assert!(page.contains("href=\"a%20b%23c.html\""));
+        assert!(page.contains("href=\"/a%20b%23c.html\""));
     }
 
-    /// Every level is one click, and the alias is the root of them. The old listing
-    /// carried a lone `../`, so climbing three levels took three page loads.
+    /// The header says where you are. An explorer does not make you read the address bar
+    /// to know which folder you are looking at.
     #[test]
-    fn the_crumbs_name_every_level_and_start_at_the_alias() {
-        let page = listing("panza", "/Vault/infra/Pinax.jl", &[]);
-        assert!(page.contains("href=\"/\">panza</a>"), "{page}");
-        assert!(page.contains("href=\"/Vault/\">Vault</a>"), "{page}");
-        assert!(page.contains("href=\"/Vault/infra/\">infra</a>"), "{page}");
+    fn the_header_names_the_alias_and_where_you_are() {
+        let page = listing("panza", "/Vault/infra", &[]);
+        assert!(page.contains("<b>panza</b>"), "{page}");
+        assert!(page.contains("<span>/Vault/infra</span>"), "{page}");
+    }
+
+    /// The point of a tree rather than a listing: every level of the path is open at once,
+    /// with the rest of each level beside it, and the deepest is the one selected.
+    ///
+    /// It costs no round trips beyond the listing it replaces, because the walk that
+    /// resolved the path warmed every ancestor to check it for symlinks — see
+    /// `the_tree_costs_what_one_directory_cost`.
+    #[tokio::test]
+    async fn the_whole_path_is_expanded_and_the_deepest_is_selected() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir("/srv", vec![("a", dir_attrs()), ("elsewhere", dir_attrs())])
+                .dir("/srv/a", vec![("b", dir_attrs()), ("sibling", dir_attrs())])
+                .dir("/srv/a/b", vec![("leaf.txt", file_attrs(3, 1))])
+                .dir("/srv/elsewhere", vec![])
+                .dir("/srv/a/sibling", vec![]),
+        )
+        .await;
+
+        let body = String::from_utf8(
+            body_of(origin.handle(get("/a/b/", None)).await)
+                .await
+                .to_vec(),
+        )
+        .expect("utf-8");
+
+        // Both levels of the path are open...
+        assert!(body.contains("<li class=\"open\">"), "{body}");
+        assert!(body.contains("href=\"/a/\""), "{body}");
+        // ...the deepest is the one marked as where the reader is...
+        assert!(body.contains("row dir here\" href=\"/a/b/\""), "{body}");
+        // ...what is inside it is rendered...
+        assert!(body.contains("leaf.txt"), "{body}");
+        // ...and so is everything beside it on the way down, which is what makes this a
+        // tree rather than one directory at a time.
+        assert!(body.contains("elsewhere"), "{body}");
+        assert!(body.contains("sibling"), "{body}");
+    }
+
+    /// The tree is four levels of listing, and it must cost what one level cost. Every
+    /// ancestor was already fetched to check it for symlinks, so showing them is free; a
+    /// version that went and asked again would pay for the depth twice.
+    #[tokio::test]
+    async fn the_tree_costs_what_one_directory_cost() {
+        let deep = origin_with(deep_tree()).await;
+        let before = trips(&deep).await;
+        assert_eq!(
+            deep.handle(get("/a/b/c/", None)).await.status(),
+            StatusCode::OK
+        );
+        let four = trips(&deep).await - before;
+
+        let shallow = origin_with(one_page()).await;
+        let before = trips(&shallow).await;
+        assert_eq!(
+            shallow.handle(get("/", None)).await.status(),
+            StatusCode::OK
+        );
+        let one = trips(&shallow).await - before;
+
+        // The slack absorbs a flush of fire-and-forget CLOSE requests landing on either
+        // side of the measurement. Asking per level would cost about four times as many.
         assert!(
-            page.contains("class=\"here\" href=\"/Vault/infra/Pinax.jl/\">Pinax.jl</a>"),
-            "the last crumb is where you are: {page}"
+            four <= one + 2,
+            "a tree four deep cost {four} round trips against {one} for one directory"
         );
     }
 
-    /// A name needing escapes appears decoded in the crumb and escaped in its href. The
-    /// two used to be the same string, which is how one of them was always wrong.
-    #[test]
-    fn a_crumb_reads_as_the_name_and_links_as_the_escape() {
-        let page = listing("docs", "/a b/c", &[]);
-        assert!(page.contains("href=\"/a%20b/\">a b</a>"), "{page}");
+    /// What the script asks for when a folder is expanded: the same level, as the fragment
+    /// that goes inside it. One renderer, so the two cannot disagree about what a row is.
+    #[tokio::test]
+    async fn asking_for_one_level_answers_with_its_rows() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir("/srv", vec![("sub", dir_attrs())])
+                .dir("/srv/sub", vec![("inner.md", file_attrs(4, 1))]),
+        )
+        .await;
+
+        let req = Request::builder()
+            .uri("http://docs.ssh-browser/sub/?ls")
+            .header(HOST, "docs.ssh-browser")
+            .body(Empty::<Bytes>::new())
+            .expect("request builds");
+        let res = origin.handle(req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = String::from_utf8(body_of(res).await.to_vec()).expect("utf-8");
+        // A fragment, so it can be inserted where it belongs rather than replacing a page.
+        assert!(body.starts_with("<ul>"), "{body}");
+        assert!(!body.contains("<html"), "{body}");
+        // Built against the level it was asked about, so the href works from anywhere.
+        assert!(body.contains("href=\"/sub/inner.md\""), "{body}");
+    }
+
+    /// It adds no capability. Everything `?ls` says is already in the page it belongs to,
+    /// and a dot-name is refused here exactly as it is everywhere else.
+    #[tokio::test]
+    async fn asking_for_one_level_does_not_mention_dot_names() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir("/srv", vec![("sub", dir_attrs())])
+                .dir(
+                    "/srv/sub",
+                    vec![("shown.md", file_attrs(4, 1)), (".hidden", dir_attrs())],
+                ),
+        )
+        .await;
+
+        let req = Request::builder()
+            .uri("http://docs.ssh-browser/sub/?ls")
+            .header(HOST, "docs.ssh-browser")
+            .body(Empty::<Bytes>::new())
+            .expect("request builds");
+        let body =
+            String::from_utf8(body_of(origin.handle(req).await).await.to_vec()).expect("utf-8");
+        assert!(body.contains("shown.md"), "{body}");
+        assert!(!body.contains(".hidden"), "{body}");
     }
 
     #[test]
@@ -3723,7 +4026,7 @@ mod tests {
         // Marked, so it reads as somewhere to open rather than somewhere to look. With no
         // headings left, the class and its colour are the whole signal.
         assert!(
-            body.contains("class=\"row site\" href=\"ft-demo/\""),
+            body.contains("class=\"row site\" href=\"/ft-demo/\""),
             "{body}"
         );
         let demo = body.find("ft-demo/").expect("the site listed");
@@ -3781,6 +4084,54 @@ mod tests {
             trips(&origin).await,
             before,
             "the listing the scan fetched should still be the one that answers"
+        );
+    }
+
+    /// The race a two-second TTL made possible, forced to happen every time.
+    ///
+    /// The walk used to ask the cache whether a listing was there and then ask it for the
+    /// listing. Those are two questions with a gap between them, and a request landing on
+    /// the expiry boundary got yes and then no -- a 404 reading "cannot list" about a
+    /// directory that plainly existed, on about one e2e run in six. With a TTL of zero
+    /// every read misses, so the gap is guaranteed rather than occasional.
+    ///
+    /// It passes because the listings are taken once and held for the request. Nothing here
+    /// can make them expire, because nothing re-reads them.
+    #[tokio::test]
+    async fn a_listing_that_expires_mid_request_does_not_lose_the_path() {
+        let origin =
+            origin_with_cache(deep_tree(), Cache::new(std::time::Duration::ZERO, 1 << 20)).await;
+        assert_eq!(
+            origin.handle(get("/a/b/c/d.html", None)).await.status(),
+            StatusCode::OK,
+            "a path four deep must survive its own listings expiring"
+        );
+        // And a directory too, which is the one that builds a tree out of them.
+        assert_eq!(
+            origin.handle(get("/a/b/c/", None)).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    /// The other half: a refusal that is not absence carries ssh's own words out, rather
+    /// than this daemon's word for not knowing.
+    #[tokio::test]
+    async fn a_directory_the_remote_refuses_says_why() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir("/srv", vec![("locked", dir_attrs())])
+                // 3 is SSH_FX_PERMISSION_DENIED: refused, and not for being absent.
+                .refuses_listing("/srv/locked", 3),
+        )
+        .await;
+
+        let res = origin.handle(get("/locked/x.html", None)).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let said = String::from_utf8(body_of(res).await.to_vec()).expect("utf-8");
+        assert!(said.contains("/srv/locked"), "{said}");
+        assert!(
+            !said.contains("cannot list"),
+            "the old wording said nothing the reader could act on: {said}"
         );
     }
 }
