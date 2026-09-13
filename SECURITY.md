@@ -153,8 +153,5 @@ to then refuse it. The prefetcher applies the same rule, so a page naming `.ssh/
 an `<img src>` cannot get it read on the strength of the request that would refuse it never
 being made.
 
-The annotation sidecar is itself a dot directory and is unaffected: annotations are read
-through the control API, which does not come this way.
-
 This is not a permission system. Everything else under the base is readable by anything else
 under the base, and that is what an origin means.

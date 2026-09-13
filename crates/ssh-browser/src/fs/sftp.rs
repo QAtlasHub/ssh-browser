@@ -130,10 +130,9 @@ fn decode_names(payload: &[u8]) -> Result<Vec<Entry>> {
 /// The handle from an OPEN or OPENDIR reply, or an error carrying why the remote said no.
 ///
 /// The status code is decoded rather than dropped. It is the only thing separating "there is
-/// no such directory" — the ordinary answer for every document nobody has annotated — from a
-/// permission problem or a session that has gone away. A caller handed one undifferentiated
-/// error has to guess, and the guess that looks safe turns every remote failure into an empty
-/// page.
+/// no such path" — the ordinary answer for a link a page got wrong — from a permission problem
+/// or a session that has gone away. A caller handed one undifferentiated error has to guess,
+/// and the guess that looks safe turns every remote failure into an empty page.
 fn handle_from(r: &Reply, what: &str) -> Result<Vec<u8>> {
     if r.kind != HANDLE {
         let why = match Dec::new(r.payload()).u32() {

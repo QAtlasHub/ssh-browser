@@ -5,10 +5,12 @@ Open files on an SSH host as a real browser origin. No web server on the remote,
 ## Why not just mount it
 
 Viewing remote HTML is not a file-access problem, it is an origin problem. Under `file://` the origin is
-opaque, so ES modules, `fetch`, XHR and service workers all fail — an sshfs mount does not give you a
-working page. SFTP file managers preview content but hand the page a sandbox rather than an origin.
-`http://127.0.0.1` is a potentially-trustworthy origin by spec, so a local HTTP server needs no
-certificate and still unlocks all of it.
+opaque, so ES modules, `fetch` and XHR all fail — an sshfs mount does not give you a working page. SFTP
+file managers preview content but hand the page a sandbox rather than an origin. An http origin fixes
+all three and needs no certificate.
+
+It does not fix everything, and the limit is worth knowing before you point this at a site — see
+[what an http origin does not buy](#what-an-http-origin-does-not-buy).
 
 `rclone serve http :sftp:host:/path` is the closest existing answer. Three gaps:
 
@@ -78,6 +80,31 @@ and throws away the origin you asked for.
 `http` needs no certificate. `https` does, so it arrives separately and behind a CA
 whose `nameConstraints` limit it to the suffix: a leaked key then cannot
 impersonate anything else, which is not true of a stock mkcert CA.
+
+## What an http origin does not buy
+
+An alias origin is plain http on a name that is not loopback, so it is not a potentially trustworthy
+origin and the secure-context APIs are simply not there. Measured, both ways:
+
+|                    | `http://alias.ssh-browser` | `http://127.0.0.1:7391` |
+| ------------------ | -------------------------- | ----------------------- |
+| `isSecureContext`  | no                         | yes                     |
+| service workers    | absent                     | present                 |
+| `crypto.subtle`    | absent                     | present                 |
+| `caches`           | absent                     | present                 |
+| IndexedDB          | present                    | present                 |
+
+The two modes trade against each other. Aliases give you origin separation: `a.ssh-browser` cannot read
+`b.ssh-browser`. The loopback fallback is a secure context, because 127.0.0.1 is potentially trustworthy
+by spec — but it puts every alias in one origin, so any page on one host can read every other. Neither
+gives both.
+
+Pick loopback if the page needs a service worker or WebCrypto and you only ever open one host. Pick
+aliases otherwise, which is the default. `https` is what would give both, and is why it is designed
+rather than dropped.
+
+A page that only wants ES modules, `fetch`, XHR, `localStorage` or IndexedDB is unaffected — that is
+most of them, and all of what `file://` breaks.
 
 ## Usage
 
@@ -270,15 +297,6 @@ There used to be an annotation feature here, writing per-author logs into a side
 directory. It is gone. A site that wants notes should have notes built into it; this is for
 seeing that site work.
 
-Four things are said rather than hidden, because each one means somebody's note is not
-saying what it appears to say:
-
-- **unanchored** — neither selector could place it on this page.
-- **drifted** — the quoted text is gone and it was placed by character position instead, so
-  it is sitting on whatever occupies those offsets now.
-- **misattributed** — the log's filename claims an author the file's owner contradicts.
-- **unreadable** — a log line the daemon could not parse.
-
 ### Verified in a browser
 
 `e2e/` opens the same bytes twice — once through the daemon and once over `file://` — and
@@ -306,23 +324,18 @@ Verified that way against Brave 152 and against a real host, extension included.
 announcing `listening on 127.0.0.1:PORT` before it had taken the port.
 
 The extension is in the harness too, loaded unpacked into the same browser. The dashboard
-connects and lists what is served, clicking a site opens its page and clicking through to the
-site lands on the alias origin with the remote's own index page, the content script runs on
-an alias page, and a note written through the control API comes back and anchors — on a filename with a space in it, which is where the read and
-write paths once disagreed about which document they meant.
+connects and lists what is served, clicking a site opens its page, and clicking through to the
+site lands on the alias origin with the remote's own index page.
 
 The harness covers, in one run: the PAC's routing decisions; the refusals (`403` for a
 rebinding `Host`, `403` for percent-encoded traversal, `405` for writing to an alias origin,
 `401` without a control token, `405` for a preflight, and no CORS headers anywhere); serving
 (weak validator, `304` on revisit, directory listing, `301` for a missing trailing slash,
-`206` for a byte range); the browser comparison above; and the extension.
+`206` for a byte range); the browser comparison above; what an alias origin does and does not
+get, against the loopback fallback in the same run; and the extension.
 
-One thing it does not cover: the permission *request*. The dashboard asks for the alias
-hosts on the first click in it, and that raises a permission bubble, which is browser chrome
-a test cannot click. The harness grants the permission up front instead, so everything downstream of the
-grant is exercised for real and the asking is not.
-
-Not there yet: collaborative editing of documents themselves.
+There is no permission prompt to leave uncovered: the extension asks for `http://127.0.0.1/*`
+at install and nothing else, ever.
 
 ```
 cargo run --example measure-roundtrips -- <ssh-host> [remote-dir]

@@ -91,7 +91,7 @@ async function stored(): Promise<Settings | null> {
     return null;
   }
   // Missing aliases are an empty list rather than a refusal: they only feed the omnibox, and
-  // state written by a build from before they were stored must not stop annotations working.
+  // state written by a build from before they were stored must not stop the daemon connecting.
   const raw: unknown = got["aliases"];
   const aliases = Array.isArray(raw) ? raw.filter((a): a is string => typeof a === "string") : [];
   return { port, token, suffix, aliases };

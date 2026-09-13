@@ -145,6 +145,18 @@ async function inspect(page) {
   }));
 }
 
+/// Stop the daemon and wait for it to actually go.
+///
+/// Idempotent on purpose. The cleanup in `finally` runs whether or not a check stopped it
+/// already, and `once(child, "exit")` on a process that has already exited waits for an
+/// event that will never fire again: the run printed every check as passing and then exited
+/// 13 for an unsettled top-level await, which is a red CI run naming no failure.
+async function stop(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill();
+  await once(child, "exit").catch(() => {});
+}
+
 async function main() {
   const { child, token, log } = await startDaemon(PORT);
   const profile = await mkdtemp(join(tmpdir(), "ssh-browser-e2e-"));
@@ -301,6 +313,49 @@ async function main() {
     check("but the stylesheet still applied, so this is about origin and not about access", () =>
       assert.equal(local.headingColour, "rgb(0, 128, 64)"),
     );
+
+    console.log("\nwhat an http origin does not buy");
+    // Measured rather than reasoned about, and pinned in both directions, because the README
+    // used to imply this fixes everything `file://` breaks. It does not: an alias origin is
+    // plain http on a name that is not loopback, so it is not a potentially trustworthy
+    // origin and the secure-context APIs are simply absent from it.
+    //
+    // The comparison that makes it sharp is the no-proxy fallback on 127.0.0.1, which *is*
+    // loopback and therefore *is* a secure context. The two modes trade against each other:
+    // aliases give origin separation, loopback gives secure context, and neither gives both
+    // until the https mode is built.
+    const surface = () => ({
+      secure: window.isSecureContext,
+      serviceWorker: "serviceWorker" in navigator,
+      subtle: typeof crypto !== "undefined" && crypto.subtle !== undefined,
+      caches: typeof caches !== "undefined",
+      indexedDB: typeof indexedDB !== "undefined",
+    });
+
+    const ctx = await browser.newPage();
+    await ctx.goto(`http://${ALIAS}.${SUFFIX}/`, { waitUntil: "domcontentloaded" });
+    const onAlias = await ctx.evaluate(surface);
+    await ctx.goto(`http://127.0.0.1:${PORT}/${ALIAS}/`, { waitUntil: "domcontentloaded" });
+    const onLoopback = await ctx.evaluate(surface);
+    await ctx.close();
+
+    check("an alias origin is not a secure context, so these are absent", () => {
+      assert.equal(onAlias.secure, false);
+      assert.equal(onAlias.serviceWorker, false);
+      assert.equal(onAlias.subtle, false);
+      assert.equal(onAlias.caches, false);
+    });
+    // Said separately because it is the part that still works, and a page relying on it is
+    // fine either way.
+    check("but storage that is not gated on it still is", () =>
+      assert.equal(onAlias.indexedDB, true),
+    );
+    check("the loopback fallback is a secure context, and has all of them", () => {
+      assert.equal(onLoopback.secure, true);
+      assert.equal(onLoopback.serviceWorker, true);
+      assert.equal(onLoopback.subtle, true);
+      assert.equal(onLoopback.caches, true);
+    });
 
     console.log("\nthe tree");
     const tree = await browser.newPage();
@@ -494,14 +549,26 @@ async function main() {
     // install it with no daemon anywhere. It used to be one red line naming a command they
     // had never heard of.
     //
-    // Storage is cleared first so this is a genuine first run whatever else is on the
-    // machine: a stored suffix is what tells the two apart, and on a developer's box there
-    // is usually a daemon already answering on the default port. This goes last because it
-    // throws that state away.
+    // Two things have to be true at once, and each needs arranging. Nothing may be
+    // answering — so the harness's own daemon is stopped, rather than hoping no daemon is
+    // running, which on a developer's box is usually false. And nothing may be remembered —
+    // so storage is cleared, since a stored suffix is what tells a first run from a daemon
+    // that has merely stopped.
+    //
+    // The port is then put back deliberately. Clearing storage alone would send the
+    // dashboard to the default 7391, which is exactly the port a developer's own daemon is
+    // on: the check would pass in CI and fail on the machine where it was written. Pointing
+    // it at the port we just released is the only one guaranteed to refuse.
+    //
+    // This goes last because it throws that state away.
+    await stop(child);
     const worker =
       browser.serviceWorkers()[0] ??
       (await browser.waitForEvent("serviceworker", { timeout: 20_000 }));
-    await worker.evaluate(() => chrome.storage.local.clear());
+    await worker.evaluate(async (port) => {
+      await chrome.storage.local.clear();
+      await chrome.storage.local.set({ port });
+    }, PORT);
     await dashboard.goto(dashboard.url().replace(/#.*$/, ""));
     await dashboard.waitForSelector(".cmd", { timeout: 20_000 });
     const firstRun = await dashboard.evaluate(() => ({
@@ -525,8 +592,7 @@ async function main() {
     console.error(log());
   } finally {
     await browser?.close();
-    child.kill();
-    await once(child, "exit").catch(() => {});
+    await stop(child);
     await rm(profile, { recursive: true, force: true }).catch(() => {});
     await rm(extension, { recursive: true, force: true }).catch(() => {});
   }

@@ -6,19 +6,18 @@ body:
   - type: markdown
     attributes:
       value: |
-        ssh-browser has a deliberately narrow scope: read, annotate and edit files on a host reachable only over SSH, without installing anything on that host. No telemetry, no self-update. Out-of-scope ideas are welcome in Discussions instead.
+        ssh-browser has a deliberately narrow scope: serve files from a host reachable only over SSH as a real browser origin, without installing anything on that host and without writing to it. No telemetry, no self-update. Out-of-scope ideas are welcome in Discussions instead.
   - type: dropdown
-    id: phase-target
+    id: area
     attributes:
-      label: "Phase target"
-      description: "Which Phase would this feature land in?"
+      label: "Area"
+      description: "Which half would this land in?"
       options:
-        - Phase 1 (resolver/sources)
-        - Phase 2 (store)
-        - Phase 3 (MCP)
-        - Phase 4 (Tier 2)
-        - Phase 5+ (TDM)
-        - Phase 7 (optional features)
+        - daemon - SSH/SFTP transport
+        - daemon - the http origin (serving, caching, prefetch)
+        - daemon - the directory tree and its themes
+        - extension - dashboard, PAC, omnibox
+        - packaging and release
         - unknown
     validations:
       required: true
@@ -48,7 +47,9 @@ body:
     attributes:
       label: "Scope sanity"
       options:
-        - label: "This fits what ssh-browser is for: reading, annotating and editing files on a host reachable only over SSH"
+        - label: "This fits what ssh-browser is for: seeing a site on an SSH-only host work, without deploying it there"
           required: true
         - label: "This does not introduce telemetry / phone-home / self-update"
+          required: true
+        - label: "This does not write anything to the remote host"
           required: true
