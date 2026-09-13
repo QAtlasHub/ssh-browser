@@ -40,12 +40,16 @@ through a browser store and has not been submitted. No surface is stable.
   Every row is a real link, so a browser with no script walks the tree one directory at a
   time exactly as before. Showing the ancestors costs nothing: the walk that resolved the
   path already fetched them to check for symlinks.
-- **Themes.** `crate::theme` holds the palettes and the listing's rules are written entirely
-  against their custom properties, so a new theme is a palette rather than a second copy of
-  the layout. Five to start: `auto` (the default, following the system), `light`, `dark`,
-  `paper`, `slate`. `[server] theme` sets the starting one; `GET`/`POST /_control/theme`
-  reads and changes it while the daemon runs, and a change is remembered beside the control
-  token rather than written back into the hand-written config file.
+- **Themes are base16 schemes**, vendored from `tinted-theming/schemes` under its MIT
+  licence, with the mapping from base16's sixteen slots to this listing's custom properties
+  written out in `crates/ssh-browser/themes/README.md`. Seventeen to start, in light and
+  dark pairs: Default, GitHub, Catppuccin, Gruvbox, Solarized, Rosé Pine, One, plus Nord,
+  Tokyo Night and Dracula. `auto` follows the system with base16's own reference pair.
+  Adding a scheme is dropping a file in and adding a line — the stylesheet is written
+  entirely against the properties, so a palette is never a second copy of the layout.
+  `[server] theme` sets the starting one; `GET`/`POST /_control/theme` reads and changes it
+  while the daemon runs, and a change is remembered beside the control token rather than
+  written back into the hand-written config file.
 - The dashboard has a settings screen: the theme, and which port the daemon is on. Reachable
   from every screen, including the one that says nothing is listening — the port lives there,
   so hiding the link when the daemon is unreachable locked out exactly the reader who needed
