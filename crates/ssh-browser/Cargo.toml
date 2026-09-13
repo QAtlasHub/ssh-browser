@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../../README.md"
-keywords = ["ssh", "sftp", "browser", "proxy", "annotation"]
+keywords = ["ssh", "sftp", "browser", "proxy", "origin"]
 # What it does, and what it is once installed. Both are true, and a daemon nobody starts
 # from a shell would be neither.
 categories = ["network-programming", "command-line-utilities"]

@@ -15,8 +15,8 @@ pub mod sftp;
 ///
 /// The reason has to survive the trip. Without it every failed listing looks alike, and a
 /// caller that wants to treat "there is no such directory" as an ordinary empty answer ends
-/// up treating a dead session and a permission problem that way too — which is how a
-/// document's annotations come to read as "nobody has annotated this".
+/// up treating a dead session and a permission problem that way too — which is how a remote
+/// that has stopped answering comes to render as a directory with nothing in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Refused {
     pub status: u32,

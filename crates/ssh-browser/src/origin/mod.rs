@@ -1554,7 +1554,7 @@ fn components(base: &str, file: &str) -> Vec<(String, String)> {
     out
 }
 
-/// An annotation is a note, not a file upload.
+/// A control body is a host name or a theme name, not a file upload.
 ///
 /// `Limited` errors once the cap is passed rather than truncating, so a body that was too
 /// large cannot be quietly parsed as a shorter one.
@@ -1716,9 +1716,6 @@ fn redirect(to: &str) -> Response<Full<Bytes>> {
 /// almost everything worth stealing sits behind a dot: `.ssh`, `.aws`, `.netrc`, a `.git`
 /// whose remote URL carries a token. Refusing them costs a reader nearly nothing, and it is
 /// what makes pointing an alias at a home directory a reasonable thing to do at all.
-///
-/// The annotation sidecar is itself a dot directory and is unaffected, because annotations are
-/// read through the control API and never arrive here.
 fn hidden(name: &str) -> bool {
     name.starts_with('.')
 }
