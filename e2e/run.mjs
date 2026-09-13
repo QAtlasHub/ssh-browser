@@ -36,6 +36,7 @@ import {
   ALIAS,
   SUFFIX,
   TOKEN_HEADER,
+  browserOptions,
   connectThroughPopup,
   extensionWithPermissionGranted,
   loadExtension,
@@ -222,33 +223,32 @@ async function main() {
     });
 
     browser = await chromium.launchPersistentContext(profile, {
-      // channel: "chromium" rather than the bundled headless shell: an MV3 service worker
-      // does not start in the old headless mode at all, so the extension half of this harness
-      // silently has nothing to talk to.
-      channel: "chromium",
-      headless: true,
+      ...browserOptions(),
       // Not `--proxy-pac-url`: Playwright replaces it with its own proxy configuration, so a
       // page that loaded under it would prove nothing. Pointing at the daemon directly is what
       // the PAC resolves to anyway, and the PAC itself is checked above.
       proxy: { server: `http://127.0.0.1:${PORT}` },
       args: loadExtension(extension),
-      ...(process.env["SSH_BROWSER_E2E_BROWSER"]
-        ? { executablePath: process.env["SSH_BROWSER_E2E_BROWSER"] }
-        : {}),
     });
 
     const page = await browser.newPage();
     // Kept so a failure says what the browser complained about rather than only that a marker
     // was not set: a CORS refusal and a 404 look identical in the DOM.
     const complaints = [];
+    // Every browser asks for a favicon nobody put there, and the daemon correctly answers 404.
+    // Reported, that line appears on every single run and looks exactly like a real 404 would
+    // — so the noise would be the thing hiding the signal.
+    const expected = (url) => url.endsWith("/favicon.ico");
     page.on("console", (m) => {
-      if (m.type() === "error") {
+      // The generic "Failed to load resource" carries no URL, so it cannot be told apart from
+      // the favicon. The response handler below reports the same failures with one attached.
+      if (m.type() === "error" && !m.text().startsWith("Failed to load resource")) {
         complaints.push(m.text());
       }
     });
     page.on("pageerror", (e) => complaints.push(String(e.message)));
     page.on("response", (r) => {
-      if (r.status() >= 400) {
+      if (r.status() >= 400 && !expected(r.url())) {
         complaints.push(`${r.status()} ${r.url()}`);
       }
     });

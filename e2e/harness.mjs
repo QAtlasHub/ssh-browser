@@ -86,6 +86,35 @@ export async function extensionWithPermissionGranted() {
   return dir;
 }
 
+/// Which browser to launch, and whether to show it.
+///
+/// `channel` and `executablePath` are mutually exclusive in Playwright, so naming a browser
+/// *replaces* the channel rather than joining it. Passing both is an error — which is exactly
+/// what pointing this at a real Brave used to produce, because the option was spread onto a
+/// launch that already named a channel. It had therefore never once worked.
+///
+/// Naming a browser also turns headless off unless told otherwise, because the reason to point
+/// this at the browser you actually use is to watch it. `SSH_BROWSER_E2E_HEADLESS=1` overrides
+/// that, and `SSH_BROWSER_E2E_HEADED=1` shows the bundled one.
+///
+/// Either way the profile is a fresh temporary directory and your own is never opened. This
+/// loads an unpacked extension and points the browser's proxy at a local daemon, and neither
+/// belongs in the browser you keep your life in.
+export function browserOptions() {
+  const named = process.env["SSH_BROWSER_E2E_BROWSER"];
+  const headless = named
+    ? process.env["SSH_BROWSER_E2E_HEADLESS"] === "1"
+    : process.env["SSH_BROWSER_E2E_HEADED"] !== "1";
+
+  return {
+    // The bundled default resolves to a headless shell that cannot run an extension at all,
+    // and an MV3 service worker does not start in the old headless mode either — so when
+    // nothing is named, ask for the full browser by channel.
+    ...(named ? { executablePath: named } : { channel: "chromium" }),
+    headless,
+  };
+}
+
 /// Chromium arguments that load an unpacked extension.
 ///
 /// Paired with `channel: "chromium"` at every call site, because an MV3 service worker does

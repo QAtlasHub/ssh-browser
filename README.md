@@ -211,7 +211,12 @@ read. A stylesheet and an image load fine from `file://`. Scripts and `fetch` ar
 break, and those are what a modern page is built out of.
 
 It runs in CI against a local `sshd` and can be pointed at a real host with
-`SSH_BROWSER_E2E_HOST` and `SSH_BROWSER_E2E_BASE`. Run against one, it caught the daemon
+`SSH_BROWSER_E2E_HOST` and `SSH_BROWSER_E2E_BASE`, and at a browser you actually use with
+`SSH_BROWSER_E2E_BROWSER` — which then runs visibly, because the reason to point it at your own
+Brave is to watch it. It always uses a throwaway profile: loading an unpacked extension and
+repointing the proxy are not things to do to the browser you keep your life in.
+
+Verified that way against Brave 152 and against a real host, extension included. Run against one, it caught the daemon
 announcing `listening on 127.0.0.1:PORT` before it had taken the port.
 
 The extension is in the harness too, loaded unpacked into the same browser. The popup
