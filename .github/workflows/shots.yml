@@ -1,0 +1,78 @@
+name: shots
+
+# Photograph the product for the Chrome Web Store listing, somewhere with nothing to leak.
+#
+# The images are not the reason this runs in CI; the *machine* is. The dashboard lists every
+# host your ssh can reach, with the user, address, port and jump host `ssh -G` resolves for
+# each, and above that what is being served, with the account and path it is rooted at. Taken
+# on a developer's own laptop, that is their infrastructure in a picture whose destination is a
+# public listing page. It happened once, which is why this file exists.
+#
+# A fresh runner has none of it: a throwaway sshd on loopback, `e2e/tree` as the site, and the
+# invented ssh_config in `e2e/shots-config/`. What comes out is a photograph of the product
+# rather than of whoever took it, and it is the same picture every time.
+#
+#   gh workflow run shots.yml
+#   gh run download <id> -n store-screenshots
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shots:
+    name: screenshots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          cache-bin: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            e2e/package-lock.json
+            extension/package-lock.json
+
+      - name: Local sshd
+        # The same arrangement the e2e job uses. The daemon only ever speaks to a host through
+        # `ssh -s sftp`, so the site in the picture is served over a real transport.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 700 ~/.ssh
+          chmod 600 ~/.ssh/authorized_keys
+          sudo systemctl start ssh || sudo service ssh start
+          ssh-keyscan -H localhost >> ~/.ssh/known_hosts
+
+      - name: An ssh_config with nobody's hosts in it
+        # Copied over the runner's, which has none, rather than pointed at with `HOME`: moving
+        # `HOME` would also move the keys the sshd above was just given.
+        #
+        # `ssh -G` resolves these without connecting to anything, which is all the dashboard
+        # needs in order to list them -- so they can be as invented as they look.
+        run: cp e2e/shots-config/.ssh/config ~/.ssh/config
+
+      - run: cargo build --bin ssh-browser
+      - run: npm --prefix extension ci
+      - run: npm --prefix extension run build
+      - run: npm --prefix e2e ci
+      - run: npm --prefix e2e run browser
+      - run: npm --prefix e2e run shots
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: store-screenshots
+          path: e2e/shots/
+          if-no-files-found: error

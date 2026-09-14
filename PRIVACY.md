@@ -38,8 +38,9 @@ Nothing is written to your host. The daemon has no write path: the SFTP requests
 are `OPEN`, `CLOSE`, `READ`, `OPENDIR`, `READDIR` and `REALPATH`, and the only open flag it
 defines is read.
 
-You can check rather than take this on trust: `extension/src/background.ts` contains exactly
-one `fetch`, in `callDaemon`, and its URL begins `http://127.0.0.1:`.
+You can check rather than take this on trust: `extension/src/background.ts` contains three
+`fetch` calls — the control API, the proxy script, and the token on first connect — and each
+of their URLs begins `http://127.0.0.1:`. There are none anywhere else in the extension.
 
 ## What it does not do
 
@@ -57,6 +58,12 @@ one `fetch`, in `callDaemon`, and its URL begins `http://127.0.0.1:`.
 - **`http://127.0.0.1/*`** — talking to your daemon. It is the only host the extension is
   allowed to reach, and there is no optional permission to grant later: it never asks to run
   on the sites you open.
+
+One more manifest entry is worth naming even though it is not a permission. The dashboard is
+listed as reachable from `http://<suffix>/` — the page your daemon serves at the root of your
+configured suffix, whose only job is to send you to the dashboard. That one origin serves
+nothing else. Pages served from a host are a different origin and are refused it, which is the
+point of listing one rather than all.
 
 ## Removing it
 

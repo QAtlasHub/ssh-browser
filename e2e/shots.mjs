@@ -20,6 +20,7 @@ import { chromium } from "playwright";
 
 import {
   ALIAS,
+  HOST,
   SUFFIX,
   browserOptions,
   connectThroughDashboard,
@@ -35,7 +36,26 @@ const OUT = join(import.meta.dirname, "shots");
 /// not a speck in one corner.
 const VIEW = { width: 1280, height: 800 };
 
-// The fuller of the two fixtures: a heading, an image and a script that ran.
+// Refused against anything but a local host, and this is not tidiness.
+//
+// The dashboard's second section lists the hosts ssh can reach, with the user, address, port
+// and jump host `ssh -G` resolved for each; the first lists what is being served, with the
+// account and path it is rooted at. Run against a real machine that is six accounts, three
+// addresses, two jump hosts and somebody's home directory — in an image whose destination is a
+// public store page. It was run that way once, which is why this is here.
+//
+// `shots.yml` runs it on a fresh runner with a throwaway sshd and the invented ssh_config in
+// `shots-config/`, so the picture is of the product rather than of whoever took it.
+if (HOST !== "localhost" && HOST !== "127.0.0.1" && !process.env["SSH_BROWSER_SHOTS_ANY_HOST"]) {
+  console.error(
+    `refusing to photograph ${HOST}: these images go on a public listing, and the dashboard\n` +
+      `shows the accounts, addresses, ports and jump hosts of every host your ssh can reach.\n\n` +
+      `Run them where everything is invented:\n` +
+      `  gh workflow run shots.yml\n\n` +
+      `To override anyway, knowing what is in frame: SSH_BROWSER_SHOTS_ANY_HOST=1`,
+  );
+  process.exit(2);
+}
 
 const { child } = await startDaemon(PORT);
 const profile = await mkdtemp(join(tmpdir(), "ssh-browser-shots-"));
