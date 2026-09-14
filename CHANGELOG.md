@@ -9,6 +9,92 @@ The two halves ship through different channels, and only one of them has shipped
 is on crates.io as [`ssh-browser`](https://crates.io/crates/ssh-browser); the extension goes
 through a browser store and has not been submitted. No surface is stable.
 
+## [0.4.0] - 2026-09-14
+
+### Added
+
+- **`--scheme https`, so an alias origin is a secure context.** This is what the http mode cannot
+  give: over https, `https://alias.ssh-browser` reports `isSecureContext` and has service workers,
+  `crypto.subtle` and `CacheStorage` — while still being one origin per host, which the loopback
+  fallback is not. Measured through the daemon against a real SSH host, in a browser that was not
+  told to ignore anything.
+  A browser will not send an https request to a proxy in the clear, so the daemon answers
+  `CONNECT <alias>.<suffix>:443` and terminates TLS inside the tunnel. Requests arriving there are
+  ordinary origin-form GETs with a `Host`, so they go through the same handler, the same guards and
+  the same cache as http: https is a property of the socket rather than a second server.
+  What the tunnel may reach is a guard, not a detail — a proxy on loopback is reachable by every
+  process on the machine and every page in the browser. Only a name this daemon serves, only port
+  443, and both checked before the https mode is consulted, so they hold under http too and a
+  refusal does not leak whether a certificate exists.
+- **A certificate authority that can only vouch for one suffix.** Nobody will issue a certificate
+  for `alias.ssh-browser`, so the daemon makes its own — and the whole question is what that could
+  do if its key leaked. A stock local CA, which is what `mkcert` installs, could impersonate any
+  site on the internet. This one carries `nameConstraints` with a single permitted subtree, so a
+  leaked key can vouch for the suffix and nothing else; `pathLenConstraint: 0`, so it cannot sign
+  another authority; and a `keyUsage` that cannot serve TLS itself.
+  All three are read back out of the encoded certificate by `x509-parser`, which is not the
+  library that wrote them — asserting through `rcgen` would only establish that its builder
+  remembered its own input, and a browser reads bytes.
+  And the claim is measured rather than argued. A name constraint is worth what the verifier
+  reading it does with it, so the test signs `evil.example` with this authority — which succeeds,
+  because a signer does not police this — and asks `openssl verify`: `permitted subtree violation`.
+  Remove the constraint and the same certificate verifies `OK`, which is the mkcert situation.
+  Chromium refuses it too, with `net::ERR_CERT_INVALID`, measured with the authority in a user
+  trust store.
+- **`ssh-browser trust`**, which prints the install command for the platform and stops. Nothing
+  here writes to a trust store: that changes how the whole machine treats the internet, is not
+  undone by uninstalling a Rust binary, and is not a decision a background process should make.
+  The command that removes it again is printed beside the one that installs it.
+- **The daemon says whether the certificate is trusted**, on `/_control/hello`, on
+  `/_control/hosts`, in the startup banner and in the dashboard. Nothing can ask a trust store
+  that question portably — but a TLS handshake *is* the question, and the daemon sees every one.
+  Three states rather than two, because "nothing has handshaked yet" is neither trusted nor
+  untrusted and guessing either way would be wrong.
+
+### Changed
+
+- The minimum supported Rust version is 1.88, which `rcgen` requires. `msrv-drift.yml`'s own
+  comment says the choice is to bump or to pin the offending crate, and pinning a certificate
+  generator to an old release to save three compiler versions is the wrong trade. That also makes
+  let-chains available, so seven nests are collapsed.
+- `/_control/hello` reports the scheme, and the extension builds omnibox URLs from it rather than
+  from a constant. Under https a URL in the wrong scheme is not a cosmetic slip: it is a link into
+  a different origin than the one being served.
+
+### Fixed
+
+- **A first https run left the reader at a certificate error with no way out.** It printed the
+  site's URL and the PAC advice and nothing about a certificate, while silently generating an
+  authority that nothing trusts — so following the banner exactly, on a machine that had never run
+  this, ended at `ERR_CERT_AUTHORITY_INVALID` with no hint that a command existed. Found by doing
+  it: fresh state directory, fresh browser profile, only what was printed.
+- **The uninstall instruction claimed success and removed nothing.** `certutil -delstore -user Root
+  "ssh-browser local CA"` reports that it completed while deleting nothing, because the stored name
+  is `ssh-browser local CA (ssh-browser)`. Found by running the printed instructions and then
+  checking the store. An uninstall that says it removed a root it has not removed is the worst
+  failure available here.
+- A wildcard certificate does not work and is no longer issued. `*.ssh-browser` is refused by
+  Chromium with `ERR_CERT_COMMON_NAME_INVALID`: the suffix is not a known registry, so a wildcard
+  directly beneath it reads as one covering an entire top-level domain. Certificates are minted per
+  name as the handshake asks for them.
+- `rustls-pemfile` is gone: it is unmaintained (RUSTSEC-2025-0134) and its job moved into
+  `rustls-pki-types`, which rustls already depends on — so this removes a crate rather than
+  replacing one.
+- Four messages had shipped carrying the source file's own indentation into the middle of a
+  sentence, from Rust string line-continuations. All four are rewritten without them.
+
+### Testing
+
+- The e2e covers what CI can: that a `CONNECT` is refused for a name this daemon does not serve,
+  for any port but 443, and for want of a certificate under http; that a first https run tells the
+  reader the trust step exists; and that the daemon reports what handshakes have done. Trusting a
+  root is not something CI can do, so the loading half stays a hand measurement, written up in
+  `crate::tls`.
+- `Bound` no longer owns the startup banner. It owns the `Origin`, which owns the TLS
+  configuration, which owns a private key — so CodeQL read every string reached through it as
+  derived from that key, and it was right about the shape if not the values. `bind` returns
+  `(Bound, Startup)` now: a thing you serve and a thing you print.
+
 ## [0.3.0] - 2026-09-14
 
 ### Added
