@@ -9,6 +9,42 @@ The two halves ship through different channels, and only one of them has shipped
 is on crates.io as [`ssh-browser`](https://crates.io/crates/ssh-browser); the extension goes
 through a browser store and has not been submitted. No surface is stable.
 
+## [0.4.1] - 2026-09-14
+
+### Added
+
+- `GET /_control/certificate?name=<alias>.<suffix>` reports the certificate being served for that
+  name and its public-key pin, in the form a browser takes for a one-launch trust decision.
+  Two reasons. Somebody being asked to trust a root may reasonably want to see what it signs
+  first, and "run openssl on this file" is a poor answer when the file is the root and the
+  question is about a leaf. And it makes the https mode testable without a trust store, which is
+  not something CI can create — so the loading half of the mode is now checked in CI rather than
+  only by hand: the alias origin is a secure context, with service workers, `crypto.subtle` and
+  `caches`, and the page actually runs.
+
+### Changed
+
+- `ssh-browser trust` no longer suggests running `openssl` to inspect what you are about to
+  trust. It reads the limits out of the certificate it just wrote and prints them — which names
+  it may vouch for, whether the constraint is marked critical, whether it can sign a second
+  authority. Pointing a reader at a tool they may not have, to check a claim this program makes
+  about itself, was the wrong way round.
+- The README says what `cargo install ssh-browser` needs: a Rust toolchain and a C compiler.
+  The C compiler is for `ring`, which the TLS stack compiles; every other dependency is pure
+  Rust, so this arrived with the https mode and it falls on people who only use http too. Said
+  outright rather than left to be discovered from a linker error.
+
+### Fixed
+
+- The certificate route reported a pin for a certificate nobody would ever be served. It minted
+  a fresh one to answer the question, so the pin was the right length and the right shape and
+  could never match. The resolver's cache is the single source of truth now, and both the
+  handshake and the route read the same entry. Caught by the e2e on its first run, which is what
+  the e2e is for.
+- `getrandom` moves to 0.4. The control token comes from it, so the change was read rather than
+  taken on trust: 0.4 adds `SysRng`, `RawOsError`, WASIp3 and an opt-in `extern_impl` backend,
+  and changes nothing about where the default bytes come from.
+
 ## [0.4.0] - 2026-09-14
 
 ### Added
