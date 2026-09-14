@@ -27,8 +27,8 @@ use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::header::{
-    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_RANGE, CONTENT_TYPE, ETAG, HOST, HeaderName,
-    IF_NONE_MATCH, IF_RANGE, LOCATION, RANGE,
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_RANGE, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, HOST,
+    HeaderName, HeaderValue, IF_NONE_MATCH, IF_RANGE, LOCATION, RANGE,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -750,10 +750,7 @@ impl Origin {
                 ),
             );
         }
-        plain_ok(
-            "text/html; charset=utf-8",
-            Bytes::from(self.alias_index().await),
-        )
+        own_page(self.alias_index().await)
     }
 
     async fn direct(
@@ -808,10 +805,7 @@ impl Origin {
 
         let rest = path.trim_start_matches('/');
         if rest.is_empty() {
-            return plain_ok(
-                "text/html; charset=utf-8",
-                Bytes::from(self.alias_index().await),
-            );
+            return own_page(self.alias_index().await);
         }
 
         let (alias, sub) = rest.split_once('/').unwrap_or((rest, ""));
@@ -2381,6 +2375,22 @@ fn served(content_type: &str, body: Bytes, tag: Option<&str>) -> Response<Full<B
 /// For responses with no validator to offer: the PAC, the alias index, a listing.
 fn plain_ok(content_type: &str, body: Bytes) -> Response<Full<Bytes>> {
     served(content_type, body, None)
+}
+
+/// One of the daemon's own pages, which no other page may frame.
+///
+/// Everything else served here is somebody's file, and whether it may be framed is their
+/// business. This is ours, and it is the one page that says what is being served and where
+/// it is rooted. A page on `evil.<suffix>` cannot read it — different origin, and no CORS
+/// header is sent — but without this it could put it under a transparent overlay, which is
+/// the attack that does not need to read anything.
+fn own_page(body: String) -> Response<Full<Bytes>> {
+    let mut res = plain_ok("text/html; charset=utf-8", Bytes::from(body));
+    res.headers_mut().insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    res
 }
 
 /// No `Last-Modified` anywhere, deliberately.

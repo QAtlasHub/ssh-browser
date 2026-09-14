@@ -243,6 +243,12 @@ async function main() {
     });
     // Nothing else is there: every path belongs to a site, and a site is a different origin.
     check("but nothing else is at the suffix", () => assert.equal(indexElsewhere.status, 404));
+    // The one page here is ours, and it names what is being served and where it is rooted. A
+    // page on another alias cannot read it — different origin, and no CORS header is sent —
+    // but framing needs neither, which is the attack that gets worse as this page grows.
+    check("and no other page may frame it", () =>
+      assert.equal(indexPage.headers["content-security-policy"], "frame-ancestors 'none'"),
+    );
 
     console.log("\nwhat the daemon refuses");
     const rebinding = await request({ path: "/", host: "evil.example" });
