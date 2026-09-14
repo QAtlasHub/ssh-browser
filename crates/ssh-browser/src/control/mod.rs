@@ -237,6 +237,12 @@ struct Hello<'a> {
     /// hardcoded it would break the moment somebody changed it. Additive, so a protocol-1
     /// client that does not read this field is unaffected and the range stays 1..=1.
     suffix: &'a str,
+    /// `http` or `https`, so the extension builds a URL in the scheme being served.
+    ///
+    /// Reported for the same reason the suffix is: it is configurable, and an extension that
+    /// assumed would hand somebody a link to a *different origin* than the one being served —
+    /// which under https is not a cosmetic difference.
+    scheme: &'a str,
     /// Remote round trips every open session has cost, added up.
     ///
     /// Here as well as in `hosts` because this is the cheap route. `hosts` runs `ssh -G` once
@@ -310,7 +316,7 @@ pub fn route_of(path: &str) -> &str {
     path.strip_prefix(PATH_PREFIX).unwrap_or("")
 }
 
-pub fn hello(aliases: &[String], suffix: &str, trips: u64) -> Response<Full<Bytes>> {
+pub fn hello(aliases: &[String], suffix: &str, scheme: &str, trips: u64) -> Response<Full<Bytes>> {
     json(&Hello {
         daemon: env!("CARGO_PKG_VERSION"),
         protocol: Protocol {
@@ -319,6 +325,7 @@ pub fn hello(aliases: &[String], suffix: &str, trips: u64) -> Response<Full<Byte
         },
         aliases,
         suffix,
+        scheme,
         trips,
     })
 }
@@ -392,7 +399,7 @@ mod tests {
     /// even if it somehow manages to send the request.
     #[test]
     fn no_response_carries_cors_headers() {
-        let mut responses = vec![hello(&["docs".to_string()], "ssh-browser", 0)];
+        let mut responses = vec![hello(&["docs".to_string()], "ssh-browser", "http", 0)];
         responses.extend(gate(&Method::OPTIONS, None, None, &token()));
         responses.extend(gate(&Method::GET, None, None, &token()));
         responses.push(text(StatusCode::NOT_FOUND, "nope"));
@@ -418,6 +425,7 @@ mod tests {
             },
             aliases: &["docs".to_string()],
             suffix: "ssh-browser",
+            scheme: "https",
             trips: 7,
         })
         .expect("serialises");
@@ -427,6 +435,9 @@ mod tests {
         assert!(body.contains("\"daemon\":\""));
         // The cheap route carries it too, so a measurement does not have to pay for `hosts`.
         assert!(body.contains("\"trips\":7"), "{body}");
+        // The scheme, because the extension builds URLs from it and a wrong one is a link into
+        // a different origin than the one being served.
+        assert!(body.contains("\"scheme\":\"https\""), "{body}");
     }
 
     /// A temporary file, named after the test so parallel runs cannot collide.

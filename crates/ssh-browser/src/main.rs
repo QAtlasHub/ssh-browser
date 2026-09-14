@@ -9,9 +9,10 @@ use ssh_browser::origin::{Alias, Origin, pac};
 use ssh_browser::reachable;
 use ssh_browser::ssh_config;
 use ssh_browser::theme;
+use ssh_browser::tls;
 
-const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--new-token] [<alias>=<ssh-host>[:<base>] ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]
-  ssh-browser hosts\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"~/docs\"   # or an absolute path; omit for the home directory itself";
+const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--scheme http|https] [--new-token] [<alias>=<ssh-host>[:<base>] ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]
+  ssh-browser trust [--config FILE] [--suffix S]\n  ssh-browser hosts\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n  scheme = \"http\"   # https terminates TLS behind CONNECT; see `ssh-browser trust`\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"~/docs\"   # or an absolute path; omit for the home directory itself";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,6 +45,9 @@ async fn main() -> Result<()> {
             "--suffix" => {
                 cli.suffix = Some(args.next().context("--suffix needs a value")?.clone());
             }
+            "--scheme" => {
+                cli.scheme = Some(args.next().context("--scheme needs a value")?.clone());
+            }
             // A flag rather than a value, so it consumes nothing: rotating is a thing you
             // do, not a thing you configure.
             "--new-token" => new_token = true,
@@ -74,6 +78,7 @@ async fn main() -> Result<()> {
     let config::Resolved {
         port,
         suffix,
+        scheme,
         aliases,
         hosts,
     } = config::merge(cli, from_file)?;
@@ -115,6 +120,30 @@ async fn main() -> Result<()> {
         }
         "pac" => {
             print!("{}", pac::script(&suffix, port)?);
+            Ok(())
+        }
+        // Prints and stops. Installing a root into a trust store changes how the whole machine
+        // treats the internet and is not undone by uninstalling this binary, so the command is
+        // the reader's to run, with it in front of them.
+        //
+        // Creating the authority is this command's job as well as `serve`'s, so that trusting it
+        // can be done before the first https run rather than only after one has failed.
+        "trust" => {
+            let authority = tls::load_or_create(&suffix)?;
+            let Some(path) = tls::certificate_path() else {
+                bail!("no state directory to keep a local certificate authority in");
+            };
+            println!("{}", tls::trust_instructions(&suffix, &path));
+            // After the instructions rather than before: the command is what the reader came
+            // for, and this is the reassurance they may want once they have read it.
+            println!(
+                "It permits {:?} and nothing else, which you can check without trusting anything:",
+                authority.suffix()
+            );
+            println!(
+                "  openssl x509 -in \"{}\" -noout -text | grep -A 3 \"Name Constraints\"",
+                path.display()
+            );
             Ok(())
         }
         "serve" => {
@@ -171,8 +200,16 @@ async fn main() -> Result<()> {
                     })
                     .collect(),
             );
-            let bound =
-                Origin::bind(aliases, reachable, suffix.clone(), port, token, theme).await?;
+            let (bound, startup) = Origin::bind(
+                aliases,
+                reachable,
+                suffix.clone(),
+                scheme.clone(),
+                port,
+                token,
+                theme,
+            )
+            .await?;
 
             // Everything from here is true by the time it is said. The routes come from
             // the bound origin rather than from the aliases, because an alias rooted at
@@ -180,13 +217,13 @@ async fn main() -> Result<()> {
             // asked, and announcing it as "home" would leave the reader to find out which
             // directory that was.
             eprintln!("listening on 127.0.0.1:{port}");
-            for route in bound.routes() {
+            for route in startup.routes() {
                 eprintln!("{route}");
             }
             // Starting with none is the ordinary case now: the extension opens a host from
             // your ssh_config when you pick one. Said outright, because a daemon that
             // listed nothing used to mean a misconfiguration.
-            if bound.routes().is_empty() {
+            if startup.routes().is_empty() {
                 eprintln!("  no aliases open yet — pick a host in the extension, or see");
                 eprintln!("  `ssh-browser hosts` for what your ssh_config can reach");
             }
@@ -194,9 +231,9 @@ async fn main() -> Result<()> {
             // answer is not a reason to refuse to start — a laptop on the wrong network has
             // half of them unreachable — but it is a reason to say so, because the alternative
             // is a URL that quietly 404s and no hint as to why.
-            if !bound.refused().is_empty() {
+            if !startup.refused().is_empty() {
                 eprintln!();
-                for line in bound.refused() {
+                for line in startup.refused() {
                     eprintln!("{line}");
                 }
             }

@@ -314,6 +314,67 @@ async function main() {
       assert.equal(local.headingColour, "rgb(0, 128, 64)"),
     );
 
+    console.log("\nwhat CONNECT is allowed to reach");
+    // The https mode terminates TLS behind a `CONNECT`, which makes this daemon a proxy — and a
+    // proxy on loopback is reachable by every process on the machine and by every page in the
+    // browser. So what it will tunnel to is a guard, not a detail.
+    //
+    // Checked in the http mode, where there is no certificate: a `CONNECT` here has to be refused
+    // for want of one rather than accepted and then dropped, which a browser reads as a tunnel
+    // that worked and died. Trusting a root is not something CI can do, so the https side is
+    // measured by hand and written up in `crate::tls`.
+    // Its own client rather than `request` above, because Node delivers a `CONNECT` answer on
+    // the `connect` event and not on `response` — so a `response` handler alone waits forever.
+    // It did: the first version of this hung the whole run for ten minutes.
+    const connect = (target) =>
+      new Promise((ok, no) => {
+        const req = http.request({
+          host: "127.0.0.1",
+          port: PORT,
+          method: "CONNECT",
+          path: target,
+        });
+        // A refusal comes back as an ordinary response, which is the case being checked. A
+        // success would arrive as `connect` with a live socket, and is reported rather than
+        // silently treated as a pass.
+        req.on("response", (res) => {
+          let body = "";
+          res.setEncoding("utf8");
+          res.on("data", (c) => {
+            body += c;
+          });
+          res.on("end", () => ok({ status: res.statusCode, body }));
+        });
+        req.on("connect", (res, socket) => {
+          socket.destroy();
+          ok({ status: res.statusCode, body: "" });
+        });
+        req.on("error", no);
+        req.setTimeout(10_000, () => {
+          req.destroy();
+          no(new Error(`CONNECT ${target} answered nothing in ten seconds`));
+        });
+        req.end();
+      });
+    const noCert = await connect(`${ALIAS}.${SUFFIX}:443`);
+    const elsewhere = await connect("evil.example:443");
+    const otherPort = await connect(`${ALIAS}.${SUFFIX}:22`);
+
+    // The status only: hyper does not send a body with a `CONNECT` response, so asserting on the
+    // text would be asserting on the empty string.
+    check("under http a CONNECT is refused for want of a certificate", () =>
+      assert.equal(noCert.status, 501),
+    );
+    // These two are the guards, and they run before the certificate is looked for — so they hold
+    // in either mode. A daemon that tunnelled anywhere would be an open proxy any page could
+    // drive by loading a subresource.
+    check("a CONNECT to a name this daemon does not serve is refused", () =>
+      assert.equal(elsewhere.status, 403),
+    );
+    check("and a CONNECT to any port but 443 is refused", () =>
+      assert.equal(otherPort.status, 403),
+    );
+
     console.log("\ninvariant 2, over a real transport");
     // The unit test for this holds a fake remote and a three-byte fixture. This is the same
     // claim against whatever host the run is pointed at, through the real SFTP transport.
