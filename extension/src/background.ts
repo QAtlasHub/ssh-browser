@@ -41,11 +41,20 @@ interface Hello {
   /// Absent from a daemon older than the https mode, which is why it is optional here and
   /// defaults to http below rather than failing the connect.
   scheme?: string;
+  /// What TLS handshakes have done. Absent under http, where there are none.
+  ///
+  /// The only honest way to know whether the local authority is trusted: nothing can ask a
+  /// trust store portably, but a handshake that completed proves a browser accepted the
+  /// certificate, and one that failed almost always means it did not.
+  tls?: { completed: number; failed: number };
 }
 
 export interface Reply {
   ok: boolean;
   detail: string;
+  /// Under https: what handshakes have done, so the dashboard can say whether the certificate
+  /// is trusted instead of leaving somebody to find out by hitting a broken page.
+  tls?: { completed: number; failed: number };
   aliases?: string[];
   suffix?: string;
   open?: OpenAlias[];
@@ -249,6 +258,9 @@ async function connect(port: number): Promise<Reply> {
   if (hello.suffix !== undefined) {
     reply.suffix = hello.suffix;
   }
+  if (hello.tls !== undefined) {
+    reply.tls = hello.tls;
+  }
   return reply;
 }
 
@@ -284,6 +296,7 @@ async function listHosts(): Promise<Reply> {
     open: OpenAlias[];
     hosts: KnownHost[];
     unusable: { host: string; why: string }[];
+    tls?: { completed: number; failed: number };
   };
   return {
     ok: true,
@@ -297,6 +310,10 @@ async function listHosts(): Promise<Reply> {
     // Carried through rather than dropped. A host missing from the list with no reason
     // reads as ssh-browser having failed to find it, which has a different fix.
     unusable: body.unusable,
+    // Absent under http, and absent from a daemon older than the https mode. Spread rather
+    // than assigned so the field stays missing instead of becoming `undefined`, which the
+    // dashboard would have to tell apart from "no handshakes yet".
+    ...(body.tls === undefined ? {} : { tls: body.tls }),
   };
 }
 

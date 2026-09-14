@@ -237,6 +237,14 @@ struct Hello<'a> {
     /// hardcoded it would break the moment somebody changed it. Additive, so a protocol-1
     /// client that does not read this field is unaffected and the range stays 1..=1.
     suffix: &'a str,
+    /// What TLS handshakes have done, under https.
+    ///
+    /// `None` under http, where there is nothing to hand shake about. Under https this is the
+    /// only honest answer to "is the authority trusted": nothing can ask a trust store portably,
+    /// but a handshake that completed proves a browser accepted the certificate and one that
+    /// failed almost always means it did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls: Option<Handshakes>,
     /// `http` or `https`, so the extension builds a URL in the scheme being served.
     ///
     /// Reported for the same reason the suffix is: it is configurable, and an extension that
@@ -316,7 +324,20 @@ pub fn route_of(path: &str) -> &str {
     path.strip_prefix(PATH_PREFIX).unwrap_or("")
 }
 
-pub fn hello(aliases: &[String], suffix: &str, scheme: &str, trips: u64) -> Response<Full<Bytes>> {
+/// Completed and failed TLS handshakes, as the extension sees them.
+#[derive(Serialize, Clone, Copy)]
+pub struct Handshakes {
+    pub completed: u64,
+    pub failed: u64,
+}
+
+pub fn hello(
+    aliases: &[String],
+    suffix: &str,
+    scheme: &str,
+    trips: u64,
+    tls: Option<Handshakes>,
+) -> Response<Full<Bytes>> {
     json(&Hello {
         daemon: env!("CARGO_PKG_VERSION"),
         protocol: Protocol {
@@ -327,6 +348,7 @@ pub fn hello(aliases: &[String], suffix: &str, scheme: &str, trips: u64) -> Resp
         suffix,
         scheme,
         trips,
+        tls,
     })
 }
 
@@ -399,7 +421,7 @@ mod tests {
     /// even if it somehow manages to send the request.
     #[test]
     fn no_response_carries_cors_headers() {
-        let mut responses = vec![hello(&["docs".to_string()], "ssh-browser", "http", 0)];
+        let mut responses = vec![hello(&["docs".to_string()], "ssh-browser", "http", 0, None)];
         responses.extend(gate(&Method::OPTIONS, None, None, &token()));
         responses.extend(gate(&Method::GET, None, None, &token()));
         responses.push(text(StatusCode::NOT_FOUND, "nope"));
@@ -427,6 +449,10 @@ mod tests {
             suffix: "ssh-browser",
             scheme: "https",
             trips: 7,
+            tls: Some(Handshakes {
+                completed: 0,
+                failed: 3,
+            }),
         })
         .expect("serialises");
         assert!(body.contains("\"min\":1"));
@@ -438,6 +464,10 @@ mod tests {
         // The scheme, because the extension builds URLs from it and a wrong one is a link into
         // a different origin than the one being served.
         assert!(body.contains("\"scheme\":\"https\""), "{body}");
+        // What handshakes have done, which is the only portable answer to "is the authority
+        // trusted". Three failures and no successes is a reader who has not run
+        // `ssh-browser trust` yet, and the dashboard has to be able to say so.
+        assert!(body.contains("\"failed\":3"), "{body}");
     }
 
     /// A temporary file, named after the test so parallel runs cannot collide.

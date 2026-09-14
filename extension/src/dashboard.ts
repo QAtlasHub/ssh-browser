@@ -41,6 +41,12 @@ interface Reply {
   url?: string;
   current?: string;
   themes?: { name: string; label: string; variant: string }[];
+  /// Under https: completed and failed TLS handshakes.
+  ///
+  /// The only honest answer to "is the local authority trusted". Nothing can ask a trust store
+  /// portably, but a handshake that completed proves a browser accepted the certificate, and one
+  /// that failed almost always means it did not.
+  tls?: { completed: number; failed: number };
 }
 
 function el<T extends HTMLElement>(id: string): T {
@@ -113,11 +119,69 @@ let generation = 0;
 // ---------------------------------------------------------------------------
 // The list
 
+/// Whether the local authority is trusted, as far as anything can tell.
+///
+/// Under https only. Nothing can ask a trust store portably — but a TLS handshake *is* the
+/// question being asked, so the daemon counts the answers and this reports them. The reason it is
+/// here rather than left to the terminal: somebody who has not trusted the authority meets
+/// `ERR_CERT_AUTHORITY_INVALID` on a page, and a page cannot tell them about a command.
+function certificateState(): HTMLElement {
+  const tls = latest.tls;
+  const box = document.createElement("div");
+  if (tls === undefined) {
+    // http, or a daemon older than this. Nothing to say, and an empty node keeps the caller
+    // from having to know which.
+    return box;
+  }
+
+  if (tls.completed > 0) {
+    box.append(node("p", "note", "The local certificate authority is trusted: https is working."));
+    return box;
+  }
+
+  if (tls.failed === 0) {
+    // Nothing has handshaked yet, so there is nothing to report either way. Saying "not
+    // trusted" here would be a guess, and saying "trusted" would be a wrong one.
+    box.append(
+      node(
+        "p",
+        "note",
+        "https is on. The first page you open will show whether the local certificate " +
+          "authority is trusted.",
+      ),
+    );
+    return box;
+  }
+
+  box.className = "act";
+  box.append(node("h2", "", "the certificate is not trusted"));
+  box.append(
+    node(
+      "p",
+      "bad",
+      `A browser refused the certificate ${tls.failed === 1 ? "once" : `${tls.failed} times`}. ` +
+        "Until the local authority is trusted, every https page here is refused.",
+    ),
+  );
+  box.append(node("pre", "cmd", "ssh-browser trust"));
+  box.append(
+    node(
+      "p",
+      "note",
+      "prints the command for your platform, and the one that undoes it. Nothing is installed " +
+        "for you: trusting a root changes how the whole machine treats the internet.",
+    ),
+  );
+  return box;
+}
+
 function renderList(): void {
   const view = clear();
   const open = latest.open ?? [];
   const hosts = latest.hosts ?? [];
 
+  // Before the sites, because under https it decides whether any of them will open.
+  view.append(certificateState());
   view.append(node("h2", "", "sites"));
   if (open.length === 0) {
     view.append(node("p", "empty", "Nothing is being served yet. Pick a host below."));

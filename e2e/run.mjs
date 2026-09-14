@@ -324,6 +324,17 @@ async function main() {
     // that the banner tells you the step exists — which is the part that was missing.
     const https = await startDaemon(PORT + 1, { scheme: "https" });
     const banner = https.log();
+
+    // And the daemon can answer "is it trusted" without being able to ask a trust store,
+    // because a handshake is the question. Nothing has handshaked yet on this fresh daemon, so
+    // both counters are zero — which is the third state, and the one that must not be reported
+    // as either trusted or untrusted.
+    const beforeAnyPage = await fetch(`http://127.0.0.1:${PORT + 1}/_control/hello`, {
+      headers: { [TOKEN_HEADER]: https.token },
+    })
+      .then((r) => r.json())
+      .catch(() => null);
+
     await stop(https.child);
 
     check("a first https run says the authority is not trusted yet", () =>
@@ -338,6 +349,10 @@ async function main() {
       assert.match(banner, new RegExp(`https://${ALIAS}\\.${SUFFIX}/`)),
     );
 
+
+    check("under https the daemon reports what handshakes have done", () =>
+      assert.deepEqual(beforeAnyPage?.tls, { completed: 0, failed: 0 }),
+    );
     console.log("\nwhat CONNECT is allowed to reach");
     // The https mode terminates TLS behind a `CONNECT`, which makes this daemon a proxy — and a
     // proxy on loopback is reachable by every process on the machine and by every page in the
