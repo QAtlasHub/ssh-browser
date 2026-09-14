@@ -1,0 +1,13 @@
+Nothing links to this file, and nothing else in the run may read it.
+
+That is its whole purpose. The invariant-2 check needs one read that is genuinely the
+first, so that "and reading it again costs nothing" is not vacuous — and every other file
+in this tree has been fetched by the time that check runs, either by a check above it or by
+the browser loading index.html, which also warms the prefetcher.
+
+Asserting on index.html instead passed against a real host and failed in CI. The host was
+slow enough that the freshness window expired between sections and the read really was
+cold; on a fast runner it was still cached and cost nothing. A check whose answer depends
+on how slow the machine is will eventually be read as a fault in the machine.
+
+So: do not reference this from index.html, and do not request it anywhere else.
