@@ -208,14 +208,22 @@ Enabled hosts are connected at startup, all at once, and one that does not answe
 reported rather than fatal: a laptop on the wrong network has half of them unreachable,
 and refusing to start then would be refusing exactly when it is wanted.
 
-**Enabled means open, not "opens on demand".** Connecting when a request for an unopened
-host arrives would be nicer to describe and much worse to have: every request to an alias
-origin arrives through the proxy, so any web page could start ssh sessions by naming a host
-in an `<img src>`, and time the answer to learn which hosts you have. The header that would
-separate a navigation from a subresource is not available — **Chromium sends no
-`Sec-Fetch-*` at all on a proxied request**, measured against a real browser. So a session
-is opened by the daemon at startup or by a control call carrying the token, and by nothing
-else.
+**A host in `ssh_config` is never opened by a request.** Every request to an alias origin
+arrives through the proxy, so if any name could be dialled by asking for it, a web page
+could start ssh sessions by naming hosts in an `<img src>` and time the answers to learn
+which ones you have. The header that would separate a navigation from a subresource is not
+available — **Chromium sends no `Sec-Fetch-*` at all on a proxied request**, measured
+against a real browser. So an `ssh_config` host is opened at startup if it is enabled, or by
+a control call carrying the token, and by nothing else.
+
+**A declared alias is different, and a request does open it.** The set of them is fixed when
+the daemon starts, from the config file and the command line — it is not `ssh_config` — so
+the furthest a page can reach is a host you already asked to have served, and one whose
+up-or-down it can already read off the status code. What it must not get is the *rate*, so a
+failed dial is remembered for three seconds and requests inside that window are answered
+from the memory. Long enough that a loop cannot choose how often this machine opens an ssh;
+short enough that reloading is still a retry, which is the point of the retry being a
+reload.
 
 `--port` and `--suffix` change the listener and the hostname suffix. `ssh-browser
 pac` prints the script without starting a server.
@@ -244,8 +252,20 @@ host = "login-node"
 
 `base` may be an absolute path, or `~` and a path under the remote's home directory, or
 omitted for the home directory itself. The tilde is resolved by asking the remote, once,
-at startup: it is shell syntax and this transport never runs a shell, so expanding it
-locally would produce *your* home directory rather than the account's.
+when the alias connects: it is shell syntax and this transport never runs a shell, so
+expanding it locally would produce *your* home directory rather than the account's.
+
+**An alias that will not connect does not stop the daemon.** All of them are dialled at
+startup, at once; the ones that come up are served, and the ones that do not are named with
+what ssh said, listed as not connected, and opened by the next request that asks for them.
+A cluster in maintenance used to take the rest of your sites down with it. The exception is
+an alias typed on the command line — `ssh-browser serve docs=myhost` — which is a thing you
+are standing there waiting on, so failing to open it is still an error.
+
+An alias that is down answers `502` and says what ssh said; one stopped from the dashboard
+answers `503` and says a restart brings it back; a name that was never declared is still a
+`404`. Three situations, three answers — a daemon that called all of them "not found" sent
+you looking in the config file for a name that was sitting in it.
 
 Pointing an alias at a home directory is reasonable because **no name beginning with a dot
 is ever served**, at any depth, and they are left out of listings. An alias base is one

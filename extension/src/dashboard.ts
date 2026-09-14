@@ -15,6 +15,19 @@ interface OpenAlias {
   url: string;
 }
 
+/// A declared alias with nothing connected behind it.
+///
+/// The other half of `OpenAlias`, and the half that used to be impossible: an alias was either
+/// being served or the daemon had refused to start. Now a host can be asleep without taking
+/// the rest down, which is only an improvement if the reader is told which ones are.
+interface StalledAlias {
+  alias: string;
+  host: string;
+  url: string;
+  why?: string;
+  stopped: boolean;
+}
+
 interface KnownHost {
   alias: string;
   host: string;
@@ -36,6 +49,7 @@ interface Reply {
   detail: string;
   suffix?: string;
   open?: OpenAlias[];
+  stalled?: StalledAlias[];
   hosts?: KnownHost[];
   unusable?: { host: string; why: string }[];
   url?: string;
@@ -204,6 +218,37 @@ function renderList(): void {
       list.append(item);
     }
     view.append(list);
+  }
+
+  // Between the sites and the hosts, because that is what they are: sites that are not up.
+  // Each says what to do about it, because "panza — not connected" is the same silence as not
+  // listing it at all.
+  for (const s of latest.stalled ?? []) {
+    const box = document.createElement("div");
+    box.className = "act";
+    box.append(node("h2", "", `${s.alias} is not connected`));
+    box.append(
+      node(
+        "p",
+        "bad-host",
+        s.stopped
+          ? `Stopped from here. It is in the daemon's configuration, so restarting serves it ` +
+              `again — reloading the page will not.`
+          : (s.why ?? `${s.host} did not answer.`),
+      ),
+    );
+    if (!s.stopped) {
+      const retry = document.createElement("a");
+      retry.className = "open-site";
+      retry.href = s.url;
+      retry.target = "_blank";
+      retry.rel = "noreferrer";
+      // Opening it *is* the retry. A button here that dialled behind the reader's back would
+      // be a second way to do the same thing, and the one they already know is the address.
+      retry.textContent = `Try ${s.url}`;
+      box.append(retry);
+    }
+    view.append(box);
   }
 
   const spare = hosts.filter((h) => !open.some((o) => o.alias === h.alias));
