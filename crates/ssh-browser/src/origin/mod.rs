@@ -40,6 +40,7 @@ use crate::control::{self, Token};
 use crate::fs::sftp::SftpFs;
 use crate::fs::{Entry, RangeReq, RemoteFs};
 use crate::prefetch;
+use crate::reachable;
 use crate::sftp::wire::Attrs;
 use crate::ssh_config;
 use crate::theme;
@@ -134,6 +135,12 @@ struct KnownHost {
     /// Named for what it is rather than "connected": what the extension needs to know is
     /// whether a URL for this alias will answer, and that is a question about routing.
     served: bool,
+    /// Whether this daemon opens it on its own, every run.
+    ///
+    /// Distinct from `served`, and the difference is the whole feature: `served` is about
+    /// now, `enabled` is about next time. A host opened by hand is served and not enabled; a
+    /// host enabled while its ssh was down is enabled and not served.
+    enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     unresolved: Option<String>,
 }
@@ -287,6 +294,12 @@ pub struct Origin {
     /// is one setting for every alias: an origin that looked different from its neighbour
     /// for no reason the reader chose would be a bug rather than a feature.
     theme: RwLock<String>,
+    /// Which `ssh_config` hosts this daemon opens without being asked.
+    ///
+    /// Never consulted while serving a request. It decides what happens at startup and what
+    /// a toggle does, and nothing else — see `crate::reachable` for why an "open it when a
+    /// request arrives" version would hand any web page the ability to start ssh sessions.
+    reachable: RwLock<reachable::Set>,
 }
 
 /// A listening socket and the origin that will answer on it.
@@ -298,6 +311,7 @@ pub struct Bound {
     origin: Arc<Origin>,
     listener: TcpListener,
     routes: Vec<String>,
+    refused: Vec<String>,
 }
 
 impl Bound {
@@ -305,6 +319,14 @@ impl Bound {
     ///
     /// Only available once bound, which is the point: an alias rooted at the home
     /// directory has no printable base until the remote has been asked.
+    /// Enabled hosts that would not connect, and what ssh said about each.
+    ///
+    /// Separate from `routes` so a caller cannot print them as though they were working. Empty
+    /// on an ordinary run; not an error, because the daemon is serving everything else.
+    pub fn refused(&self) -> &[String] {
+        &self.refused
+    }
+
     pub fn routes(&self) -> &[String] {
         &self.routes
     }
@@ -322,6 +344,7 @@ impl Origin {
     /// request does not also pay for an ssh handshake.
     pub async fn bind(
         aliases: Vec<Alias>,
+        hosts: reachable::Set,
         suffix: String,
         port: u16,
         token: Token,
@@ -386,16 +409,29 @@ impl Origin {
                 a.name
             );
         }
+        let origin = Arc::new(Self {
+            suffix,
+            port,
+            sessions: RwLock::new(sessions),
+            cache: Cache::default(),
+            token,
+            theme: RwLock::new(theme),
+            reachable: RwLock::new(hosts),
+        });
+
+        // Opened after the aliases, and on different terms. An alias failing stops the daemon:
+        // it was named for this run and serving without it would be answering a different
+        // question. An enabled host failing does not, because the set is everything somebody
+        // uses in a week and a laptop on the wrong network has half of them unreachable — a
+        // daemon that refused to start until every one answered would be useless exactly when
+        // it is most wanted. So the failures are reported and the rest is served.
+        let (opened, refused) = origin.open_enabled().await;
+        routes.extend(opened);
+
         Ok(Bound {
             routes,
-            origin: Arc::new(Self {
-                suffix,
-                port,
-                sessions: RwLock::new(sessions),
-                cache: Cache::default(),
-                token,
-                theme: RwLock::new(theme),
-            }),
+            refused,
+            origin,
             listener,
         })
     }
@@ -793,6 +829,7 @@ impl Origin {
             (&Method::GET, "hosts") => self.list_hosts().await,
             (&Method::POST, "open") => self.open_host(body).await,
             (&Method::POST, "close") => self.close_alias(body).await,
+            (&Method::POST, "enabled") => self.set_enabled(body).await,
             (&Method::GET, "theme") => self.show_theme().await,
             (&Method::POST, "theme") => self.set_theme(body).await,
             (&Method::GET, route) => {
@@ -853,6 +890,14 @@ impl Origin {
             open.sort_by(|a, b| a.alias.cmp(&b.alias));
             open
         };
+        // Read once, before the loop, rather than taking the lock per host.
+        let enabled: Vec<String> = self
+            .reachable
+            .read()
+            .await
+            .enabled()
+            .map(|h| h.name.clone())
+            .collect();
         let mut hosts = Vec::with_capacity(found.hosts.len());
         for (h, task) in found.hosts.iter().zip(described) {
             // A host ssh cannot describe is still listed, with the reason attached.
@@ -868,6 +913,7 @@ impl Origin {
                 host: h.host.clone(),
                 settings,
                 served: open.iter().any(|o| o.alias == h.alias),
+                enabled: enabled.iter().any(|name| name == &h.alias),
                 unresolved,
             });
         }
@@ -1067,6 +1113,141 @@ impl Origin {
         }
     }
 
+    /// Connect one host and work out where it is rooted.
+    ///
+    /// Owns its arguments and borrows nothing, so it can run in a task and several of them can
+    /// run at once. Does not touch the session map: dialling and adopting are separated so that
+    /// the concurrent path at startup and the one-at-a-time path behind a toggle share the part
+    /// that talks to ssh, rather than each having a copy of it to drift.
+    async fn dial(alias: String, host: String, base: Option<String>) -> Result<Session> {
+        let fs = SftpFs::connect(&host)
+            .await
+            .with_context(|| format!("ssh to {host}"))?;
+        let resolved = resolve_base(base.as_deref(), &fs)
+            .await
+            .with_context(|| format!("working out where to root {alias}"))?;
+        Ok(Session {
+            host,
+            base: resolved,
+            fs,
+        })
+    }
+
+    /// Put a connected session in the map, or keep the one that got there first.
+    ///
+    /// A session that lost the race is dropped rather than replacing the winner. Dropping it
+    /// closes that ssh child, which is the right end for a connection nothing is using;
+    /// replacing the winner would close one that requests are already going through.
+    async fn adopt(&self, alias: &str, session: Session) -> Arc<Session> {
+        let mut sessions = self.sessions.write().await;
+        Arc::clone(
+            sessions
+                .entry(alias.to_string())
+                .or_insert_with(|| Arc::new(session)),
+        )
+    }
+
+    async fn connect(&self, alias: &str, host: &str, base: Option<&str>) -> Result<Arc<Session>> {
+        let session = Self::dial(
+            alias.to_string(),
+            host.to_string(),
+            base.map(str::to_string),
+        )
+        .await?;
+        Ok(self.adopt(alias, session).await)
+    }
+
+    /// Open every enabled host, at once, and say which ones would not.
+    ///
+    /// At once rather than in turn: these are independent ssh handshakes, and in sequence six
+    /// hosts would cost the sum of six round-trip times before the daemon answered anything.
+    async fn open_enabled(&self) -> (Vec<String>, Vec<String>) {
+        let wanted: Vec<reachable::Host> = self.reachable.read().await.enabled().cloned().collect();
+        if wanted.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Looked up in ssh_config rather than dialled by the name in the file, for two reasons
+        // and the second is the important one.
+        //
+        // The name in the file is the *label* — lowercase, because it becomes a hostname — and
+        // the ssh_config `Host` it came from need not be spelled the same. A file saying
+        // `panza` for a config that says `Panza` produced `Could not resolve hostname panza` on
+        // every start, while enabling it in the first place had worked: that path had the
+        // ssh_config entry in hand and this one only had the label.
+        //
+        // And it is the same gate `open` and `enabled` have. Without it this is a path that
+        // ssh's to whatever names are in a file, with no check that ssh has ever heard of them
+        // — a second, looser door into the one thing this daemon is careful about.
+        let known = match ssh_config::read() {
+            Ok(found) => found.hosts,
+            Err(e) => {
+                let mut refused: Vec<String> = wanted
+                    .iter()
+                    .map(|h| {
+                        format!(
+                            "  {} is enabled but ssh_config could not be read: {e:#}",
+                            h.name
+                        )
+                    })
+                    .collect();
+                refused.sort();
+                return (Vec::new(), refused);
+            }
+        };
+
+        let mut dialling = tokio::task::JoinSet::new();
+        let mut refused = Vec::new();
+        for host in wanted {
+            let Some(entry) = entry_for(&known, &host.name) else {
+                // Named and gone: the ssh_config entry was renamed or removed since this was
+                // turned on. Said rather than retried silently, because the fix is in a file
+                // the reader owns.
+                refused.push(format!(
+                    "  {} is enabled but is no longer a host in your ssh_config",
+                    host.name
+                ));
+                continue;
+            };
+            let (label, target) = (entry.alias.clone(), entry.host.clone());
+            dialling.spawn(async move {
+                let got = Self::dial(label.clone(), target, host.base.clone()).await;
+                (label, got)
+            });
+        }
+
+        let mut opened = Vec::new();
+        while let Some(finished) = dialling.join_next().await {
+            let (name, got) = match finished {
+                Ok(pair) => pair,
+                // The task itself failed rather than the ssh in it -- a panic. Reported the same
+                // way, because from here it is the same fact: this host is not being served and
+                // the reader has to be told which one.
+                Err(e) => {
+                    refused.push(format!("  an enabled host could not be opened: {e}"));
+                    continue;
+                }
+            };
+            match got {
+                Ok(session) => {
+                    let base = session.base.clone();
+                    self.adopt(&name, session).await;
+                    opened.push(format!(
+                        "  http://{name}.{}/  ->  {name}:{base}",
+                        self.suffix
+                    ));
+                }
+                // ssh's own words, not "could not connect". ssh's reasons are the ones with a
+                // fix in them: a jump host that is down, a key that is not loaded, a name that
+                // does not resolve.
+                Err(e) => refused.push(format!("  {name} is enabled but did not answer: {e:#}")),
+            }
+        }
+        opened.sort();
+        refused.sort();
+        (opened, refused)
+    }
+
     fn opened(&self, alias: &str, host: &str, base: &str) -> Response<Full<Bytes>> {
         #[derive(serde::Serialize)]
         struct Opened<'a> {
@@ -1080,6 +1261,109 @@ impl Origin {
             host,
             base,
             url: format!("http://{alias}.{}/", self.suffix),
+        })
+    }
+
+    /// `POST /_control/enabled` -- open a host every run, or stop.
+    ///
+    /// The difference from `open` is that this is remembered. `open` serves a host until the
+    /// daemon stops; this says to open it next time too, which is what turns "click the host,
+    /// then use the URL" into "use the URL".
+    ///
+    /// Turning one on connects it now as well, because a setting that only took effect after a
+    /// restart would be indistinguishable from one that did not work. Turning one off closes it
+    /// now, for the same reason in reverse: a host still answering after you switched it off
+    /// reads as the switch having failed.
+    async fn set_enabled(&self, body: &[u8]) -> Response<Full<Bytes>> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Ask {
+            host: String,
+            enabled: bool,
+            /// Where to root it, for the first time it is turned on.
+            #[serde(default)]
+            base: Option<String>,
+        }
+
+        let ask: Ask = match serde_json::from_slice(body) {
+            Ok(ask) => ask,
+            Err(e) => {
+                return control::text(
+                    StatusCode::BAD_REQUEST,
+                    format!("enabled needs a JSON body naming a host and whether it is on: {e}"),
+                );
+            }
+        };
+
+        // The same gate `open` has, and for the same reason: "ssh to an arbitrary host on
+        // request" is a larger primitive than this needs to be, and the ssh_config list is
+        // already the menu. Checked before anything is remembered, so a typo does not leave a
+        // name in the file that will be retried at every start forever.
+        let found = match ssh_config::read() {
+            Ok(found) => found,
+            Err(e) => {
+                return control::text(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("reading ssh_config: {e:#}"),
+                );
+            }
+        };
+        let Some(known) = found
+            .hosts
+            .iter()
+            .find(|h| h.host.eq_ignore_ascii_case(&ask.host) || h.alias == ask.host)
+        else {
+            return control::text(
+                StatusCode::NOT_FOUND,
+                format!("{:?} is not a host in your ssh_config", ask.host),
+            );
+        };
+
+        // Held to the same rules an alias is, before it is written down anywhere. A name that
+        // cannot be a hostname label would be remembered and then refused on every request.
+        if let Err(e) = Alias::new(&known.alias, &known.host, ask.base.as_deref()) {
+            return control::text(StatusCode::BAD_REQUEST, format!("{e:#}"));
+        }
+
+        if ask.enabled {
+            // Connected before it is remembered. A host that cannot be reached is not written
+            // into the file, so the answer is the same failure `open` would give rather than a
+            // silent "saved" followed by a URL that does not work.
+            if self.session(&known.alias).await.is_none() {
+                if let Err(e) = self
+                    .connect(&known.alias, &known.host, ask.base.as_deref())
+                    .await
+                {
+                    return control::text(StatusCode::BAD_GATEWAY, format!("{e:#}"));
+                }
+            }
+        } else {
+            self.sessions.write().await.remove(&known.alias);
+        }
+
+        let remembered = {
+            let mut set = self.reachable.write().await;
+            set.set(&known.alias, ask.enabled, ask.base.clone());
+            // Best effort, and reported beside the result rather than instead of it: failing to
+            // write a file under the state directory must not undo a change that has already
+            // taken effect.
+            reachable::remember(&set).is_ok()
+        };
+
+        #[derive(serde::Serialize)]
+        struct Switched<'a> {
+            host: &'a str,
+            enabled: bool,
+            remembered: bool,
+            url: Option<String>,
+        }
+        control::json(&Switched {
+            host: &known.alias,
+            enabled: ask.enabled,
+            remembered,
+            url: ask
+                .enabled
+                .then(|| format!("http://{}.{}/", known.alias, self.suffix)),
         })
     }
 
@@ -1765,6 +2049,22 @@ fn redirect(to: &str) -> Response<Full<Bytes>> {
 /// Listing for a directory that has no index.html.
 /// A name this daemon will not serve.
 ///
+/// The ssh_config entry a remembered name refers to.
+///
+/// Matched on either spelling, because the two are not always the same thing: what is written
+/// down is the URL *label*, which is lowercase because it becomes a hostname, and the
+/// `Host` in ssh_config it came from may be `Panza` where the label is `panza`.
+///
+/// Getting this wrong is not a near miss. Dialling the label produced `Could not resolve
+/// hostname panza` on every start, while turning the host on had worked a moment earlier —
+/// because that path had the ssh_config entry in hand and startup had only the name. No test
+/// against a fake remote could have found it; running it twice did.
+fn entry_for<'a>(known: &'a [ssh_config::Host], name: &str) -> Option<&'a ssh_config::Host> {
+    known
+        .iter()
+        .find(|h| h.alias == name || h.host.eq_ignore_ascii_case(name))
+}
+
 /// Anything beginning with a dot. An alias base is one origin, so a page under it can read
 /// everything else under it with `fetch` — the base is the blast radius. On a home directory
 /// almost everything worth stealing sits behind a dot: `.ssh`, `.aws`, `.netrc`, a `.git`
@@ -2208,6 +2508,9 @@ mod tests {
             cache,
             theme: RwLock::new(theme::DEFAULT.to_string()),
             token: Token::from_hex(TEST_TOKEN),
+            // Empty on purpose: these tests build their session map directly, so nothing here
+            // should be opening anything behind their backs.
+            reachable: RwLock::new(reachable::Set::default()),
         }
     }
 
@@ -2660,6 +2963,7 @@ mod tests {
         const NOWHERE: &str = "a-host-that-cannot-resolve.invalid";
         let result = Origin::bind(
             vec![Alias::new("docs", NOWHERE, Some("/srv")).expect("a valid alias")],
+            reachable::Set::default(),
             "ssh-browser".to_string(),
             port,
             Token::from_hex(TEST_TOKEN),
@@ -3597,6 +3901,158 @@ mod tests {
             after > before,
             "serving a page reported no round trips ({before} -> {after})"
         );
+    }
+
+    /// A remembered label finds the ssh_config `Host` it came from, whatever its case.
+    ///
+    /// The regression this exists for: startup dialled the *label* rather than the `Host`, so a
+    /// config saying `Host Panza` and a remembered `panza` produced `Could not resolve hostname
+    /// panza` on every single start — while turning the host on a moment earlier had worked,
+    /// because that path had the entry in hand. Two runs found it; no fake remote could have.
+    #[test]
+    fn a_remembered_label_finds_the_host_it_came_from() {
+        let known = vec![
+            ssh_config::Host {
+                host: "Panza".to_string(),
+                alias: "panza".to_string(),
+            },
+            ssh_config::Host {
+                host: "issp-ohtaka".to_string(),
+                alias: "issp-ohtaka".to_string(),
+            },
+        ];
+
+        // What is actually written down is the label, and it has to reach `Panza`.
+        assert_eq!(
+            entry_for(&known, "panza").map(|h| h.host.as_str()),
+            Some("Panza")
+        );
+        // And the other spelling, for a name typed rather than clicked.
+        assert_eq!(
+            entry_for(&known, "Panza").map(|h| h.host.as_str()),
+            Some("Panza")
+        );
+        assert_eq!(
+            entry_for(&known, "issp-ohtaka").map(|h| h.host.as_str()),
+            Some("issp-ohtaka")
+        );
+    }
+
+    /// A name ssh has never heard of is not dialled.
+    ///
+    /// Startup is the one path that reads hosts out of a file rather than from a request, so
+    /// without this it is a looser door into "make this daemon ssh somewhere" than the two that
+    /// are guarded — and one that fires again at every start.
+    #[test]
+    fn a_name_ssh_config_does_not_know_resolves_to_nothing() {
+        let known = vec![ssh_config::Host {
+            host: "Panza".to_string(),
+            alias: "panza".to_string(),
+        }];
+        assert!(entry_for(&known, "not-a-host-anywhere").is_none());
+        assert!(entry_for(&known, "").is_none());
+        // Not a prefix or substring match either: `panz` is somebody else's name.
+        assert!(entry_for(&known, "panz").is_none());
+    }
+
+    /// Enabling a host is held to the same gate opening one is.
+    ///
+    /// This is a second door into "make the daemon ssh somewhere", and a worse one if it is
+    /// looser, because what it writes down is retried at every start from then on. The name is
+    /// nonsense on purpose, so this asserts the same thing whether or not the machine running
+    /// it has an ssh_config at all.
+    #[tokio::test]
+    async fn enabling_a_host_ssh_does_not_know_is_refused() {
+        let origin = origin_with(one_page()).await;
+        let res = origin
+            .handle(control_post(
+                "/_control/enabled",
+                Some(TEST_TOKEN),
+                r#"{"host":"not-a-host-in-anyones-ssh-config.invalid","enabled":true}"#,
+            ))
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// And it needs the token, like everything else on this API.
+    ///
+    /// Worth its own check rather than trusting the gate: this route writes a file that
+    /// survives the process, so "anyone on loopback can make this daemon ssh somewhere every
+    /// morning" is the failure it would be.
+    #[tokio::test]
+    async fn enabling_a_host_without_the_token_is_refused() {
+        let origin = origin_with(one_page()).await;
+        let res = origin
+            .handle(control_post(
+                "/_control/enabled",
+                None,
+                r#"{"host":"anything","enabled":true}"#,
+            ))
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A body that does not say what to do is refused rather than defaulted.
+    ///
+    /// Defaulting `enabled` would make a malformed request turn a host on, or off, and the
+    /// caller would have no way to tell which had happened.
+    #[tokio::test]
+    async fn enabling_needs_to_say_which_way() {
+        let origin = origin_with(one_page()).await;
+        for body in [
+            r#"{"host":"anything"}"#,
+            r#"{"enabled":true}"#,
+            "{}",
+            "not json",
+        ] {
+            let res = origin
+                .handle(control_post("/_control/enabled", Some(TEST_TOKEN), body))
+                .await;
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "{body} should not have been accepted"
+            );
+        }
+    }
+
+    /// Turning a host off closes it now, not only next time.
+    ///
+    /// A setting that took effect at the next restart is indistinguishable from one that did
+    /// not work, and in this direction it is worse than confusing: a host still answering after
+    /// you switched it off is an ssh session you believe you have given back.
+    #[tokio::test]
+    async fn disabling_a_host_closes_it_now() {
+        let origin = origin_with(one_page()).await;
+        // `docs` is the alias the test origin serves. Naming it here needs no ssh_config, but
+        // the route checks ssh_config before it does anything -- so this asserts the closing
+        // through the piece that does not need a network, and the gate above covers the rest.
+        assert!(origin.session("docs").await.is_some());
+        origin.sessions.write().await.remove("docs");
+        assert!(
+            origin.session("docs").await.is_none(),
+            "removing the session is what disabling does, and a request must then 404"
+        );
+        let res = origin.handle(get("/a.html", None)).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Nothing about how to reach a host is reported to anything but the dashboard.
+    ///
+    /// The point of the whole arrangement: `ssh_config` keeps the account, the port and the
+    /// jump host, and an alias origin never learns any of it. A page that could read this off
+    /// its own origin would be reading the machine's ssh setup.
+    #[tokio::test]
+    async fn an_alias_origin_cannot_read_the_host_list() {
+        let origin = origin_with(one_page()).await;
+        for path in ["/_control/hosts", "/_control/enabled", "/_control/hello"] {
+            let res = origin.handle(get(path, None)).await;
+            assert_ne!(
+                res.status(),
+                StatusCode::OK,
+                "{path} answered a request from an alias origin"
+            );
+        }
     }
 
     /// The check that keeps `open` from being "ssh to anything on request". The list the

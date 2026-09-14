@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use ssh_browser::config;
 use ssh_browser::control::{self, Token};
 use ssh_browser::origin::{Alias, Origin, pac};
+use ssh_browser::reachable;
 use ssh_browser::ssh_config;
 use ssh_browser::theme;
 
@@ -63,6 +64,7 @@ async fn main() -> Result<()> {
     let from_file = file.unwrap_or(config::Config {
         server: config::Server::default(),
         aliases: Vec::new(),
+        hosts: Vec::new(),
     });
 
     // Read before `merge` consumes the file, because the theme is not an alias or a port
@@ -73,6 +75,7 @@ async fn main() -> Result<()> {
         port,
         suffix,
         aliases,
+        hosts,
     } = config::merge(cli, from_file)?;
 
     match command.as_str() {
@@ -156,7 +159,20 @@ async fn main() -> Result<()> {
             let theme = theme::remembered()
                 .or_else(|| from_file_theme.clone())
                 .unwrap_or_else(|| theme::DEFAULT.to_string());
-            let bound = Origin::bind(aliases, suffix.clone(), port, token, theme).await?;
+            // Over the file, the same way the theme is: the file sets the starting value and
+            // the dashboard records a later change of mind.
+            let reachable = reachable::Set::new(
+                hosts
+                    .into_iter()
+                    .map(|h| reachable::Host {
+                        name: h.name,
+                        base: h.base,
+                        enabled: h.enabled,
+                    })
+                    .collect(),
+            );
+            let bound =
+                Origin::bind(aliases, reachable, suffix.clone(), port, token, theme).await?;
 
             // Everything from here is true by the time it is said. The routes come from
             // the bound origin rather than from the aliases, because an alias rooted at
@@ -173,6 +189,16 @@ async fn main() -> Result<()> {
             if bound.routes().is_empty() {
                 eprintln!("  no aliases open yet — pick a host in the extension, or see");
                 eprintln!("  `ssh-browser hosts` for what your ssh_config can reach");
+            }
+            // After the routes, so what is working is read first. An enabled host that did not
+            // answer is not a reason to refuse to start — a laptop on the wrong network has
+            // half of them unreachable — but it is a reason to say so, because the alternative
+            // is a URL that quietly 404s and no hint as to why.
+            if !bound.refused().is_empty() {
+                eprintln!();
+                for line in bound.refused() {
+                    eprintln!("{line}");
+                }
             }
             eprintln!();
             // A PAC is not discoverable, so the banner says outright what to do with it

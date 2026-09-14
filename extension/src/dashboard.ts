@@ -23,6 +23,11 @@ interface KnownHost {
   port?: number;
   proxyJump?: string | null;
   served: boolean;
+  /// Whether the daemon opens this host on its own, every run.
+  ///
+  /// Not the same as `served`, and the difference is the whole point: `served` is about now,
+  /// `enabled` is about next time.
+  enabled: boolean;
   unresolved?: string;
 }
 
@@ -463,7 +468,57 @@ function renderAlias(alias: string): void {
   view.append(
     node("p", "note", "Closes the ssh session. The site stops answering until it is served again."),
   );
+
+  view.append(node("h2", "", "every run"));
+  const always = document.createElement("div");
+  always.className = "act";
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.id = "enabled";
+  const on = host?.enabled === true;
+  toggle.dataset["enabled"] = String(on);
+  toggle.textContent = on ? "Opened every run" : "Open every run";
+  toggle.addEventListener("click", () => {
+    void setEnabled(site.alias, !on, toggle);
+  });
+  always.append(toggle);
+  view.append(always);
+  view.append(
+    node(
+      "p",
+      "note",
+      on
+        ? "The daemon opens this when it starts, so the URL works without coming here first. " +
+            "Click to stop — that closes it now as well."
+        : "Open it when the daemon starts, so the URL works without coming here first. Nothing " +
+            "about how to reach it is written down: the name goes in a file beside the token, " +
+            "and your ~/.ssh/config keeps the rest.",
+    ),
+  );
+
   view.append(settingsLink());
+}
+
+/// Open this host every run, or stop.
+async function setEnabled(alias: string, enabled: boolean, button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  say(enabled ? `opening ${alias}…` : `closing ${alias}…`);
+  const reply = await send({ kind: "setEnabled", host: alias, enabled });
+  button.disabled = false;
+  if (!reply.ok) {
+    say(reply.detail, true);
+    return;
+  }
+  say(reply.detail);
+  await refresh();
+  // Turning it off closes it, so the page this was clicked on is now about a site that is not
+  // being served. Going back to the list is what the reader wants next either way.
+  if (!enabled) {
+    location.hash = "";
+    route();
+  } else {
+    route();
+  }
 }
 
 /// Close and reopen under a new root.

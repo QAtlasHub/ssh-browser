@@ -141,6 +141,30 @@ so prefer the PAC.
 pick one, and `POST /_control/open` is what it calls. Only a host named in your ssh_config
 can be opened — the list is the menu, and anything else is a config change.
 
+A host you use every day does not have to be picked every time. Turning one on in the
+dashboard opens it now *and* every run after this one, so its URL simply works:
+
+```toml
+[[host]]
+name = "login-node"
+base = "~/public_html"
+```
+
+Only the name. Which account, which port, which jump host — that is already in your
+`~/.ssh/config`, and copying any of it here would mean two answers to one question.
+Enabled hosts are connected at startup, all at once, and one that does not answer is
+reported rather than fatal: a laptop on the wrong network has half of them unreachable,
+and refusing to start then would be refusing exactly when it is wanted.
+
+**Enabled means open, not "opens on demand".** Connecting when a request for an unopened
+host arrives would be nicer to describe and much worse to have: every request to an alias
+origin arrives through the proxy, so any web page could start ssh sessions by naming a host
+in an `<img src>`, and time the answer to learn which hosts you have. The header that would
+separate a navigation from a subresource is not available — **Chromium sends no
+`Sec-Fetch-*` at all on a proxied request**, measured against a real browser. So a session
+is opened by the daemon at startup or by a control call carrying the token, and by nothing
+else.
+
 `--port` and `--suffix` change the listener and the hostname suffix. `ssh-browser
 pac` prints the script without starting a server.
 
@@ -150,7 +174,6 @@ pac` prints the script without starting a server.
 [server]
 port = 7391
 suffix = "ssh-browser"
-author = "souta"
 
 [[alias]]
 name = "docs"
