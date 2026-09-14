@@ -129,6 +129,48 @@ async function routeAccordingToPac(url, host) {
   );
 }
 
+/// One site's card, as the browser resolved it.
+///
+/// The same `[data-alias]` finds it on the extension's dashboard and at the root of the
+/// suffix, where it is a `button` and an `a` respectively. Computed properties rather than
+/// the markup, because the claim is that the two pages *look* the same, and the only way a
+/// shared stylesheet fails is by not arriving.
+function cardShape(page, alias) {
+  return page.evaluate((name) => {
+    const card = document.querySelector(`#view [data-alias="${name}"]`);
+    if (!card) return null;
+    // Longhands, not shorthands: `border` and `font` serialise differently between a button
+    // and a link even when every component matches, which would fail for no reason.
+    const look = (el) => {
+      const s = getComputedStyle(el);
+      return [
+        "color",
+        "backgroundColor",
+        "fontFamily",
+        "fontSize",
+        "fontWeight",
+        "lineHeight",
+        "display",
+        "padding",
+        "borderTopWidth",
+        "borderTopStyle",
+        "borderTopColor",
+        "borderRadius",
+        "textAlign",
+        "textDecorationLine",
+      ]
+        .map((p) => `${p}:${s[p]}`)
+        .join(";");
+    };
+    const fields = {};
+    for (const cls of ["name", "url", "where"]) {
+      const el = card.querySelector(`.${cls}`);
+      fields[cls] = el === null ? null : { text: el.textContent, look: look(el) };
+    }
+    return { look: look(card), fields };
+  }, alias);
+}
+
 /// What a page ended up being, as the browser sees it.
 ///
 /// Read out of the DOM rather than out of the network log, because the claim is about what the
@@ -180,6 +222,32 @@ async function main() {
     check("everything else goes direct", () => assert.equal(toElsewhere, "DIRECT"));
     check("a host that only contains the suffix goes direct", () =>
       assert.equal(toLookalike, "DIRECT"),
+    );
+
+    // The PAC routes the bare suffix too, and for a long time the daemon refused it — so the
+    // script sent a browser somewhere that answered 403. Routing somewhere that refuses is
+    // worse than not routing, and neither half of a disagreement like that can see the other.
+    // These two checks are the agreement itself.
+    const toIndex = await routeAccordingToPac(`http://${SUFFIX}/`, SUFFIX);
+    const indexPage = await request({ path: "/", host: SUFFIX });
+    const indexElsewhere = await request({ path: "/anything", host: SUFFIX });
+
+    check("the suffix on its own routes to the daemon", () =>
+      assert.equal(toIndex, `PROXY 127.0.0.1:${PORT}`),
+    );
+    check("and the daemon answers it with the list of sites", () => {
+      assert.equal(indexPage.status, 200);
+      // Each link is to a site's own origin, which is the difference between this page and the
+      // same list on the loopback listener, where everything shares one origin.
+      assert.match(indexPage.body, new RegExp(`href="https?://${ALIAS}\.${SUFFIX}/"`));
+    });
+    // Nothing else is there: every path belongs to a site, and a site is a different origin.
+    check("but nothing else is at the suffix", () => assert.equal(indexElsewhere.status, 404));
+    // The one page here is ours, and it names what is being served and where it is rooted. A
+    // page on another alias cannot read it — different origin, and no CORS header is sent —
+    // but framing needs neither, which is the attack that gets worse as this page grows.
+    check("and no other page may frame it", () =>
+      assert.equal(indexPage.headers["content-security-policy"], "frame-ancestors 'none'"),
     );
 
     console.log("\nwhat the daemon refuses");
@@ -628,7 +696,7 @@ async function main() {
     await tree.close();
 
     console.log("\nthe dashboard");
-    const { dashboard } = await connectThroughDashboard(browser, PORT);
+    const { dashboard, extensionId } = await connectThroughDashboard(browser, PORT);
     // Waited for, not assumed. `connectThroughDashboard` returns once the daemon line
     // names the port; the sites are fetched after that, so reading the rows straight
     // afterwards is a race that passes most of the time.
@@ -656,6 +724,58 @@ async function main() {
       );
       assert.ok(row.endsWith(tail), `the row should name the root ${tail}: ${row}`);
     });
+
+    // There is one dashboard, and this is what makes it one: the root of the suffix hands a
+    // browser over to it rather than drawing a second. Typed, not clicked — this is the URL a
+    // reader would reach for, and the claim is about that URL and not about the toolbar.
+    const front = await browser.newPage();
+    await front.goto(`http://${SUFFIX}/`, { waitUntil: "domcontentloaded" });
+    await front.waitForURL(/^chrome-extension:/, { timeout: 10_000 }).catch(() => {});
+    const landedOn = front.url();
+    await front.close();
+
+    check("the root of the suffix hands a browser to the dashboard", () =>
+      assert.equal(landedOn, `chrome-extension://${extensionId}/dashboard.html`),
+    );
+
+    // And nothing else may follow it. The extension names one origin in
+    // `web_accessible_resources`, so a page served from a *host* — remote HTML, which is
+    // untrusted code — is refused the same navigation. Without that narrowing, any file on
+    // any host could open the page that holds the controls.
+    const onAHost = await browser.newPage();
+    await onAHost.goto(`http://${ALIAS}.${SUFFIX}/`, { waitUntil: "domcontentloaded" });
+    await onAHost
+      .evaluate((to) => location.replace(to), `chrome-extension://${extensionId}/dashboard.html`)
+      .catch(() => {});
+    await onAHost.waitForTimeout(1500);
+    const hostWent = onAHost.url();
+    await onAHost.close();
+
+    check("but a page served from a host may not", () =>
+      assert.doesNotMatch(hostWent, /^chrome-extension:/),
+    );
+
+    // The loopback listener does not hand over — it is what a browser *without* the extension
+    // is pointed at, so there is nowhere to hand it to, and the fallback is the real answer
+    // there. That makes it the place to check the fallback looks like the page it stands in
+    // for. Computed properties rather than the two sources: one stylesheet is only worth
+    // having if both ends read it, and a build that forgot to copy it into `dist/` would
+    // leave the markup identical and the page unstyled.
+    const spare = await browser.newPage();
+    await spare.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: "domcontentloaded" });
+    const [onDashboard, onSpare] = await Promise.all([
+      cardShape(dashboard, ALIAS),
+      cardShape(spare, ALIAS),
+    ]);
+    await spare.close();
+
+    check("the fallback is the dashboard's own page", () => {
+      assert.notEqual(onSpare, null, "no site card on the loopback listener");
+      assert.deepEqual(onSpare?.look, onDashboard?.look);
+    });
+    check("with the same three things said about the site", () =>
+      assert.deepEqual(onSpare?.fields, onDashboard?.fields),
+    );
 
     // Nothing to paste is the point: the dashboard asked the daemon for the token, and the
     // daemon hands it to anything that is not a page. A field for it would mean the old

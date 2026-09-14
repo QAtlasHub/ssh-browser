@@ -214,7 +214,10 @@ async function connect(port: number): Promise<Reply> {
 
   let res: Response;
   try {
-    res = await callDaemon(s, "/_control/hello");
+    // Naming ourselves, so the root of the suffix has somewhere to send a browser rather
+    // than drawing a second dashboard. Nothing but the id goes over, and the id is already
+    // in every URL this extension's own pages are served from.
+    res = await callDaemon(s, `/_control/hello?dashboard=${chrome.runtime.id}`);
   } catch {
     return { ok: false, detail: `127.0.0.1:${port} stopped answering` };
   }

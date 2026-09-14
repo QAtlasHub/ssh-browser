@@ -13,6 +13,12 @@ use anyhow::{Context, Result, bail, ensure};
 pub enum Target<'a> {
     /// Proxied: the browser asked for `http://<alias>.<suffix>/<path>`.
     Alias { alias: &'a str, path: &'a str },
+    /// Proxied, at the suffix itself: `http://<suffix>/`, with no alias label.
+    ///
+    /// The front door. The PAC has always routed this — `host === "<suffix>"` is in the script —
+    /// and the https certificate has always covered it, but nothing answered it, so the browser
+    /// was sent here and refused. Routing somewhere that refuses is worse than not routing.
+    Index { path: &'a str },
     /// Direct: something reached the loopback listener by address.
     Direct { path: &'a str },
 }
@@ -36,6 +42,16 @@ pub fn classify<'a>(host: &'a str, path: &'a str, suffix: &str, port: u16) -> Re
             "refusing {host:?}: unexpected port for an alias"
         );
         return Ok(Target::Alias { alias, path });
+    }
+
+    // The suffix with no label in front of it. Held to the same port rule as an alias, because
+    // it arrives the same way and for the same reason.
+    if name == suffix {
+        ensure!(
+            matches!(given_port, None | Some(80) | Some(443)),
+            "refusing {host:?}: unexpected port for the index"
+        );
+        return Ok(Target::Index { path });
     }
 
     if matches!(name, "127.0.0.1" | "localhost" | "[::1]" | "::1") {
@@ -140,6 +156,42 @@ fn hex(c: u8) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The suffix on its own is the index, not a refusal.
+    ///
+    /// The PAC has always routed it — `host === "<suffix>"` is in the script it serves — and the
+    /// https certificate has always carried it as a name. Only the daemon disagreed, so a
+    /// browser following the PAC arrived here and was told `403`. Routing somewhere that refuses
+    /// is worse than not routing.
+    #[test]
+    fn the_suffix_on_its_own_is_the_index() {
+        assert_eq!(
+            classify("ssh-browser", "/", "ssh-browser", 7391).unwrap(),
+            Target::Index { path: "/" }
+        );
+        // With the ports a browser actually sends for http and https.
+        assert_eq!(
+            classify("ssh-browser:80", "/", "ssh-browser", 7391).unwrap(),
+            Target::Index { path: "/" }
+        );
+        assert_eq!(
+            classify("ssh-browser:443", "/", "ssh-browser", 7391).unwrap(),
+            Target::Index { path: "/" }
+        );
+        // And not on a port nobody handed out, which is the same rule an alias is held to.
+        assert!(classify("ssh-browser:9999", "/", "ssh-browser", 7391).is_err());
+    }
+
+    /// A host that merely ends with the suffix is still somebody else's.
+    ///
+    /// The index arm compares the whole name, so this cannot become a way in. It is the same
+    /// case the PAC is careful about, checked on the other side of the routing decision.
+    #[test]
+    fn a_lookalike_is_not_the_index() {
+        assert!(classify("ssh-browser.evil.example", "/", "ssh-browser", 7391).is_err());
+        assert!(classify("notssh-browser", "/", "ssh-browser", 7391).is_err());
+        assert!(classify("evil.example", "/", "ssh-browser", 7391).is_err());
+    }
 
     #[test]
     fn an_alias_host_is_recognised() {

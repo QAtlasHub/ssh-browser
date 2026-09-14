@@ -33,6 +33,12 @@ for (const file of ["manifest.json", "dashboard.html"]) {
   copyFileSync(file, `dist/${file}`);
 }
 
+// The one thing here that is not ours. The daemon serves the same page at the root of the
+// suffix and compiles this in, so it lives in the crate — which is also what puts it inside
+// what `cargo publish` ships. Copied rather than duplicated: two dashboards that drift is
+// exactly what having one file prevents.
+copyFileSync("../crates/ssh-browser/assets/dashboard.css", "dist/dashboard.css");
+
 // The manifest names these, so a build without them is a broken extension rather than a
 // plain one. Saying so here beats a puzzle-piece icon and a console warning at load time.
 if (!existsSync("icons")) {
