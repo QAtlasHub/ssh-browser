@@ -49,6 +49,33 @@ struct AliasEntry {
     base: Option<String>,
 }
 
+/// A host from `ssh_config` that is reachable at its URL without being opened first.
+///
+/// The difference from `[[alias]]` is when the connection happens. An alias is connected while
+/// the daemon starts, so a host that is down stops it starting; one of these is connected the
+/// first time somebody navigates to it, so naming ten costs nothing until one is used.
+///
+/// **Only the name is written here.** Which account, which port, which jump host — all of that
+/// is already in `ssh_config`, and copying any of it into a second file would mean two answers
+/// to one question and a new place for the interesting ones to sit.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostEntry {
+    /// A `Host` from `ssh_config`. Also the label in the URL.
+    name: String,
+    /// Omitted means the remote's home directory, as for an alias.
+    #[serde(default)]
+    base: Option<String>,
+    /// Written out so a host can be turned off without deleting the line that says where it
+    /// is rooted. Absent means on: a host somebody bothered to write down is one they want.
+    #[serde(default = "yes")]
+    enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
@@ -58,12 +85,23 @@ struct Document {
     /// is all of them.
     #[serde(default, rename = "alias")]
     aliases: Vec<AliasEntry>,
+    #[serde(default, rename = "host")]
+    hosts: Vec<HostEntry>,
+}
+
+/// One `[[host]]`, checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reachable {
+    pub name: String,
+    pub base: Option<String>,
+    pub enabled: bool,
 }
 
 #[derive(Debug)]
 pub struct Config {
     pub server: Server,
     pub aliases: Vec<Alias>,
+    pub hosts: Vec<Reachable>,
 }
 
 /// Parse the text of a configuration file.
@@ -83,9 +121,35 @@ pub fn parse(text: &str) -> Result<Config> {
     for entry in &doc.aliases {
         aliases.push(Alias::new(&entry.name, &entry.host, entry.base.as_deref())?);
     }
+
+    let mut hosts = Vec::with_capacity(doc.hosts.len());
+    for entry in &doc.hosts {
+        // Built through the same constructor an alias uses, and then thrown away. The name has
+        // to be a usable label — it becomes a hostname — and the base has to survive the same
+        // checks, and there is no reason for a second copy of either rule that could drift
+        // looser than this one.
+        Alias::new(&entry.name, &entry.name, entry.base.as_deref())?;
+        ensure!(
+            !hosts.iter().any(|h: &Reachable| h.name == entry.name),
+            "host {:?} is listed twice",
+            entry.name
+        );
+        ensure!(
+            !aliases.iter().any(|a| a.name() == entry.name),
+            "{:?} is both an alias and a host; one of them would decide what that URL means and it is not obvious which",
+            entry.name
+        );
+        hosts.push(Reachable {
+            name: entry.name.clone(),
+            base: entry.base.clone(),
+            enabled: entry.enabled,
+        });
+    }
+
     Ok(Config {
         server: doc.server,
         aliases,
+        hosts,
     })
 }
 
@@ -128,6 +192,10 @@ pub struct Resolved {
     pub port: u16,
     pub suffix: String,
     pub aliases: Vec<Alias>,
+    /// Hosts reachable on demand. Carried through rather than merged with anything: there is
+    /// no command-line half of this, because a host worth reaching every day is worth writing
+    /// down once.
+    pub hosts: Vec<Reachable>,
 }
 
 /// Fold the command line over the file.
@@ -151,6 +219,7 @@ pub fn merge(cli: Overrides, file: Config) -> Result<Resolved> {
             .or(file.server.suffix)
             .unwrap_or_else(|| DEFAULT_SUFFIX.to_string()),
         aliases,
+        hosts: file.hosts,
     })
 }
 
@@ -281,12 +350,121 @@ base = "/home/me/public_html"
         assert_eq!(c.aliases[0].base(), None);
     }
 
+    #[test]
+    fn a_host_needs_only_a_name_and_is_on_by_default() {
+        let c = parse(
+            "[[host]]
+name = \"login-node\"
+",
+        )
+        .expect("parses");
+        assert_eq!(c.hosts.len(), 1);
+        assert_eq!(c.hosts[0].name, "login-node");
+        assert_eq!(c.hosts[0].base, None);
+        assert!(
+            c.hosts[0].enabled,
+            "a host somebody wrote down is one they want"
+        );
+    }
+
+    #[test]
+    fn a_host_can_be_turned_off_without_deleting_where_it_is_rooted() {
+        let c = parse(
+            "[[host]]
+name = \"n\"
+base = \"~/w\"
+enabled = false
+",
+        )
+        .expect("parses");
+        assert!(!c.hosts[0].enabled);
+        assert_eq!(c.hosts[0].base.as_deref(), Some("~/w"));
+    }
+
+    /// Nothing about *how* to reach a host belongs here — that is `ssh_config`'s job, and two
+    /// answers to one question is how they come to disagree. An unknown key is refused rather
+    /// than ignored, so writing one is a failed start and not a silently different connection.
+    #[test]
+    fn a_host_may_not_carry_ssh_details() {
+        for line in [
+            "user = \"me\"",
+            "port = 22",
+            "hostname = \"h\"",
+            "proxyJump = \"j\"",
+        ] {
+            assert!(
+                parse(&format!(
+                    "[[host]]
+name = \"n\"
+{line}
+"
+                ))
+                .is_err(),
+                "{line} should have been refused"
+            );
+        }
+    }
+
+    /// Two rows for the same name, or a name that is also an alias, would each make one URL
+    /// mean two things — and which one won would depend on the order they were read in.
+    #[test]
+    fn a_name_may_not_mean_two_things() {
+        assert!(
+            parse(
+                "[[host]]
+name = \"n\"
+[[host]]
+name = \"n\"
+"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                "[[alias]]
+name = \"n\"
+host = \"h\"
+[[host]]
+name = \"n\"
+"
+            )
+            .is_err()
+        );
+    }
+
+    /// The name becomes a hostname label, so it is held to the same rule an alias name is —
+    /// here, where it is written, rather than on every request after the daemon has already
+    /// connected and announced the route.
+    #[test]
+    fn a_host_name_that_cannot_be_a_label_is_refused_where_it_is_written() {
+        assert!(
+            parse(
+                "[[host]]
+name = \"-nope\"
+"
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                "[[host]]
+name = \"\"
+"
+            )
+            .is_err()
+        );
+    }
+
     fn alias(name: &str, host: &str) -> Alias {
         Alias::new(name, host, Some("/srv")).expect("a valid alias")
     }
 
     fn file_with(server: Server, aliases: Vec<Alias>) -> Config {
-        Config { server, aliases }
+        Config {
+            server,
+            aliases,
+            hosts: Vec::new(),
+        }
     }
 
     /// What was typed for this run wins over what was written down for every run.

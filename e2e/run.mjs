@@ -547,6 +547,31 @@ async function main() {
         assert.equal(servedHash, `#${clickable}`),
       );
 
+      // The toggle that makes it come back after a restart. Checked here rather than in its
+      // own section because it needs a host that is genuinely servable, which is exactly what
+      // this opt-in supplies -- and because turning it on and off again is the only way to run
+      // it without leaving somebody's machine reconnecting to a host every morning.
+      await dashboard.waitForSelector("#enabled");
+      const before = await dashboard.getAttribute("#enabled", "data-enabled");
+      await dashboard.click("#enabled");
+      await dashboard.waitForFunction(
+        () => document.getElementById("enabled")?.dataset["enabled"] === "true",
+        undefined,
+        { timeout: 60_000 },
+      );
+      check("a host can be set to open every run", () => assert.equal(before, "false"));
+      // Turned straight back off, and the assertion is on the way back: a toggle that reported
+      // success and did not move would pass a check that only looked once.
+      await dashboard.click("#enabled");
+      await dashboard.waitForSelector(hostRow, { timeout: 60_000 });
+      const stillEnabled = await dashboard.$("#enabled");
+      check("and turning it off closes it, rather than waiting for a restart", () =>
+        assert.equal(stillEnabled, null, "the site page should be gone, because it is not served"),
+      );
+      // Turning it off closed the session, so re-open it for the stop check below.
+      await dashboard.click(hostRow);
+      await dashboard.waitForSelector("#open-site", { timeout: 60_000 });
+
       // And taking it down puts it back among the hosts. The run must not leave a
       // connection open that it started.
       await dashboard.click("#stop");

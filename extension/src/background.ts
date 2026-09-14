@@ -64,6 +64,8 @@ export interface KnownHost {
   proxyJump?: string | null;
   served: boolean;
   unresolved?: string;
+  /// Whether the daemon opens this host on its own, every run.
+  enabled?: boolean;
 }
 
 type Request =
@@ -71,6 +73,7 @@ type Request =
   | { kind: "hosts" }
   | { kind: "open"; host: string; base?: string }
   | { kind: "close"; alias: string }
+  | { kind: "setEnabled"; host: string; enabled: boolean; base?: string }
   | { kind: "theme" }
   | { kind: "setTheme"; name: string }
   | { kind: "disconnect" }
@@ -342,6 +345,50 @@ async function closeAlias(alias: string): Promise<Reply> {
   return { ok: true, detail: `${alias} is no longer served` };
 }
 
+/// Open this host every run, or stop.
+///
+/// Different from `open`, which lasts until the daemon stops. This is the setting behind it,
+/// so that a host somebody uses every day does not have to be clicked again after a restart.
+async function setEnabled(host: string, enabled: boolean, base?: string): Promise<Reply> {
+  const s = await stored();
+  if (!s) {
+    return { ok: false, detail: "not connected" };
+  }
+  const payload: Record<string, unknown> = { host, enabled };
+  if (base !== undefined && base !== "") {
+    payload["base"] = base;
+  }
+  const res = await callDaemon(s, "/_control/enabled", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    return { ok: false, detail: await res.text() };
+  }
+  const got = (await res.json()) as { host: string; enabled: boolean; remembered: boolean };
+  // The aliases list feeds the omnibox, and turning a host on opens it -- so the omnibox has to
+  // learn about it here or it stays missing until the next connect.
+  const aliases = got.enabled
+    ? [...new Set([...s.aliases, got.host])]
+    : s.aliases.filter((a) => a !== got.host);
+  await chrome.storage.local.set({ aliases });
+  // The failure to write it down is said outright rather than folded into success. A setting
+  // that quietly did not persist is one somebody finds out about after a restart, which is the
+  // worst moment to learn it.
+  if (!got.remembered) {
+    return {
+      ok: true,
+      detail: `${got.host} is ${got.enabled ? "open" : "closed"} now, but the choice could not be saved for next time`,
+    };
+  }
+  return {
+    ok: true,
+    detail: got.enabled
+      ? `${got.host} will be opened every run`
+      : `${got.host} is closed and will stay closed`,
+  };
+}
+
 /// What listings look like, and what else they could.
 ///
 /// The list of themes comes from the daemon rather than being written out again here. Two
@@ -404,6 +451,8 @@ async function dispatch(message: unknown): Promise<Reply> {
       return openHost(message.host, message.base);
     case "close":
       return closeAlias(message.alias);
+    case "setEnabled":
+      return setEnabled(message.host, message.enabled, message.base);
     case "theme":
       return getTheme();
     case "setTheme":

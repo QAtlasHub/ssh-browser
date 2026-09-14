@@ -6,6 +6,7 @@ pub mod control;
 pub mod fs;
 pub mod origin;
 pub mod prefetch;
+pub mod reachable;
 pub mod sftp;
 pub mod ssh_config;
 pub mod theme;
