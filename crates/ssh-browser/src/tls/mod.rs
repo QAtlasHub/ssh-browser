@@ -23,6 +23,28 @@
 //! is not the code that wrote it. Asserting against `rcgen`'s own view would only say that the
 //! builder remembered what it was told; a browser reads bytes, so the tests read bytes.
 //!
+//! **And the constraint is enforced, measured rather than assumed.** A name constraint is worth
+//! exactly what the verifier reading it chooses to do, and "required by the RFC" and "honoured
+//! by the browser on your desk" are different claims. With a CA of this shape in the current
+//! user's root store, two leaves signed by it, and a browser that was not told to ignore
+//! certificate errors:
+//!
+//! | | `openssl s_client` | Chromium |
+//! | --- | --- | --- |
+//! | a name under the suffix | `Verify return code: 0 (ok)` | loaded, `isSecureContext: true` |
+//! | `evil.example` | `47 (permitted subtree violation)` | refused, `net::ERR_CERT_INVALID` |
+//!
+//! And what the mode is *for* is measured too. Through the daemon, against a real SSH host, an
+//! https alias origin reports `isSecureContext: true` with `navigator.serviceWorker`,
+//! `crypto.subtle` and `caches` all present — the three things an http alias origin does not
+//! have, and the reason this exists.
+//!
+//! The same run is what ruled out a wildcard certificate: see `Authority::leaf_for`.
+//!
+//! Firefox and Safari are unmeasured. Firefox keeps its own store and does not read the system
+//! one, which `trust_instructions` says; whether it honours the constraint is the same question
+//! again, and not one to answer by assuming.
+//!
 //! **The daemon never installs this.** Putting a root into a trust store changes how the whole
 //! machine treats the internet, is not undone by uninstalling a Rust binary, and is not a
 //! decision a background process should make. `ssh-browser trust` prints the command for the
@@ -50,9 +72,23 @@ const AUTHORITY_DAYS: i64 = 3650;
 /// this can be short without being a nuisance.
 const LEAF_DAYS: i64 = 90;
 
-/// The name every authority this module writes is called, and the name the uninstall command
-/// looks for. One constant because the two have to agree, and they are in different files.
+/// The stem of every authority's name.
+///
+/// Not the whole name: see `common_name`. Kept separate so that a reader scanning a trust store
+/// can recognise the family, and so the two places that build the full name agree.
 pub const AUTHORITY_NAME: &str = "ssh-browser local CA";
+
+/// The exact common name of the authority for `suffix`.
+///
+/// **The uninstall command needs this and not the stem.** `certutil -delstore -user Root
+/// "ssh-browser local CA"` reports success and deletes nothing, because the stored name is
+/// `ssh-browser local CA (ssh-browser)`. Found by running the instructions this module prints
+/// and then checking the store: it said the command completed, and the root was still trusted.
+/// An uninstall that claims to have removed a root it has not removed is the worst failure
+/// available here.
+pub fn common_name(suffix: &str) -> String {
+    format!("{AUTHORITY_NAME} ({suffix})")
+}
 
 /// The authority's certificate and the key that signs with it.
 pub struct Authority {
@@ -78,7 +114,7 @@ impl Authority {
         // reads in a trust-store list a year from now while deciding whether to remove it.
         // The bare product name would not say which suffix it covers.
         let mut name = DistinguishedName::new();
-        name.push(DnType::CommonName, format!("{AUTHORITY_NAME} ({suffix})"));
+        name.push(DnType::CommonName, common_name(suffix));
         name.push(DnType::OrganizationName, "ssh-browser");
         params.distinguished_name = name;
 
@@ -121,16 +157,31 @@ impl Authority {
         &self.suffix
     }
 
-    /// A certificate covering every alias under the suffix.
+    /// A certificate for one name under the suffix.
     ///
-    /// One certificate rather than one per alias: they are all under the same suffix, a wildcard
-    /// covers them, and minting one when an alias is opened would put key generation inside a
-    /// TLS handshake.
+    /// One concrete name, **not** a wildcard, and that is a measured decision rather than a
+    /// preference. `*.ssh-browser` is refused by Chromium with `ERR_CERT_COMMON_NAME_INVALID`:
+    /// the suffix is not a known registry, so a wildcard directly beneath it reads as one
+    /// spanning an entire top-level domain, which no browser will accept. A certificate naming
+    /// `e2e.ssh-browser` outright, from the same authority, loads — with `isSecureContext`,
+    /// service workers and `crypto.subtle` all present, which is the whole point of the mode.
     ///
-    /// `*.suffix` and `suffix` both, because the daemon answers on both — the second is the
-    /// index of what is being served.
-    pub fn leaf(&self) -> Result<Leaf> {
-        self.leaf_named(&[&format!("*.{}", self.suffix), &self.suffix.clone()])
+    /// So there is one certificate per alias, minted when a handshake first asks for that name.
+    pub fn leaf_for(&self, name: &str) -> Result<Leaf> {
+        // The label is held to `guard::is_label`, the same function that decides whether an
+        // arriving request's label is acceptable — rather than a third copy of the rule here.
+        // Without it `*.ssh-browser` satisfies "one label, no dots" and gets signed, which is
+        // precisely the certificate a browser refuses.
+        ensure!(
+            name == self.suffix
+                || name
+                    .strip_suffix(&self.suffix)
+                    .and_then(|head| head.strip_suffix('.'))
+                    .is_some_and(crate::origin::guard::is_label),
+            "{name:?} is not a single label under {:?}, so this authority cannot vouch for it",
+            self.suffix
+        );
+        self.leaf_named(&[name])
     }
 
     /// Sign a certificate for whatever names are asked for.
@@ -439,8 +490,8 @@ impl Store {
 }
 
 /// What to run to trust this authority, for the platform this is running on.
-pub fn trust_instructions(cert_path: &Path) -> String {
-    instructions_for(Store::here(), cert_path)
+pub fn trust_instructions(suffix: &str, cert_path: &Path) -> String {
+    instructions_for(Store::here(), suffix, cert_path)
 }
 
 /// Printed, never executed. The three differ in more than spelling: the Windows one needs no
@@ -448,8 +499,10 @@ pub fn trust_instructions(cert_path: &Path) -> String {
 /// the login keychain, and on Linux the location depends on the distribution while Firefox keeps
 /// its own store regardless. Guessing wrong while running as somebody's shell is not a thing to
 /// do quietly.
-pub fn instructions_for(store: Store, cert_path: &Path) -> String {
+pub fn instructions_for(store: Store, suffix: &str, cert_path: &Path) -> String {
     let path = cert_path.display();
+    // The full name, because the stem alone silently removes nothing.
+    let name = common_name(suffix);
     let preamble = format!(
         "The certificate to trust is\n  {path}\n\n\
          It is an authority constrained to one suffix: if its key leaks, it can vouch for that\n\
@@ -461,15 +514,15 @@ pub fn instructions_for(store: Store, cert_path: &Path) -> String {
             "{preamble}Trust it for this account only, no administrator rights needed:\n\
              \x20 certutil -addstore -user Root \"{path}\"\n\n\
              Undo:\n\
-             \x20 certutil -delstore -user Root \"{AUTHORITY_NAME}\"\n\n\
+             \x20 certutil -delstore -user Root \"{name}\"\n\n\
              Check what is there:\n\
-             \x20 certutil -store -user Root | findstr /C:\"{AUTHORITY_NAME}\"\n"
+             \x20 certutil -store -user Root | findstr /C:\"{name}\"\n"
         ),
         Store::MacOs => format!(
             "{preamble}Trust it in your login keychain (it will ask for your password):\n\
              \x20 security add-trusted-cert -k ~/Library/Keychains/login.keychain-db \"{path}\"\n\n\
              Undo:\n\
-             \x20 security delete-certificate -c \"{AUTHORITY_NAME}\" ~/Library/Keychains/login.keychain-db\n"
+             \x20 security delete-certificate -c \"{name}\" ~/Library/Keychains/login.keychain-db\n"
         ),
         Store::Other => format!(
             "{preamble}Where this goes depends on the distribution. On Debian and Ubuntu:\n\
@@ -480,7 +533,7 @@ pub fn instructions_for(store: Store, cert_path: &Path) -> String {
              \x20 sudo update-ca-certificates --fresh\n\n\
              Firefox keeps its own store and does not read that one. Import it under Settings,\n\
              Privacy & Security, Certificates, View Certificates, Authorities, Import — and to\n\
-             remove it again, find \"{AUTHORITY_NAME}\" in that same list and delete it.\n"
+             remove it again, find \"{name}\" in that same list and delete it.\n"
         ),
     }
 }
@@ -591,20 +644,14 @@ mod tests {
         }
     }
 
-    /// The serving certificate covers every alias and the bare suffix, and is not an authority.
-    #[test]
-    fn the_leaf_covers_the_wildcard_and_is_not_itself_an_authority() {
+    /// Names in a serving certificate, out of the encoded bytes.
+    fn names_in(certificate_pem: &str) -> Vec<String> {
         use x509_parser::prelude::*;
 
-        let ca = Authority::create("ssh-browser").expect("an authority");
-        let leaf = ca.leaf().expect("a leaf");
-        assert!(leaf.key_pem.contains("PRIVATE KEY"));
-
-        let (_, pem) = x509_parser::pem::parse_x509_pem(leaf.certificate_pem.as_bytes())
-            .expect("the leaf is PEM");
+        let (_, pem) =
+            x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes()).expect("the leaf is PEM");
         let (_, cert) = X509Certificate::from_der(&pem.contents).expect("the leaf is X.509");
-        let names: Vec<String> = cert
-            .subject_alternative_name()
+        cert.subject_alternative_name()
             .ok()
             .flatten()
             .map(|san| {
@@ -617,16 +664,67 @@ mod tests {
                     })
                     .collect()
             })
-            .unwrap_or_default();
-        assert!(names.contains(&"*.ssh-browser".to_string()), "{names:?}");
-        assert!(names.contains(&"ssh-browser".to_string()), "{names:?}");
+            .unwrap_or_default()
+    }
 
-        // A serving certificate that was also an authority would be able to sign for the whole
-        // suffix, and it is handed to whatever terminates TLS.
+    /// The serving certificate names one alias outright, and is not an authority.
+    ///
+    /// **Not a wildcard, and that is measured rather than preferred.** `*.ssh-browser` is refused
+    /// by Chromium with `ERR_CERT_COMMON_NAME_INVALID`: the suffix is not a known registry, so a
+    /// wildcard directly beneath it reads as one covering an entire top-level domain. The same
+    /// authority signing `e2e.ssh-browser` outright loads, with `isSecureContext`, service
+    /// workers and `crypto.subtle` all present — which is the entire point of the https mode.
+    ///
+    /// So this asserts the wildcard is *absent*. A later change back to one would look tidier
+    /// and would break every https page.
+    #[test]
+    fn the_leaf_names_one_alias_and_is_not_itself_an_authority() {
+        let ca = Authority::create("ssh-browser").expect("an authority");
+        let leaf = ca.leaf_for("alias.ssh-browser").expect("a leaf");
+        assert!(leaf.key_pem.contains("PRIVATE KEY"));
+
+        let names = names_in(&leaf.certificate_pem);
+        assert_eq!(names, ["alias.ssh-browser"], "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with('*')),
+            "a wildcard under a suffix that is not a real registry is refused by browsers: \
+             {names:?}"
+        );
+
+        // A serving certificate that was also an authority could sign for the whole suffix, and
+        // it is handed to whatever terminates TLS.
         assert!(
             !limits_of(&leaf.certificate_pem).expect("parses").is_ca,
             "the serving certificate must not be a CA"
         );
+    }
+
+    /// And the authority refuses to vouch for anything that is not one label under its suffix.
+    ///
+    /// Refused here rather than left to the name constraint. The constraint would stop it too,
+    /// at the verifier — but failing here means the certificate is never signed at all, and a
+    /// signature that was never produced cannot be misread by anything.
+    #[test]
+    fn the_authority_signs_only_a_single_label_under_its_suffix() {
+        let ca = Authority::create("ssh-browser").expect("an authority");
+
+        assert!(ca.leaf_for("alias.ssh-browser").is_ok());
+        // The bare suffix is served too: it is the index of what is open.
+        assert!(ca.leaf_for("ssh-browser").is_ok());
+
+        for bad in [
+            "evil.example",
+            "deep.nested.ssh-browser",
+            ".ssh-browser",
+            "ssh-browser.evil.example",
+            "*.ssh-browser",
+            "",
+        ] {
+            assert!(
+                ca.leaf_for(bad).is_err(),
+                "{bad:?} should not have been signed"
+            );
+        }
     }
 
     /// Every platform's instructions name the file, name the authority, and say how to undo it.
@@ -638,7 +736,7 @@ mod tests {
     #[test]
     fn every_platforms_instructions_say_what_to_install_and_how_to_undo_it() {
         for store in [Store::Windows, Store::MacOs, Store::Other] {
-            let said = instructions_for(store, Path::new("/tmp/authority.pem"));
+            let said = instructions_for(store, "ssh-browser", Path::new("/tmp/authority.pem"));
             assert!(said.contains("authority.pem"), "{store:?}: {said}");
             assert!(
                 said.contains("Undo:"),
@@ -648,7 +746,7 @@ mod tests {
             // The name is how they find it again in a list months later, when the path this
             // printed is long forgotten.
             assert!(
-                said.contains(AUTHORITY_NAME),
+                said.contains(&common_name("ssh-browser")),
                 "{store:?}: nothing names the authority, so it cannot be found to remove: {said}"
             );
         }
@@ -660,7 +758,7 @@ mod tests {
     /// still pass.
     #[test]
     fn the_instructions_printed_here_are_for_this_platform() {
-        let said = trust_instructions(Path::new("/tmp/authority.pem"));
+        let said = trust_instructions("ssh-browser", Path::new("/tmp/authority.pem"));
         let expect = if cfg!(windows) {
             "certutil"
         } else if cfg!(target_os = "macos") {
@@ -797,7 +895,11 @@ mod tests {
         );
         assert!(ca_until > now, "the authority has already expired");
 
-        let (leaf_from, leaf_until) = read(&ca.leaf().expect("a leaf").certificate_pem);
+        let (leaf_from, leaf_until) = read(
+            &ca.leaf_for("alias.ssh-browser")
+                .expect("a leaf")
+                .certificate_pem,
+        );
         assert!(leaf_from < now, "the leaf is not valid yet");
         assert!(
             leaf_until < ca_until,

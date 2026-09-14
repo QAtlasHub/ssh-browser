@@ -20,6 +20,11 @@ interface Settings {
   /// Needed to turn a page URL into a document name. Stored rather than asked for each
   /// time, so a content script never has to know it.
   suffix: string;
+  /// `http` or `https`, as the daemon reported it.
+  ///
+  /// Stored rather than assumed: under https a URL in the wrong scheme is a link into a
+  /// different origin than the one being served.
+  scheme: string;
   /// What the daemon reported at connect time, for the omnibox to suggest from.
   ///
   /// Held here rather than fetched per keystroke: the address bar fires on every character
@@ -33,6 +38,9 @@ interface Hello {
   protocol: { min: number; max: number };
   aliases: string[];
   suffix?: string;
+  /// Absent from a daemon older than the https mode, which is why it is optional here and
+  /// defaults to http below rather than failing the connect.
+  scheme?: string;
 }
 
 export interface Reply {
@@ -80,7 +88,7 @@ type Request =
   | { kind: "status" };
 
 async function stored(): Promise<Settings | null> {
-  const got = await chrome.storage.local.get(["port", "token", "suffix", "aliases"]);
+  const got = await chrome.storage.local.get(["port", "token", "suffix", "scheme", "aliases"]);
   const port = got["port"];
   const token = got["token"];
   const suffix = got["suffix"];
@@ -97,7 +105,10 @@ async function stored(): Promise<Settings | null> {
   // state written by a build from before they were stored must not stop the daemon connecting.
   const raw: unknown = got["aliases"];
   const aliases = Array.isArray(raw) ? raw.filter((a): a is string => typeof a === "string") : [];
-  return { port, token, suffix, aliases };
+  // Absent means a connection made before this extension knew about schemes, and http is what
+  // that daemon was serving.
+  const scheme = got["scheme"] === "https" ? "https" : "http";
+  return { port, token, suffix, scheme, aliases };
 }
 
 /// Every call to the daemon goes through here, so the token is attached in exactly one place
@@ -190,7 +201,7 @@ async function connect(port: number): Promise<Reply> {
   }
   // Neither the suffix nor the aliases are known until `hello` answers, so these placeholders
   // only have to be good enough to reach the daemon; the real ones are stored below.
-  const s: Settings = { port, token, suffix: "", aliases: [] };
+  const s: Settings = { port, token, suffix: "", scheme: "http", aliases: [] };
 
   let res: Response;
   try {
@@ -226,6 +237,8 @@ async function connect(port: number): Promise<Reply> {
     port,
     token,
     suffix: hello.suffix ?? "",
+    // http when the daemon did not say, which is what a daemon older than the https mode means.
+    scheme: hello.scheme ?? "http",
     aliases: hello.aliases,
   });
   const reply: Reply = {
@@ -485,8 +498,12 @@ function escapeXml(s: string): string {
     .replace(/'/g, "&apos;");
 }
 
-function urlFor(alias: string, path: string, suffix: string): string {
-  return `http://${alias}.${suffix}/${encodeDoc(path)}`;
+/// Built from the scheme the daemon reported, not from a constant.
+///
+/// Under https a URL in the wrong scheme is not a cosmetic slip: it is a link into a different
+/// origin than the one being served, which is the one thing this product is about.
+function urlFor(alias: string, path: string, suffix: string, scheme: string): string {
+  return `${scheme}://${alias}.${suffix}/${encodeDoc(path)}`;
 }
 
 /// Typing the keyword in the address bar, then an alias and a path.
@@ -529,7 +546,7 @@ function installOmnibox(): void {
       suggest(
         names.map((a) => ({
           content: path === "" ? a : `${a}/${path}`,
-          description: escapeXml(urlFor(a, path, s.suffix)),
+          description: escapeXml(urlFor(a, path, s.suffix, s.scheme)),
         })),
       );
     })().catch(complain("omnibox suggestions"));
@@ -547,7 +564,7 @@ function installOmnibox(): void {
       if (!/^[a-z0-9-]+$/.test(alias)) {
         return;
       }
-      const url = urlFor(alias, path, s.suffix);
+      const url = urlFor(alias, path, s.suffix, s.scheme);
       switch (disposition) {
         case "newForegroundTab":
           await chrome.tabs.create({ url });

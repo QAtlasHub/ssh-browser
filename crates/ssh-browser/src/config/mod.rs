@@ -29,10 +29,11 @@ pub struct Server {
     /// beside the token rather than written back here, because this file is hand-written
     /// and a daemon that rewrote it would eventually lose somebody's comment.
     pub theme: Option<String>,
-    /// Accepted so that asking for `https` is refused rather than ignored.
+    /// `http` or `https`.
     ///
-    /// The https mode is designed and not built. Of the three things that could happen to a
-    /// file asking for it, serving http anyway is the worst, because it looks like it worked.
+    /// `https` terminates TLS behind a `CONNECT`, using a local authority constrained to the
+    /// suffix — see `crate::tls`. It needs that authority trusted once, which `ssh-browser
+    /// trust` prints the command for, so it is opt-in rather than the default.
     pub scheme: Option<String>,
 }
 
@@ -112,8 +113,8 @@ pub fn parse(text: &str) -> Result<Config> {
 
     if let Some(scheme) = doc.server.scheme.as_deref() {
         ensure!(
-            scheme == "http",
-            "scheme = {scheme:?} is not supported yet; only \"http\" is. https needs a CA constrained to the suffix, which is designed but not built"
+            scheme == "http" || scheme == "https",
+            "scheme = {scheme:?} is not one this daemon serves; use \"http\" or \"https\""
         );
     }
 
@@ -177,12 +178,17 @@ pub fn default_path() -> Option<PathBuf> {
 pub const DEFAULT_PORT: u16 = 7391;
 pub const DEFAULT_SUFFIX: &str = "ssh-browser";
 
+/// `http`, because `https` needs a root trusted once by hand and a default that silently
+/// required that would fail for everybody who had not done it.
+pub const DEFAULT_SCHEME: &str = "http";
+
 /// What the command line said, all of it optional because anything it leaves out the file may
 /// supply and anything neither supplies has a default.
 #[derive(Debug, Default)]
 pub struct Overrides {
     pub port: Option<u16>,
     pub suffix: Option<String>,
+    pub scheme: Option<String>,
     pub aliases: Vec<Alias>,
 }
 
@@ -191,6 +197,7 @@ pub struct Overrides {
 pub struct Resolved {
     pub port: u16,
     pub suffix: String,
+    pub scheme: String,
     pub aliases: Vec<Alias>,
     /// Hosts reachable on demand. Carried through rather than merged with anything: there is
     /// no command-line half of this, because a host worth reaching every day is worth writing
@@ -218,6 +225,10 @@ pub fn merge(cli: Overrides, file: Config) -> Result<Resolved> {
             .suffix
             .or(file.server.suffix)
             .unwrap_or_else(|| DEFAULT_SUFFIX.to_string()),
+        scheme: cli
+            .scheme
+            .or(file.server.scheme)
+            .unwrap_or_else(|| DEFAULT_SCHEME.to_string()),
         aliases,
         hosts: file.hosts,
     })
@@ -300,13 +311,42 @@ base = "/home/me/public_html"
         assert!(parse("[serverr]\nport = 1\n").is_err());
     }
 
-    /// Designed and not built. Serving http to a file that asked for https is the one outcome
-    /// that looks like success.
+    /// Both schemes are served, and nothing else is.
+    ///
+    /// The third case is the one worth a test: a scheme this daemon does not speak has to be
+    /// refused where it is written rather than quietly falling back, because serving http to a
+    /// file that asked for something else is the one outcome that looks like success.
     #[test]
-    fn asking_for_https_is_refused_while_it_does_not_exist() {
-        let e = parse("[server]\nscheme = \"https\"\n").expect_err("refused");
-        assert!(format!("{e:#}").contains("https"), "{e:#}");
+    fn the_two_schemes_are_accepted_and_a_third_is_refused() {
         assert!(parse("[server]\nscheme = \"http\"\n").is_ok());
+        assert!(parse("[server]\nscheme = \"https\"\n").is_ok());
+        for bad in ["HTTPS", "ftp", "wss", "", "http:"] {
+            let e = parse(&format!("[server]\nscheme = \"{bad}\"\n"))
+                .expect_err(&format!("{bad:?} should have been refused"));
+            assert!(format!("{e:#}").contains("scheme"), "{e:#}");
+        }
+    }
+
+    /// http unless something says otherwise.
+    ///
+    /// https needs a root trusted once by hand, so a default that silently required that would
+    /// fail for everybody who had not done it — and fail at the TLS layer, where the reason is
+    /// least visible.
+    #[test]
+    fn the_default_scheme_is_http() {
+        let r = merge(Overrides::default(), parse("").expect("empty parses")).expect("merges");
+        assert_eq!(r.scheme, "http");
+    }
+
+    /// And `--scheme` wins over the file, like the rest of the command line.
+    #[test]
+    fn the_command_line_scheme_wins() {
+        let file = parse("[server]\nscheme = \"http\"\n").expect("parses");
+        let cli = Overrides {
+            scheme: Some("https".to_string()),
+            ..Overrides::default()
+        };
+        assert_eq!(merge(cli, file).expect("merges").scheme, "https");
     }
 
     /// The command line's rules, reached through the same constructor rather than written out
@@ -482,6 +522,7 @@ name = \"\"
         let cli = Overrides {
             port: Some(2222),
             suffix: Some("from-cli".to_string()),
+            scheme: None,
             aliases: vec![],
         };
 

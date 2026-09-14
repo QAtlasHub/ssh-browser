@@ -18,11 +18,11 @@ pub mod range;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::header::{
@@ -44,6 +44,7 @@ use crate::reachable;
 use crate::sftp::wire::Attrs;
 use crate::ssh_config;
 use crate::theme;
+use crate::tls;
 
 /// A file worth holding whole. Anything larger is served by range and not cached: a
 /// seek into a video must not pull the entire file, and holding one would evict every
@@ -244,6 +245,14 @@ impl Origin {
         self.sessions.read().await.get(alias).cloned()
     }
 
+    /// Where a site lives, as a reader would type it.
+    ///
+    /// One place, because the scheme is part of the origin: a URL built with the wrong one is not
+    /// a cosmetic slip but a link into a different origin than the one being served.
+    fn site_url(&self, alias: &str) -> String {
+        format!("{}://{alias}.{}/", self.scheme, self.suffix)
+    }
+
     async fn alias_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.sessions.read().await.keys().cloned().collect();
         names.sort();
@@ -294,6 +303,18 @@ pub struct Origin {
     /// is one setting for every alias: an origin that looked different from its neighbour
     /// for no reason the reader chose would be a bug rather than a feature.
     theme: RwLock<String>,
+    /// `http` or `https`. What a site's URL starts with, and whether `CONNECT` is answered.
+    ///
+    /// Held here rather than consulted from the config, because six places build a site URL and
+    /// a seventh that forgot would hand somebody a link to the wrong scheme — which under
+    /// https is not a cosmetic difference but a different origin.
+    scheme: String,
+    /// The serving certificate, when there is one.
+    ///
+    /// `None` under http, and that is what a `CONNECT` is refused by: there is no certificate to
+    /// terminate with, and answering `200` and then failing the handshake would tell the browser
+    /// the tunnel was fine.
+    tls: Option<Arc<rustls::ServerConfig>>,
     /// Which `ssh_config` hosts this daemon opens without being asked.
     ///
     /// Never consulted while serving a request. It decides what happens at startup and what
@@ -346,6 +367,7 @@ impl Origin {
         aliases: Vec<Alias>,
         hosts: reachable::Set,
         suffix: String,
+        scheme: String,
         port: u16,
         token: Token,
         theme: String,
@@ -365,6 +387,16 @@ impl Origin {
         // Refused here rather than at the first listing: it is configuration, so it is
         // refused where the rest of the configuration is.
         theme::check(&theme)?;
+
+        // The certificate is made before the listener answers anything, so a misconfigured
+        // https mode fails at startup with a reason rather than on the first request with a
+        // handshake error. Under http nothing is generated at all: no key is written for a
+        // feature nobody asked for.
+        let tls = match scheme.as_str() {
+            "http" => None,
+            "https" => Some(Arc::new(serving_config(&suffix)?)),
+            other => bail!("scheme {other:?} is not one this daemon serves; use http or https"),
+        };
 
         let mut sessions = HashMap::new();
         let mut routes = Vec::new();
@@ -388,7 +420,7 @@ impl Origin {
             // actually go. Formatting it from the alias beforehand would print the word
             // "home" and leave the reader to find out which directory that was.
             routes.push(format!(
-                "  http://{}.{suffix}/  ->  {}:{base}",
+                "  {scheme}://{}.{suffix}/  ->  {}:{base}",
                 a.name, a.host
             ));
             // Checked where the map is built, so there is no way to reach a session map with
@@ -411,6 +443,8 @@ impl Origin {
         }
         let origin = Arc::new(Self {
             suffix,
+            scheme,
+            tls,
             port,
             sessions: RwLock::new(sessions),
             cache: Cache::default(),
@@ -448,18 +482,113 @@ impl Bound {
             let (stream, _) = listener.accept().await?;
             let me = Arc::clone(&self_);
             tokio::spawn(async move {
-                let service = service_fn(move |req| {
-                    let me = Arc::clone(&me);
-                    async move { Ok::<_, std::convert::Infallible>(me.handle(req).await) }
+                let outer = Arc::clone(&me);
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let me = Arc::clone(&outer);
+                    async move {
+                        if req.method() == Method::CONNECT {
+                            return Ok::<_, std::convert::Infallible>(me.tunnel(req));
+                        }
+                        Ok(me.handle(req).await)
+                    }
                 });
                 // Keep-alive is not a nicety here: a page pulls many subresources
                 // and a fresh connection each time would add a local handshake per
                 // request on top of the remote cost.
+                //
+                // `with_upgrades` is what lets the `CONNECT` above hand back the socket. Without
+                // it the response would be sent and the connection then closed, which reads to
+                // the browser as a proxy that accepted the tunnel and dropped it.
                 let _ = http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
+                    .with_upgrades()
                     .await;
             });
         }
+    }
+}
+
+impl Origin {
+    /// Answer `CONNECT <alias>.<suffix>:443`, then speak TLS inside the socket.
+    ///
+    /// This is the whole of the https mode's plumbing. The browser will not send an https request
+    /// to a proxy in the clear; it asks for a tunnel, and whatever answers inside that tunnel has
+    /// to present a certificate for the name it asked for. So the daemon is both the proxy and
+    /// the server on the other side of it.
+    ///
+    /// The target is checked before the tunnel is granted, and checked by the same `classify` that
+    /// guards every other request. A proxy that tunnels anywhere is an open proxy, and this one
+    /// listens on loopback where every process on the machine can reach it.
+    fn tunnel(self: &Arc<Self>, mut req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
+        // `CONNECT` puts the target in the authority, not the path: `CONNECT host:443 HTTP/1.1`.
+        let Some(authority) = req.uri().authority().map(ToString::to_string) else {
+            return fail(StatusCode::BAD_REQUEST, "CONNECT carries no authority");
+        };
+
+        // The guards run first, before anything about the https mode is consulted. Two reasons:
+        // they are the part that has to hold in either mode, and a daemon that answered "https is
+        // not configured" to a tunnel it would refuse anyway has told the caller something about
+        // its configuration in exchange for nothing.
+        //
+        // Only a name this daemon serves, and only its https port. Tunnelling anywhere else would
+        // turn a loopback listener into a way out of the machine for whatever can reach it —
+        // including a page, through its own subresource loads.
+        let (name, port) = match authority.rsplit_once(':') {
+            Some((name, port)) => (name, port),
+            None => (authority.as_str(), "443"),
+        };
+        if port != "443" {
+            return fail(
+                StatusCode::FORBIDDEN,
+                format!("CONNECT to port {port} is refused; only 443 is tunnelled"),
+            );
+        }
+        if guard::classify(name, "/", &self.suffix, self.port).is_err() {
+            return fail(
+                StatusCode::FORBIDDEN,
+                format!("{name:?} is not a name this daemon serves"),
+            );
+        }
+
+        let Some(config) = self.tls.clone() else {
+            return fail(
+                StatusCode::NOT_IMPLEMENTED,
+                "this daemon serves http; CONNECT needs the https mode and a certificate.                  Set scheme = \"https\" and see `ssh-browser trust`.",
+            );
+        };
+
+        let me = Arc::clone(self);
+        let upgrade = hyper::upgrade::on(&mut req);
+        tokio::spawn(async move {
+            let Ok(upgraded) = upgrade.await else {
+                return;
+            };
+            let acceptor = tokio_rustls::TlsAcceptor::from(config);
+            let Ok(tls) = acceptor.accept(TokioIo::new(upgraded)).await else {
+                // A failed handshake is the browser's to report: it is the one that knows
+                // whether the certificate was refused or the name did not match, and it shows
+                // that on the page. Saying it again here would be noise on every visit by
+                // somebody who has not run `ssh-browser trust` yet.
+                return;
+            };
+            // Inside the tunnel the requests are ordinary origin-form GETs carrying a `Host`,
+            // so they go through exactly the same handler as the http mode. That is the point of
+            // terminating here rather than proxying onwards: one request path, one set of
+            // guards, and https is a property of the socket rather than a second server.
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                let me = Arc::clone(&me);
+                async move { Ok::<_, std::convert::Infallible>(me.handle(req).await) }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(tls), service)
+                .await;
+        });
+
+        // 200 with no body is what the proxy protocol wants; the socket becomes the tunnel.
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "building the tunnel"))
     }
 }
 
@@ -821,7 +950,12 @@ impl Origin {
         match (method, control::route_of(path)) {
             (&Method::GET, "hello") => {
                 let aliases = self.alias_names().await;
-                control::hello(&aliases, &self.suffix, self.round_trips().await)
+                control::hello(
+                    &aliases,
+                    &self.suffix,
+                    &self.scheme,
+                    self.round_trips().await,
+                )
             }
             (&Method::GET, "hosts") => self.list_hosts().await,
             (&Method::POST, "open") => self.open_host(body).await,
@@ -880,7 +1014,7 @@ impl Origin {
                     alias: alias.clone(),
                     host: s.host.clone(),
                     base: s.base.clone(),
-                    url: format!("http://{alias}.{}/", self.suffix),
+                    url: self.site_url(alias),
                     trips: s.fs.round_trips(),
                 })
                 .collect();
@@ -1230,8 +1364,8 @@ impl Origin {
                     let base = session.base.clone();
                     self.adopt(&name, session).await;
                     opened.push(format!(
-                        "  http://{name}.{}/  ->  {name}:{base}",
-                        self.suffix
+                        "  {}://{name}.{}/  ->  {name}:{base}",
+                        self.scheme, self.suffix
                     ));
                 }
                 // ssh's own words, not "could not connect". ssh's reasons are the ones with a
@@ -1257,7 +1391,7 @@ impl Origin {
             alias,
             host,
             base,
-            url: format!("http://{alias}.{}/", self.suffix),
+            url: self.site_url(alias),
         })
     }
 
@@ -1357,9 +1491,7 @@ impl Origin {
             host: &known.alias,
             enabled: ask.enabled,
             remembered,
-            url: ask
-                .enabled
-                .then(|| format!("http://{}.{}/", known.alias, self.suffix)),
+            url: ask.enabled.then(|| self.site_url(&known.alias)),
         })
     }
 
@@ -1855,7 +1987,7 @@ impl Origin {
             "<!doctype html><html><head><meta charset=\"utf-8\"><title>ssh-browser</title></head><body><h1>ssh-browser</h1><ul>",
         );
         for name in names {
-            let href = format!("http://{name}.{}/", self.suffix);
+            let href = self.site_url(&name);
             s.push_str("<li><a href=\"");
             s.push_str(&escape(&href));
             s.push_str("\">");
@@ -2059,6 +2191,95 @@ fn entry_for<'a>(known: &'a [ssh_config::Host], name: &str) -> Option<&'a ssh_co
     known
         .iter()
         .find(|h| h.alias == name || h.host.eq_ignore_ascii_case(name))
+}
+
+/// A rustls configuration that mints a certificate for whatever name the handshake asks for.
+///
+/// Per name rather than one wildcard, because a wildcard does not work: `*.ssh-browser` is
+/// refused by Chromium with `ERR_CERT_COMMON_NAME_INVALID`, since the suffix is not a known
+/// registry and a wildcard directly beneath one reads as covering a whole top-level domain. A
+/// certificate naming the alias outright is accepted, and the origin is then a real secure
+/// context — service workers, `crypto.subtle` and all.
+fn serving_config(suffix: &str) -> Result<rustls::ServerConfig> {
+    let authority = tls::load_or_create(suffix)?;
+
+    // No client authentication: the browser is not asked to prove anything, because nothing here
+    // decides what to serve based on who is asking. The token does that, on the control API.
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(PerName {
+            authority,
+            suffix: suffix.to_string(),
+            minted: Mutex::new(HashMap::new()),
+        }));
+    // The browser asked for https, so http/1.1 is what is spoken inside the tunnel. Advertised
+    // rather than left to chance: without it a browser may negotiate h2, which nothing here
+    // serves, and the failure is a dead connection rather than a refusal.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// Signs a certificate the first time each name is asked for, and remembers it.
+///
+/// Remembered because a handshake must not wait on key generation twice for the same site, and
+/// because a browser opening a page and its subresources will handshake more than once.
+struct PerName {
+    authority: tls::Authority,
+    suffix: String,
+    minted: Mutex<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
+}
+
+impl std::fmt::Debug for PerName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-written because `Authority` holds a private key and deriving this would put it one
+        // `{:?}` away from a log line.
+        f.debug_struct("PerName")
+            .field("suffix", &self.suffix)
+            .finish()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for PerName {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        // No SNI means no name to vouch for. Returning nothing fails the handshake, which is the
+        // honest answer: a certificate for a name the client did not ask about would be rejected
+        // by the client anyway, and more confusingly.
+        let name = hello.server_name()?.to_string();
+
+        if let Some(found) = self
+            .minted
+            .lock()
+            .ok()
+            .and_then(|held| held.get(&name).cloned())
+        {
+            return Some(found);
+        }
+
+        // `leaf_for` refuses anything that is not a single label under the suffix, so this is
+        // also the point where a handshake for somebody else's name stops. It would be stopped
+        // again by the name constraint in the authority, but failing here means never signing
+        // the certificate at all.
+        let leaf = self.authority.leaf_for(&name).ok()?;
+        let certs = rustls_pemfile::certs(&mut leaf.certificate_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        let key = rustls_pemfile::private_key(&mut leaf.key_pem.as_bytes())
+            .ok()
+            .flatten()?;
+        let signing = rustls::crypto::ring::default_provider()
+            .key_provider
+            .load_private_key(key)
+            .ok()?;
+        let certified = Arc::new(rustls::sign::CertifiedKey::new(certs, signing));
+
+        if let Ok(mut held) = self.minted.lock() {
+            held.insert(name, Arc::clone(&certified));
+        }
+        Some(certified)
+    }
 }
 
 /// Anything beginning with a dot. An alias base is one origin, so a page under it can read
@@ -2499,6 +2720,10 @@ mod tests {
         );
         Origin {
             suffix: "ssh-browser".to_string(),
+            // http, because these tests drive `handle` directly and never open a socket. An
+            // https origin here would only change the URLs printed in a listing.
+            scheme: "http".to_string(),
+            tls: None,
             port: 7391,
             sessions: RwLock::new(sessions),
             cache,
@@ -2961,6 +3186,7 @@ mod tests {
             vec![Alias::new("docs", NOWHERE, Some("/srv")).expect("a valid alias")],
             reachable::Set::default(),
             "ssh-browser".to_string(),
+            "http".to_string(),
             port,
             Token::from_hex(TEST_TOKEN),
             theme::DEFAULT.to_string(),

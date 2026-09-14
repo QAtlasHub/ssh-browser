@@ -83,34 +83,65 @@ server or hosts-file entry is needed**. It also leaves the address bar alone,
 unlike a `declarativeNetRequest` redirect, which rewrites the URL to `127.0.0.1`
 and throws away the origin you asked for.
 
-`http` needs no certificate. `https` does, so it arrives separately and behind a CA
-whose `nameConstraints` limit it to the suffix: a leaked key then cannot
-impersonate anything else, which is not true of a stock mkcert CA.
+`http` needs no certificate and is the default. `https` needs one, and the point of it is the
+row below that `http` cannot have: an https alias origin is a **secure context**, so service
+workers, `crypto.subtle` and `CacheStorage` all work there.
+
+```
+ssh-browser trust                        # prints the command; runs nothing
+ssh-browser serve --scheme https ...
+```
+
+The certificate comes from an authority this daemon generates, carrying `nameConstraints` with
+one permitted subtree — the suffix. **If its key leaks it can vouch for `*.ssh-browser` and
+nothing else**, which is not true of a stock mkcert CA. It also carries `pathLenConstraint: 0`,
+so it cannot sign a second authority, and a `keyUsage` that cannot serve TLS itself.
+
+Measured rather than argued, because a name constraint is worth what the verifier reading it
+does with it:
+
+|                                  | `openssl verify`             | Chromium                     |
+| -------------------------------- | ---------------------------- | ---------------------------- |
+| a name under the suffix          | `OK`                         | loads, `isSecureContext`     |
+| `evil.example`, same authority   | `permitted subtree violation` | `net::ERR_CERT_INVALID`     |
+
+Remove the constraint and the same certificate verifies `OK` — that is the mkcert situation.
+
+`ssh-browser trust` prints the install command for your platform and stops. **Nothing here puts
+anything in a trust store**: that changes how the whole machine treats the internet, is not undone
+by uninstalling this, and is not a decision a background process should make. The command to
+remove it again is printed beside the one that installs it.
+
+Firefox and Safari are unmeasured. Firefox keeps its own store and does not read the system one.
 
 ## What an http origin does not buy
 
-An alias origin is plain http on a name that is not loopback, so it is not a potentially trustworthy
-origin and the secure-context APIs are simply not there. Measured, both ways:
+This is the argument for `--scheme https`, and it is why that exists.
 
-|                    | `http://alias.ssh-browser` | `http://127.0.0.1:7391` |
-| ------------------ | -------------------------- | ----------------------- |
-| `isSecureContext`  | no                         | yes                     |
-| service workers    | absent                     | present                 |
-| `crypto.subtle`    | absent                     | present                 |
-| `caches`           | absent                     | present                 |
-| IndexedDB          | present                    | present                 |
+An alias origin over plain http is on a name that is not loopback, so it is not a potentially
+trustworthy origin and the secure-context APIs are simply not there. Measured, all three ways:
 
-The two modes trade against each other. Aliases give you origin separation: `a.ssh-browser` cannot read
-`b.ssh-browser`. The loopback fallback is a secure context, because 127.0.0.1 is potentially trustworthy
-by spec — but it puts every alias in one origin, so any page on one host can read every other. Neither
-gives both.
+|                    | `http://alias.ssh-browser` | `http://127.0.0.1:7391` | `https://alias.ssh-browser` |
+| ------------------ | -------------------------- | ----------------------- | --------------------------- |
+| `isSecureContext`  | no                         | yes                     | **yes**                     |
+| service workers    | absent                     | present                 | **present**                 |
+| `crypto.subtle`    | absent                     | present                 | **present**                 |
+| `caches`           | absent                     | present                 | **present**                 |
+| IndexedDB          | present                    | present                 | present                     |
+| one origin per host| yes                        | **no**                  | **yes**                     |
 
-Pick loopback if the page needs a service worker or WebCrypto and you only ever open one host. Pick
-aliases otherwise, which is the default. `https` is what would give both, and is why it is designed
-rather than dropped.
+The first two columns trade against each other. http aliases give origin separation:
+`a.ssh-browser` cannot read `b.ssh-browser`. The loopback fallback is a secure context, because
+127.0.0.1 is potentially trustworthy by spec — but it puts every alias in one origin, so any page
+on one host can read every other.
 
-A page that only wants ES modules, `fetch`, XHR, `localStorage` or IndexedDB is unaffected — that is
-most of them, and all of what `file://` breaks.
+**`https` is the column with both**, and needs one manual step: trusting the constrained authority
+once. See [URLs](#urls).
+
+`http` is still the default, because a default that silently required a trusted root would fail for
+everybody who had not done it, and fail at the TLS layer where the reason is least visible. A page
+that only wants ES modules, `fetch`, XHR, `localStorage` or IndexedDB does not need any of this —
+that is most of them, and all of what `file://` breaks.
 
 ## Usage
 
