@@ -182,6 +182,26 @@ async function main() {
       assert.equal(toLookalike, "DIRECT"),
     );
 
+    // The PAC routes the bare suffix too, and for a long time the daemon refused it — so the
+    // script sent a browser somewhere that answered 403. Routing somewhere that refuses is
+    // worse than not routing, and neither half of a disagreement like that can see the other.
+    // These two checks are the agreement itself.
+    const toIndex = await routeAccordingToPac(`http://${SUFFIX}/`, SUFFIX);
+    const indexPage = await request({ path: "/", host: SUFFIX });
+    const indexElsewhere = await request({ path: "/anything", host: SUFFIX });
+
+    check("the suffix on its own routes to the daemon", () =>
+      assert.equal(toIndex, `PROXY 127.0.0.1:${PORT}`),
+    );
+    check("and the daemon answers it with the list of sites", () => {
+      assert.equal(indexPage.status, 200);
+      // Each link is to a site's own origin, which is the difference between this page and the
+      // same list on the loopback listener, where everything shares one origin.
+      assert.match(indexPage.body, new RegExp(`href="https?://${ALIAS}\.${SUFFIX}/"`));
+    });
+    // Nothing else is there: every path belongs to a site, and a site is a different origin.
+    check("but nothing else is at the suffix", () => assert.equal(indexElsewhere.status, 404));
+
     console.log("\nwhat the daemon refuses");
     const rebinding = await request({ path: "/", host: "evil.example" });
     const traversal = await alias("/%2e%2e/%2e%2e/etc/passwd");

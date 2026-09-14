@@ -719,7 +719,41 @@ impl Origin {
                 self.alias(&method, alias, path, &cond, query.as_deref())
                     .await
             }
+            Ok(guard::Target::Index { path }) => self.index(&method, path).await,
         }
+    }
+
+    /// The front door: `http(s)://<suffix>/`, listing what is being served.
+    ///
+    /// The same list the loopback listener shows at its root, on a real origin instead. That
+    /// difference is the point: from here a link to a site is a navigation to a *different*
+    /// origin, which is what those links mean. Reached through the loopback listener they are
+    /// links within one origin, because everything there shares one.
+    ///
+    /// Read-only and with no control API, like any alias origin. This is a page the browser can
+    /// be pointed at, so it is held to what a page may do.
+    async fn index(&self, method: &Method, path: &str) -> Response<Full<Bytes>> {
+        if !matches!(*method, Method::GET | Method::HEAD) {
+            return fail(
+                StatusCode::METHOD_NOT_ALLOWED,
+                format!("{method} is not allowed: this origin is read-only"),
+            );
+        }
+        // Only the root. There is nothing else here — every path belongs to a site, and a site
+        // is a different origin — so anything else is a 404 rather than a redirect that would
+        // guess which site was meant.
+        if path != "/" {
+            return fail(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "{path:?} is not here: this origin is the list of sites, and each site is its own origin"
+                ),
+            );
+        }
+        plain_ok(
+            "text/html; charset=utf-8",
+            Bytes::from(self.alias_index().await),
+        )
     }
 
     async fn direct(
