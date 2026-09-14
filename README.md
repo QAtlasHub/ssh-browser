@@ -138,6 +138,18 @@ on one host can read every other.
 **`https` is the column with both**, and needs one manual step: trusting the constrained authority
 once. See [URLs](#urls).
 
+It costs nothing measurable. Three real sites on a host over SSH — Documenter output, a
+board of 400 figures, a generated report — in the same session, back to back:
+
+| | http | https |
+| --- | --- | --- |
+| Documenter output | 2661 ms, 27 round trips | 2789 ms, 25 round trips |
+| a 400-figure board | 2425 ms, 49 round trips | 2477 ms, 50 round trips |
+| a small report | 937 ms, 20 round trips | 955 ms, 17 round trips |
+
+The round trips are the same because they are about SFTP, which the scheme does not touch; the
+wall time differs by less than the run-to-run spread of the network.
+
 `http` is still the default, because a default that silently required a trusted root would fail for
 everybody who had not done it, and fail at the TLS layer where the reason is least visible. A page
 that only wants ES modules, `fetch`, XHR, `localStorage` or IndexedDB does not need any of this —
