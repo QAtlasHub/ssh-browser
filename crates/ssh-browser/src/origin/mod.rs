@@ -18,6 +18,7 @@ pub mod range;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::RwLock;
@@ -176,6 +177,12 @@ struct KnownHosts {
     open: Vec<OpenAlias>,
     hosts: Vec<KnownHost>,
     unusable: Vec<ssh_config::Unusable>,
+    /// What TLS handshakes have done, under https.
+    ///
+    /// Here as well as on `hello` because this is the route the dashboard polls, and the answer
+    /// belongs where somebody is looking. `None` under http, where there are no handshakes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls: Option<control::Handshakes>,
 }
 
 /// Whether a configured base is one this daemon can resolve.
@@ -310,6 +317,14 @@ pub struct Origin {
     /// a seventh that forgot would hand somebody a link to the wrong scheme — which under
     /// https is not a cosmetic difference but a different origin.
     scheme: String,
+    /// What TLS handshakes have done, which is the only portable way to learn whether the
+    /// authority is trusted.
+    ///
+    /// Nothing can ask a trust store the question directly and get a portable answer — but a
+    /// handshake *is* the answer. One that completes proves the browser accepted the
+    /// certificate; one that fails at this stage almost always means it did not. So the daemon
+    /// stops guessing and reports what happened.
+    handshakes: Handshakes,
     /// The serving certificate, when there is one.
     ///
     /// `None` under http, and that is what a `CONNECT` is refused by: there is no certificate to
@@ -348,6 +363,7 @@ pub struct Bound {
 pub struct Startup {
     routes: Vec<String>,
     refused: Vec<String>,
+    trust: Option<String>,
 }
 
 impl Startup {
@@ -365,6 +381,17 @@ impl Startup {
     /// on an ordinary run; not an error, because the daemon is serving everything else.
     pub fn refused(&self) -> &[String] {
         &self.refused
+    }
+
+    /// What to say about the certificate, under https.
+    ///
+    /// `None` under http, where there is nothing to trust. Under https there is always
+    /// something to say, because nothing portable can tell whether the authority is *still*
+    /// trusted — and a daemon that advertised `https://...` and said nothing else left a
+    /// first-time reader at `ERR_CERT_AUTHORITY_INVALID` with no way to guess what to do. That
+    /// was measured by following the banner on a machine that had never run this.
+    pub fn trust(&self) -> Option<&str> {
+        self.trust.as_deref()
     }
 }
 
@@ -407,9 +434,12 @@ impl Origin {
         // https mode fails at startup with a reason rather than on the first request with a
         // handshake error. Under http nothing is generated at all: no key is written for a
         // feature nobody asked for.
-        let tls = match scheme.as_str() {
-            "http" => None,
-            "https" => Some(Arc::new(serving_config(&suffix)?)),
+        let (tls, trust) = match scheme.as_str() {
+            "http" => (None, None),
+            "https" => {
+                let (config, advice) = serving_config(&suffix)?;
+                (Some(Arc::new(config)), Some(advice))
+            }
             other => bail!("scheme {other:?} is not one this daemon serves; use http or https"),
         };
 
@@ -466,6 +496,7 @@ impl Origin {
             token,
             theme: RwLock::new(theme),
             reachable: RwLock::new(hosts),
+            handshakes: Handshakes::default(),
         });
 
         // Opened after the aliases, and on different terms. An alias failing stops the daemon:
@@ -477,7 +508,14 @@ impl Origin {
         let (opened, refused) = origin.open_enabled().await;
         routes.extend(opened);
 
-        Ok((Bound { origin, listener }, Startup { routes, refused }))
+        Ok((
+            Bound { origin, listener },
+            Startup {
+                routes,
+                refused,
+                trust,
+            },
+        ))
     }
 }
 
@@ -561,7 +599,10 @@ impl Origin {
         let Some(config) = self.tls.clone() else {
             return fail(
                 StatusCode::NOT_IMPLEMENTED,
-                "this daemon serves http; CONNECT needs the https mode and a certificate.                  Set scheme = \"https\" and see `ssh-browser trust`.",
+                concat!(
+                    "this daemon serves http; CONNECT needs the https mode and a certificate. ",
+                    "Set scheme = \"https\" and see `ssh-browser trust`.",
+                ),
             );
         };
 
@@ -572,12 +613,30 @@ impl Origin {
                 return;
             };
             let acceptor = tokio_rustls::TlsAcceptor::from(config);
-            let Ok(tls) = acceptor.accept(TokioIo::new(upgraded)).await else {
-                // A failed handshake is the browser's to report: it is the one that knows
-                // whether the certificate was refused or the name did not match, and it shows
-                // that on the page. Saying it again here would be noise on every visit by
-                // somebody who has not run `ssh-browser trust` yet.
-                return;
+            let tls = match acceptor.accept(TokioIo::new(upgraded)).await {
+                Ok(tls) => {
+                    me.handshakes.completed.fetch_add(1, Ordering::Relaxed);
+                    tls
+                }
+                Err(e) => {
+                    // Reported, and this used to be silent. The browser shows the reader
+                    // `ERR_CERT_AUTHORITY_INVALID` on the page — but the fix is a command, and
+                    // commands live in the terminal, which is where nothing was being said.
+                    //
+                    // Only the first, because a page pulls many subresources and every one of
+                    // them fails the same way: the second copy onwards is noise around the one
+                    // line that matters.
+                    if me.handshakes.failed.fetch_add(1, Ordering::Relaxed) == 0 {
+                        eprintln!();
+                        eprintln!("a browser refused the certificate: {e}");
+                        // Two calls rather than one string with a line continuation in it. Three
+                        // separate messages here have now shipped carrying the source file's own
+                        // indentation into the middle of a sentence.
+                        eprintln!("  almost always the local authority is not trusted yet.");
+                        eprintln!("  `ssh-browser trust` prints how to trust it.");
+                    }
+                    return;
+                }
             };
             // Inside the tunnel the requests are ordinary origin-form GETs carrying a `Host`,
             // so they go through exactly the same handler as the http mode. That is the point of
@@ -963,6 +1022,10 @@ impl Origin {
                     &self.suffix,
                     &self.scheme,
                     self.round_trips().await,
+                    self.tls.is_some().then(|| control::Handshakes {
+                        completed: self.handshakes.completed.load(Ordering::Relaxed),
+                        failed: self.handshakes.failed.load(Ordering::Relaxed),
+                    }),
                 )
             }
             (&Method::GET, "hosts") => self.list_hosts().await,
@@ -1060,6 +1123,10 @@ impl Origin {
             open,
             hosts,
             unusable: found.unusable,
+            tls: self.tls.is_some().then(|| control::Handshakes {
+                completed: self.handshakes.completed.load(Ordering::Relaxed),
+                failed: self.handshakes.failed.load(Ordering::Relaxed),
+            }),
         })
     }
 
@@ -2201,6 +2268,17 @@ fn entry_for<'a>(known: &'a [ssh_config::Host], name: &str) -> Option<&'a ssh_co
         .find(|h| h.alias == name || h.host.eq_ignore_ascii_case(name))
 }
 
+/// Completed and failed TLS handshakes since this daemon started.
+///
+/// Two counters rather than a single "is it trusted" flag, because the two facts are different
+/// and a reader needs both: a failure says the step was missed, and a success says it was taken.
+/// A flag would have to pick one moment to believe.
+#[derive(Debug, Default)]
+struct Handshakes {
+    completed: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+}
+
 /// A rustls configuration that mints a certificate for whatever name the handshake asks for.
 ///
 /// Per name rather than one wildcard, because a wildcard does not work: `*.ssh-browser` is
@@ -2208,8 +2286,35 @@ fn entry_for<'a>(known: &'a [ssh_config::Host], name: &str) -> Option<&'a ssh_co
 /// registry and a wildcard directly beneath one reads as covering a whole top-level domain. A
 /// certificate naming the alias outright is accepted, and the origin is then a real secure
 /// context — service workers, `crypto.subtle` and all.
-fn serving_config(suffix: &str) -> Result<rustls::ServerConfig> {
-    let authority = tls::load_or_create(suffix)?;
+fn serving_config(suffix: &str) -> Result<(rustls::ServerConfig, String)> {
+    let (authority, found) = tls::load_or_create_reporting(suffix)?;
+
+    // Said on every https run, not only the first. Nothing portable can ask a trust store
+    // whether this is still in it, and the failure when it is not — `ERR_CERT_AUTHORITY_INVALID`
+    // on a URL the daemon itself just advertised — contains no hint that a command exists. A
+    // returning reader can skim two lines; a first-time reader cannot recover without them.
+    let path = tls::certificate_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "the state directory".to_string());
+    // A list of lines rather than one string with escapes in it. The last attempt at the latter
+    // shipped a banner carrying the source file's own indentation into the middle of a sentence.
+    let lines: Vec<String> = match found {
+        tls::Found::Created => vec![
+            "this run made a local certificate authority, and nothing trusts it yet.".to_string(),
+            "Until it is, the browser will refuse every page here:".to_string(),
+            String::new(),
+            "  ssh-browser trust".to_string(),
+            String::new(),
+            "prints the command for your platform, and the one that undoes it.".to_string(),
+            format!("The certificate is {path}"),
+        ],
+        tls::Found::Existing => vec![
+            "https: if the browser refuses a page, the local authority is not trusted.".to_string(),
+            "`ssh-browser trust` prints how.".to_string(),
+            format!("The certificate is {path}"),
+        ],
+    };
+    let advice = lines.join("\n");
 
     // No client authentication: the browser is not asked to prove anything, because nothing here
     // decides what to serve based on who is asking. The token does that, on the control API.
@@ -2224,7 +2329,7 @@ fn serving_config(suffix: &str) -> Result<rustls::ServerConfig> {
     // rather than left to chance: without it a browser may negotiate h2, which nothing here
     // serves, and the failure is a dead connection rather than a refusal.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(config)
+    Ok((config, advice))
 }
 
 /// Signs a certificate the first time each name is asked for, and remembers it.
@@ -2742,6 +2847,7 @@ mod tests {
             // Empty on purpose: these tests build their session map directly, so nothing here
             // should be opening anything behind their backs.
             reachable: RwLock::new(reachable::Set::default()),
+            handshakes: Handshakes::default(),
         }
     }
 

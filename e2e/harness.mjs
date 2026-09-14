@@ -99,7 +99,10 @@ async function sources(root) {
 /// Waiting for the line rather than sleeping: a fixed sleep is either too short on a loaded
 /// runner, which makes the caller flaky, or too long everywhere else. The line is printed only
 /// once the port has been taken and every host is connected, so it means what it says.
-export async function startDaemon(port) {
+/// `scheme` defaults to the daemon's own default, which is http. Passing `"https"` makes it
+/// generate a certificate authority inside the isolated state directory below — where it is
+/// thrown away with everything else, and where it is trusted by nothing.
+export async function startDaemon(port, { scheme } = {}) {
   await refuseIfStale();
 
   // An empty config file, named explicitly. Without it the daemon reads whatever
@@ -115,7 +118,9 @@ export async function startDaemon(port) {
     // prettier-ignore
     [
       "serve", "--config", empty, "--port", String(port),
-      "--suffix", SUFFIX, `${ALIAS}=${HOST}:${BASE}`,
+      "--suffix", SUFFIX,
+      ...(scheme ? ["--scheme", scheme] : []),
+      `${ALIAS}=${HOST}:${BASE}`,
     ],
     {
       stdio: ["ignore", "pipe", "pipe"],

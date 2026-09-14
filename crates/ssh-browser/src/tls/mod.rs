@@ -387,8 +387,24 @@ pub fn certificate_path() -> Option<PathBuf> {
     Some(authority_dir()?.join("authority.pem"))
 }
 
+/// Whether the authority was already there, which decides how loudly to say what to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    /// Read back from a previous run. It may or may not still be trusted; nothing portable can
+    /// tell, so the caller reminds rather than instructs.
+    Existing,
+    /// Made just now, so it is certainly not trusted yet and the reader has a step to take
+    /// before anything will load.
+    Created,
+}
+
 /// Load the authority for `suffix`, or make one and write it down.
 pub fn load_or_create(suffix: &str) -> Result<Authority> {
+    Ok(load_or_create_reporting(suffix)?.0)
+}
+
+/// The same, saying which of the two happened.
+pub fn load_or_create_reporting(suffix: &str) -> Result<(Authority, Found)> {
     let Some(dir) = authority_dir() else {
         bail!("no state directory to keep a local certificate authority in");
     };
@@ -398,7 +414,7 @@ pub fn load_or_create(suffix: &str) -> Result<Authority> {
     let cert_path = dir.join("authority.pem");
 
     if let Some(found) = load(&key_path, &cert_path, suffix) {
-        return Ok(found);
+        return Ok((found, Found::Existing));
     }
 
     let authority = Authority::create(suffix)?;
@@ -409,7 +425,7 @@ pub fn load_or_create(suffix: &str) -> Result<Authority> {
         .with_context(|| format!("writing {}", key_path.display()))?;
     std::fs::write(&cert_path, authority.certificate_pem())
         .with_context(|| format!("writing {}", cert_path.display()))?;
-    Ok(authority)
+    Ok((authority, Found::Created))
 }
 
 /// An authority already on disk, if there is one and it is for this suffix.
