@@ -129,6 +129,48 @@ async function routeAccordingToPac(url, host) {
   );
 }
 
+/// One site's card, as the browser resolved it.
+///
+/// The same `[data-alias]` finds it on the extension's dashboard and at the root of the
+/// suffix, where it is a `button` and an `a` respectively. Computed properties rather than
+/// the markup, because the claim is that the two pages *look* the same, and the only way a
+/// shared stylesheet fails is by not arriving.
+function cardShape(page, alias) {
+  return page.evaluate((name) => {
+    const card = document.querySelector(`#view [data-alias="${name}"]`);
+    if (!card) return null;
+    // Longhands, not shorthands: `border` and `font` serialise differently between a button
+    // and a link even when every component matches, which would fail for no reason.
+    const look = (el) => {
+      const s = getComputedStyle(el);
+      return [
+        "color",
+        "backgroundColor",
+        "fontFamily",
+        "fontSize",
+        "fontWeight",
+        "lineHeight",
+        "display",
+        "padding",
+        "borderTopWidth",
+        "borderTopStyle",
+        "borderTopColor",
+        "borderRadius",
+        "textAlign",
+        "textDecorationLine",
+      ]
+        .map((p) => `${p}:${s[p]}`)
+        .join(";");
+    };
+    const fields = {};
+    for (const cls of ["name", "url", "where"]) {
+      const el = card.querySelector(`.${cls}`);
+      fields[cls] = el === null ? null : { text: el.textContent, look: look(el) };
+    }
+    return { look: look(card), fields };
+  }, alias);
+}
+
 /// What a page ended up being, as the browser sees it.
 ///
 /// Read out of the DOM rather than out of the network log, because the claim is about what the
@@ -676,6 +718,26 @@ async function main() {
       );
       assert.ok(row.endsWith(tail), `the row should name the root ${tail}: ${row}`);
     });
+
+    // The root of the suffix is this page, from the same stylesheet. Checked by comparing what
+    // a browser made of each card rather than by comparing the two sources: one file is only
+    // worth having if both ends actually read it, and a build that forgot to copy it into
+    // `dist/` would leave the markup identical and the page unstyled.
+    const front = await browser.newPage();
+    await front.goto(`http://${SUFFIX}/`, { waitUntil: "domcontentloaded" });
+    const [onDashboard, onFront] = await Promise.all([
+      cardShape(dashboard, ALIAS),
+      cardShape(front, ALIAS),
+    ]);
+    await front.close();
+
+    check("the root of the suffix is the dashboard's own page", () => {
+      assert.notEqual(onFront, null, "no site card at the root of the suffix");
+      assert.deepEqual(onFront?.look, onDashboard?.look);
+    });
+    check("with the same three things said about the site", () =>
+      assert.deepEqual(onFront?.fields, onDashboard?.fields),
+    );
 
     // Nothing to paste is the point: the dashboard asked the daemon for the token, and the
     // daemon hands it to anything that is not a page. A field for it would mean the old

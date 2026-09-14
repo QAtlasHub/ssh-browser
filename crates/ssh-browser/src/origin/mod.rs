@@ -2168,21 +2168,73 @@ fn first_symlink(held: &HashMap<String, Vec<Entry>>, chain: &[(String, String)])
     })
 }
 
+/// What the dashboard looks like, compiled in.
+///
+/// Shared with the extension, which links the same file out of `dist/` — see the note at the
+/// top of it. The root of the suffix and the dashboard are one page in two places, and one
+/// stylesheet is what keeps them one page.
+const DASHBOARD_CSS: &str = include_str!("../../assets/dashboard.css");
+
 impl Origin {
+    /// The root of the suffix, and the root of the loopback listener: the sites, listed.
+    ///
+    /// The extension's dashboard, as far as it goes. It cannot go all the way: serving a host
+    /// and stopping one are control-API calls, and nothing about how to reach a host is
+    /// reported anywhere but there. What is left is the half that is already public — the
+    /// sites being served, each already announcing its own name in its own URL.
+    ///
+    /// A card here is a link where the dashboard's is a button, because there is nowhere to
+    /// route to within this page and the site's own origin is the honest destination.
     async fn alias_index(&self) -> String {
-        let names = self.alias_names().await;
+        let mut sites: Vec<(String, String, String)> = self
+            .sessions
+            .read()
+            .await
+            .iter()
+            .map(|(alias, s)| (alias.clone(), s.host.clone(), s.base.clone()))
+            .collect();
+        sites.sort();
+
         let mut s = String::from(
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>ssh-browser</title></head><body><h1>ssh-browser</h1><ul>",
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+             <title>ssh-browser</title><style>",
         );
-        for name in names {
-            let href = self.site_url(&name);
-            s.push_str("<li><a href=\"");
-            s.push_str(&escape(&href));
-            s.push_str("\">");
-            s.push_str(&escape(&href));
-            s.push_str("</a></li>");
+        s.push_str(DASHBOARD_CSS);
+        s.push_str("</style></head><body><h1>ssh-browser</h1><div id=\"view\"><h2>sites</h2>");
+
+        if sites.is_empty() {
+            s.push_str(
+                "<p class=\"empty\">Nothing is being served yet. \
+                 Open the ssh-browser dashboard to pick a host.</p>",
+            );
+        } else {
+            s.push_str("<ul>");
+            for (alias, host, base) in &sites {
+                let href = escape(&self.site_url(alias));
+                s.push_str("<li><a data-alias=\"");
+                // The same attribute the dashboard's card carries, so one selector finds the
+                // card on either page -- which is how the two are checked against each other.
+                s.push_str(&escape(alias));
+                s.push_str("\" href=\"");
+                s.push_str(&href);
+                s.push_str("\"><div class=\"name\">");
+                s.push_str(&escape(alias));
+                s.push_str("</div><div class=\"url\">");
+                s.push_str(&href);
+                s.push_str("</div><div class=\"where\">");
+                s.push_str(&escape(&format!("{host}:{base}")));
+                s.push_str("</div></a></li>");
+            }
+            s.push_str("</ul>");
         }
-        s.push_str("</ul></body></html>");
+
+        s.push_str(
+            "<p class=\"note\">Each of these is its own origin, which is what this page is a \
+             list of. Serving a host and stopping one happen in the extension's dashboard: \
+             those go through the daemon's control API, and no page reaches that.</p>\
+             </div></body></html>",
+        );
         s
     }
 }
