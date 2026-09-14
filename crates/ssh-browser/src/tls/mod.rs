@@ -407,14 +407,48 @@ fn load(key_path: &Path, cert_path: &Path, suffix: &str) -> Option<Authority> {
     }
 }
 
-/// What to run to trust this authority, for the platform this is running on.
+/// Which trust store the instructions are for.
 ///
+/// A parameter rather than a `cfg!`, so all three can be checked on one machine. They were
+/// `cfg!` branches, and the branch nobody ran locally was the one that turned out to be wrong:
+/// the Linux text never named the authority, so the test asserting that it did passed on Windows
+/// and failed in CI. A platform-specific string that only its own platform can test is a string
+/// nobody tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Store {
+    /// The current account's root store. Needs no elevation.
+    Windows,
+    /// The login keychain. Prompts for a password.
+    MacOs,
+    /// The system anchors, wherever the distribution puts them — and Firefox, which keeps its
+    /// own and does not read them.
+    Other,
+}
+
+impl Store {
+    /// The one this daemon is running on.
+    pub fn here() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// What to run to trust this authority, for the platform this is running on.
+pub fn trust_instructions(cert_path: &Path) -> String {
+    instructions_for(Store::here(), cert_path)
+}
+
 /// Printed, never executed. The three differ in more than spelling: the Windows one needs no
 /// elevation and writes to this account only, the macOS one prompts for a password and writes to
 /// the login keychain, and on Linux the location depends on the distribution while Firefox keeps
 /// its own store regardless. Guessing wrong while running as somebody's shell is not a thing to
 /// do quietly.
-pub fn trust_instructions(cert_path: &Path) -> String {
+pub fn instructions_for(store: Store, cert_path: &Path) -> String {
     let path = cert_path.display();
     let preamble = format!(
         "The certificate to trust is\n  {path}\n\n\
@@ -422,24 +456,22 @@ pub fn trust_instructions(cert_path: &Path) -> String {
          suffix and nothing else. Nothing here installs it — the command below is yours to run,\n\
          and the one after it undoes this.\n\n"
     );
-    if cfg!(windows) {
-        format!(
+    match store {
+        Store::Windows => format!(
             "{preamble}Trust it for this account only, no administrator rights needed:\n\
              \x20 certutil -addstore -user Root \"{path}\"\n\n\
              Undo:\n\
              \x20 certutil -delstore -user Root \"{AUTHORITY_NAME}\"\n\n\
              Check what is there:\n\
              \x20 certutil -store -user Root | findstr /C:\"{AUTHORITY_NAME}\"\n"
-        )
-    } else if cfg!(target_os = "macos") {
-        format!(
+        ),
+        Store::MacOs => format!(
             "{preamble}Trust it in your login keychain (it will ask for your password):\n\
              \x20 security add-trusted-cert -k ~/Library/Keychains/login.keychain-db \"{path}\"\n\n\
              Undo:\n\
              \x20 security delete-certificate -c \"{AUTHORITY_NAME}\" ~/Library/Keychains/login.keychain-db\n"
-        )
-    } else {
-        format!(
+        ),
+        Store::Other => format!(
             "{preamble}Where this goes depends on the distribution. On Debian and Ubuntu:\n\
              \x20 sudo cp \"{path}\" /usr/local/share/ca-certificates/ssh-browser.crt\n\
              \x20 sudo update-ca-certificates\n\n\
@@ -447,8 +479,9 @@ pub fn trust_instructions(cert_path: &Path) -> String {
              \x20 sudo rm /usr/local/share/ca-certificates/ssh-browser.crt\n\
              \x20 sudo update-ca-certificates --fresh\n\n\
              Firefox keeps its own store and does not read that one. Import it under Settings,\n\
-             Privacy & Security, Certificates, View Certificates, Authorities, Import.\n"
-        )
+             Privacy & Security, Certificates, View Certificates, Authorities, Import — and to\n\
+             remove it again, find \"{AUTHORITY_NAME}\" in that same list and delete it.\n"
+        ),
     }
 }
 
@@ -596,17 +629,49 @@ mod tests {
         );
     }
 
-    /// Instructions name the file and say how to undo the install.
+    /// Every platform's instructions name the file, name the authority, and say how to undo it.
+    ///
+    /// All three on whichever machine runs this, which is the point. They used to be `cfg!`
+    /// branches and this test saw only one of them — so the Linux text, which never named the
+    /// authority, passed on Windows and failed in CI. A platform-specific string only its own
+    /// platform can test is a string nobody tests.
     #[test]
-    fn the_instructions_name_the_certificate_and_how_to_undo_it() {
+    fn every_platforms_instructions_say_what_to_install_and_how_to_undo_it() {
+        for store in [Store::Windows, Store::MacOs, Store::Other] {
+            let said = instructions_for(store, Path::new("/tmp/authority.pem"));
+            assert!(said.contains("authority.pem"), "{store:?}: {said}");
+            assert!(
+                said.contains("Undo:"),
+                "{store:?}: telling somebody to install a root without saying how to remove it \
+                 is half an instruction: {said}"
+            );
+            // The name is how they find it again in a list months later, when the path this
+            // printed is long forgotten.
+            assert!(
+                said.contains(AUTHORITY_NAME),
+                "{store:?}: nothing names the authority, so it cannot be found to remove: {said}"
+            );
+        }
+    }
+
+    /// And the platform this is running on gets its own instructions, not somebody else's.
+    ///
+    /// Without this, `Store::here()` could return one constant and every assertion above would
+    /// still pass.
+    #[test]
+    fn the_instructions_printed_here_are_for_this_platform() {
         let said = trust_instructions(Path::new("/tmp/authority.pem"));
-        assert!(said.contains("authority.pem"), "{said}");
+        let expect = if cfg!(windows) {
+            "certutil"
+        } else if cfg!(target_os = "macos") {
+            "security add-trusted-cert"
+        } else {
+            "update-ca-certificates"
+        };
         assert!(
-            said.contains("Undo:"),
-            "telling somebody to install a root without saying how to remove it is half an \
-             instruction: {said}"
+            said.contains(expect),
+            "expected {expect:?} for this platform: {said}"
         );
-        assert!(said.contains(AUTHORITY_NAME), "{said}");
     }
 
     /// An independent verifier refuses a name outside the constraint.
