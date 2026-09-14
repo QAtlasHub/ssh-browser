@@ -30,5 +30,16 @@
   },
   "omnibox": {
     "keyword": "ssh"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "dashboard.html"
+      ],
+      "matches": [
+        "http://ssh-browser/*",
+        "https://ssh-browser/*"
+      ]
+    }
+  ]
 }

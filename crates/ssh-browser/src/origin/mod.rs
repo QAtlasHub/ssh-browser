@@ -325,6 +325,17 @@ pub struct Origin {
     /// certificate; one that fails at this stage almost always means it did not. So the daemon
     /// stops guessing and reports what happened.
     handshakes: Handshakes,
+    /// Which extension is the dashboard, once one has said so.
+    ///
+    /// There is one dashboard, and it is the extension's. This is how the root of the suffix
+    /// knows where to send a browser instead of drawing a second one: the extension names
+    /// itself on `hello`, and the root hands that back as the address to go to.
+    ///
+    /// Only ever an id — never a token, never anything about a host — and only from a caller
+    /// that already holds the control token. Held rather than stored, so a daemon that has
+    /// not been connected to since it started simply has no dashboard to point at, which is
+    /// the truth at that moment.
+    dashboard: RwLock<Option<String>>,
     /// The certificate resolver, when there is one.
     ///
     /// Held here as well as inside the TLS configuration, because `/_control/certificate` answers
@@ -504,6 +515,7 @@ impl Origin {
             theme: RwLock::new(theme),
             reachable: RwLock::new(hosts),
             handshakes: Handshakes::default(),
+            dashboard: RwLock::new(None),
         });
 
         // Opened after the aliases, and on different terms. An alias failing stops the daemon:
@@ -750,7 +762,11 @@ impl Origin {
                 ),
             );
         }
-        own_page(self.alias_index().await)
+        // Only here. The loopback listener is what a browser without the extension is told
+        // to use, so sending *it* into an extension page would be sending it somewhere it
+        // cannot go -- and that listener is the one place the fallback is the real answer.
+        let to = self.dashboard.read().await.clone();
+        own_page(self.alias_index(to.as_deref()).await)
     }
 
     async fn direct(
@@ -805,7 +821,7 @@ impl Origin {
 
         let rest = path.trim_start_matches('/');
         if rest.is_empty() {
-            return own_page(self.alias_index().await);
+            return own_page(self.alias_index(None).await);
         }
 
         let (alias, sub) = rest.split_once('/').unwrap_or((rest, ""));
@@ -1057,6 +1073,11 @@ impl Origin {
     ) -> Response<Full<Bytes>> {
         match (method, control::route_of(path)) {
             (&Method::GET, "hello") => {
+                // Where the dashboard is, which the root of the suffix needs and cannot
+                // discover: a page cannot enumerate extensions, so the extension says.
+                if let Some(id) = extension_id(query) {
+                    *self.dashboard.write().await = Some(id);
+                }
                 let aliases = self.alias_names().await;
                 control::hello(
                     &aliases,
@@ -2162,6 +2183,20 @@ fn first_symlink(held: &HashMap<String, Vec<Entry>>, chain: &[(String, String)])
     })
 }
 
+/// The `?dashboard=` an extension names itself with on `hello`, if it is one.
+///
+/// Strict to the point of being boring, because this ends up inside a URL in a `<script>` on
+/// the daemon's own page. Chrome derives an extension id as thirty-two letters from `a` to
+/// `p` and nothing else, so anything else is not an id and is dropped rather than escaped:
+/// there is no string that passes this and means something other than an extension.
+fn extension_id(query: Option<&str>) -> Option<String> {
+    let id = query?
+        .split('&')
+        .find_map(|p| p.strip_prefix("dashboard="))?;
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_lowercase() && b <= b'p'))
+        .then(|| id.to_string())
+}
+
 /// What the dashboard looks like, compiled in.
 ///
 /// Shared with the extension, which links the same file out of `dist/` — see the note at the
@@ -2170,16 +2205,19 @@ fn first_symlink(held: &HashMap<String, Vec<Entry>>, chain: &[(String, String)])
 const DASHBOARD_CSS: &str = include_str!("../../assets/dashboard.css");
 
 impl Origin {
-    /// The root of the suffix, and the root of the loopback listener: the sites, listed.
+    /// The root of the suffix, and the root of the loopback listener: the front door.
     ///
-    /// The extension's dashboard, as far as it goes. It cannot go all the way: serving a host
-    /// and stopping one are control-API calls, and nothing about how to reach a host is
-    /// reported anywhere but there. What is left is the half that is already public — the
-    /// sites being served, each already announcing its own name in its own URL.
+    /// There is one dashboard and it is the extension's, so the first thing this does is hand
+    /// a browser over to it. Drawing a second one here was the alternative and it is the wrong
+    /// one twice over: the halves that matter — the hosts you can serve, serving one, stopping
+    /// one — are control-API calls that no page reaches, and two drawings of one page is two
+    /// things to keep identical.
     ///
-    /// A card here is a link where the dashboard's is a button, because there is nowhere to
-    /// route to within this page and the site's own origin is the honest destination.
-    async fn alias_index(&self) -> String {
+    /// What is left below the hand-over is the fallback, and it is only ever seen by something
+    /// that cannot follow it: a local tool with `--proxy`, a daemon nothing has connected to
+    /// yet, or a suffix the extension was not built with. It says what is being served and
+    /// nothing that is not already public.
+    async fn alias_index(&self, dashboard: Option<&str>) -> String {
         let mut sites: Vec<(String, String, String)> = self
             .sessions
             .read()
@@ -2195,7 +2233,30 @@ impl Origin {
              <title>ssh-browser</title><style>",
         );
         s.push_str(DASHBOARD_CSS);
-        s.push_str("</style></head><body><h1>ssh-browser</h1><div id=\"view\"><h2>sites</h2>");
+        s.push_str("</style>");
+
+        // In the head, so nothing below is ever painted on the way past. The id is thirty-two
+        // letters or it is not here at all, which is what makes putting it inside a script
+        // safe without escaping -- see `extension_id`.
+        if let Some(id) = dashboard {
+            s.push_str("<script>location.replace(\"chrome-extension://");
+            s.push_str(id);
+            s.push_str("/dashboard.html\")</script>");
+        }
+        s.push_str("</head><body><h1>ssh-browser</h1><div id=\"view\">");
+
+        if let Some(id) = dashboard {
+            // Read only by somebody the browser refused that navigation to, which it does
+            // unless the extension lists this exact origin in `web_accessible_resources` --
+            // so a custom suffix arrives here. Same address, for a reader to take by hand.
+            s.push_str("<p class=\"note\">The dashboard is at <a href=\"chrome-extension://");
+            s.push_str(id);
+            s.push_str("/dashboard.html\">chrome-extension://");
+            s.push_str(id);
+            s.push_str("/dashboard.html</a>.</p>");
+        }
+
+        s.push_str("<h2>sites</h2>");
 
         if sites.is_empty() {
             s.push_str(
@@ -2225,8 +2286,8 @@ impl Origin {
 
         s.push_str(
             "<p class=\"note\">Each of these is its own origin, which is what this page is a \
-             list of. Serving a host and stopping one happen in the extension's dashboard: \
-             those go through the daemon's control API, and no page reaches that.</p>\
+             list of. Serving a host and stopping one happen in the dashboard: those go \
+             through the daemon's control API, and no page reaches that.</p>\
              </div></body></html>",
         );
         s
@@ -2967,6 +3028,75 @@ mod tests {
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    /// A real one, as Chrome derives them: thirty-two letters, none past `p`.
+    const AN_EXTENSION: &str = "ndilofdepphikcodahklfjggbacbbhcc";
+
+    #[test]
+    fn an_extension_names_itself() {
+        assert_eq!(
+            extension_id(Some(&format!("dashboard={AN_EXTENSION}"))).as_deref(),
+            Some(AN_EXTENSION),
+        );
+        assert_eq!(
+            extension_id(Some(&format!("x=1&dashboard={AN_EXTENSION}"))).as_deref(),
+            Some(AN_EXTENSION),
+        );
+    }
+
+    #[test]
+    fn nothing_named_is_nothing_stored() {
+        assert_eq!(extension_id(None), None);
+        assert_eq!(extension_id(Some("")), None);
+        assert_eq!(extension_id(Some("dashboard=")), None);
+    }
+
+    /// The letters `q` to `z`, digits, and capitals are not in the alphabet Chrome uses, so a
+    /// string containing them is not an id. Kept as a test because the alphabet is the whole
+    /// reason the value needs no escaping where it is used.
+    #[test]
+    fn a_string_outside_the_alphabet_is_not_an_id() {
+        for bad in [
+            "ndilofdepphikcodahklfjggbacbbhcz", // z
+            "ndilofdepphikcodahklfjggbacbbhc1", // a digit
+            "ndilofdepphikcodahklfjggbacbbhcC", // a capital
+        ] {
+            assert_eq!(
+                extension_id(Some(&format!("dashboard={bad}"))),
+                None,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_length_is_not_an_id() {
+        for bad in [&AN_EXTENSION[..31], &format!("{AN_EXTENSION}a")[..]] {
+            assert_eq!(
+                extension_id(Some(&format!("dashboard={bad}"))),
+                None,
+                "{bad}"
+            );
+        }
+    }
+
+    /// The point of the whole check. This lands inside a `<script>` on the daemon's own page,
+    /// so anything that could close the string and keep going has to be refused rather than
+    /// escaped -- escaping is a thing one can forget, and a fixed alphabet is not.
+    #[test]
+    fn nothing_that_could_end_the_script_gets_through() {
+        for bad in [
+            "a\");alert(1);//aaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaa</script><script>",
+            "../../../../../../../../../etc/p",
+        ] {
+            assert_eq!(
+                extension_id(Some(&format!("dashboard={bad}"))),
+                None,
+                "{bad}"
+            );
+        }
+    }
+
     async fn body_of(res: Response<Full<Bytes>>) -> Bytes {
         res.into_body()
             .collect()
@@ -3048,6 +3178,7 @@ mod tests {
             // should be opening anything behind their backs.
             reachable: RwLock::new(reachable::Set::default()),
             handshakes: Handshakes::default(),
+            dashboard: RwLock::new(None),
         }
     }
 

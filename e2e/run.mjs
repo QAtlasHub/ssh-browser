@@ -696,7 +696,7 @@ async function main() {
     await tree.close();
 
     console.log("\nthe dashboard");
-    const { dashboard } = await connectThroughDashboard(browser, PORT);
+    const { dashboard, extensionId } = await connectThroughDashboard(browser, PORT);
     // Waited for, not assumed. `connectThroughDashboard` returns once the daemon line
     // names the port; the sites are fetched after that, so reading the rows straight
     // afterwards is a race that passes most of the time.
@@ -725,24 +725,56 @@ async function main() {
       assert.ok(row.endsWith(tail), `the row should name the root ${tail}: ${row}`);
     });
 
-    // The root of the suffix is this page, from the same stylesheet. Checked by comparing what
-    // a browser made of each card rather than by comparing the two sources: one file is only
-    // worth having if both ends actually read it, and a build that forgot to copy it into
-    // `dist/` would leave the markup identical and the page unstyled.
+    // There is one dashboard, and this is what makes it one: the root of the suffix hands a
+    // browser over to it rather than drawing a second. Typed, not clicked — this is the URL a
+    // reader would reach for, and the claim is about that URL and not about the toolbar.
     const front = await browser.newPage();
     await front.goto(`http://${SUFFIX}/`, { waitUntil: "domcontentloaded" });
-    const [onDashboard, onFront] = await Promise.all([
-      cardShape(dashboard, ALIAS),
-      cardShape(front, ALIAS),
-    ]);
+    await front.waitForURL(/^chrome-extension:/, { timeout: 10_000 }).catch(() => {});
+    const landedOn = front.url();
     await front.close();
 
-    check("the root of the suffix is the dashboard's own page", () => {
-      assert.notEqual(onFront, null, "no site card at the root of the suffix");
-      assert.deepEqual(onFront?.look, onDashboard?.look);
+    check("the root of the suffix hands a browser to the dashboard", () =>
+      assert.equal(landedOn, `chrome-extension://${extensionId}/dashboard.html`),
+    );
+
+    // And nothing else may follow it. The extension names one origin in
+    // `web_accessible_resources`, so a page served from a *host* — remote HTML, which is
+    // untrusted code — is refused the same navigation. Without that narrowing, any file on
+    // any host could open the page that holds the controls.
+    const onAHost = await browser.newPage();
+    await onAHost.goto(`http://${ALIAS}.${SUFFIX}/`, { waitUntil: "domcontentloaded" });
+    await onAHost
+      .evaluate((to) => location.replace(to), `chrome-extension://${extensionId}/dashboard.html`)
+      .catch(() => {});
+    await onAHost.waitForTimeout(1500);
+    const hostWent = onAHost.url();
+    await onAHost.close();
+
+    check("but a page served from a host may not", () =>
+      assert.doesNotMatch(hostWent, /^chrome-extension:/),
+    );
+
+    // The loopback listener does not hand over — it is what a browser *without* the extension
+    // is pointed at, so there is nowhere to hand it to, and the fallback is the real answer
+    // there. That makes it the place to check the fallback looks like the page it stands in
+    // for. Computed properties rather than the two sources: one stylesheet is only worth
+    // having if both ends read it, and a build that forgot to copy it into `dist/` would
+    // leave the markup identical and the page unstyled.
+    const spare = await browser.newPage();
+    await spare.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: "domcontentloaded" });
+    const [onDashboard, onSpare] = await Promise.all([
+      cardShape(dashboard, ALIAS),
+      cardShape(spare, ALIAS),
+    ]);
+    await spare.close();
+
+    check("the fallback is the dashboard's own page", () => {
+      assert.notEqual(onSpare, null, "no site card on the loopback listener");
+      assert.deepEqual(onSpare?.look, onDashboard?.look);
     });
     check("with the same three things said about the site", () =>
-      assert.deepEqual(onFront?.fields, onDashboard?.fields),
+      assert.deepEqual(onSpare?.fields, onDashboard?.fields),
     );
 
     // Nothing to paste is the point: the dashboard asked the daemon for the token, and the
