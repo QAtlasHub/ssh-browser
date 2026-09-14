@@ -12,6 +12,9 @@ keywords = ["ssh", "sftp", "browser", "proxy", "origin"]
 # from a shell would be neither.
 categories = ["network-programming", "command-line-utilities"]
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1"
 bytes = "1"

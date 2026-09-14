@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
@@ -34,6 +36,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
@@ -58,6 +62,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
@@ -74,6 +80,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: "1.88"
@@ -85,6 +93,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
@@ -103,6 +113,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
       - name: the crate and the extension must be the same version
         run: |
           crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -123,6 +135,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
@@ -131,6 +145,42 @@ jobs:
       - run: npm --prefix extension ci
       - run: npm --prefix extension run typecheck
       - run: npm --prefix extension run build
+      # What the extension can touch, against what is written down. Every key it compares
+      # decides something a reviewer would ask about -- which APIs, which origins, which
+      # pages -- and those are the ones that change by accident, because a key added while
+      # doing something else looks like nothing in a diff full of TypeScript.
+      - run: node extension/check-permissions.mjs
+      # The build dependencies are esbuild and typescript, and they run on this machine with
+      # the repository checked out. A compromised one is a compromised build, so the advisory
+      # database is worth a second here. `high` and above only: the moderate tier is mostly
+      # transitive noise in dev tooling, and a check that cries wolf gets disabled.
+      - run: npm --prefix extension audit --audit-level=high
+
+  workflows:
+    # The checks above are only worth what the runner they execute on is worth. zizmor reads
+    # these files for the ways a workflow leaks its own privileges: a `${{ }}` interpolated
+    # into a `run:` block where a branch name can reach it, a token wider than the job needs,
+    # an action referenced by a tag that can be moved under it.
+    #
+    # Advisory-only would make it decoration. It fails the build, and an accepted finding is
+    # a `# zizmor: ignore[rule]` comment with a reason beside it.
+    #
+    # It is also why every `actions/checkout` in this repository carries
+    # `persist-credentials: false`: the default leaves a token in `.git/config`, which every
+    # later step can read and any artifact upload can carry off the runner. The three that
+    # need git credentials say so where they are.
+    name: workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+      # `pipx` is on the runner image, so this needs no action and therefore no fourth-party
+      # SHA to keep pinned. The version is exact: a linter that moves under you turns a green
+      # branch red for reasons nobody changed.
+      - run: pipx run zizmor==1.30.1 --persona=regular .github/workflows/
 
   e2e:
     # The only check that tests the claim rather than a piece of it: that a file on a host
@@ -142,6 +192,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
@@ -192,6 +244,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
