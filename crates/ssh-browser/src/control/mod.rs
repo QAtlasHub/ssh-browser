@@ -97,8 +97,7 @@ impl Token {
     pub fn write_to_disk(&self) -> Option<PathBuf> {
         let path = token_path()?;
         std::fs::create_dir_all(path.parent()?).ok()?;
-        std::fs::write(&path, &self.0).ok()?;
-        restrict(&path);
+        write_private(&path, self.0.as_bytes()).ok()?;
         Some(path)
     }
 
@@ -127,12 +126,11 @@ impl Token {
     ///
     /// `rotate` mints a new one anyway, which is what to reach for if the old one leaked.
     pub fn load_or_generate(rotate: bool) -> Result<(Self, Source)> {
-        if !rotate {
-            if let Some(path) = token_path() {
-                if let Some(token) = Self::from_disk(&path) {
-                    return Ok((token, Source::Reused(path)));
-                }
-            }
+        if !rotate
+            && let Some(path) = token_path()
+            && let Some(token) = Self::from_disk(&path)
+        {
+            return Ok((token, Source::Reused(path)));
         }
         let token = Self::generate()?;
         let written = token.write_to_disk();
@@ -178,16 +176,31 @@ pub fn state_dir() -> Option<PathBuf> {
     Some(base.join("ssh-browser"))
 }
 
+/// Write a file only this account can read, with the permissions set as it is created.
+///
+/// Created restricted rather than tightened afterwards. Writing the bytes and then calling
+/// `set_permissions` leaves a window in which the file exists and is readable — short, real, and
+/// exactly the kind of detail that stays invisible until it matters. The token has always gone
+/// through here; the authority key in `crate::tls` has to, because a private key another account
+/// on the machine can read is the one thing that makes a constrained CA pointless.
 #[cfg(unix)]
-fn restrict(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
 }
 
+/// On Windows a file created under the user's own `LOCALAPPDATA` inherits an ACL that already
+/// excludes other users, and there is no mode to set.
 #[cfg(not(unix))]
-fn restrict(_path: &std::path::Path) {
-    // On Windows a file created under the user's own LOCALAPPDATA inherits an ACL that
-    // already excludes other users, and there is no mode to set.
+pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 fn hex(bytes: &[u8]) -> String {

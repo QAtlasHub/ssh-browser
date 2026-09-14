@@ -87,10 +87,10 @@ pub fn scan(html: &[u8], max: usize) -> Vec<String> {
 }
 
 fn push(out: &mut Vec<String>, raw: Option<&str>) {
-    if let Some(url) = raw.and_then(usable) {
-        if !out.contains(&url) {
-            out.push(url);
-        }
+    if let Some(url) = raw.and_then(usable)
+        && !out.contains(&url)
+    {
+        out.push(url);
     }
 }
 
@@ -107,10 +107,10 @@ fn usable(raw: &str) -> Option<String> {
     }
     // A scheme is somewhere else too, `data:` and `mailto:` included. The colon has to come
     // before any slash to be a scheme, or a filename like `t:0.5.png` would read as one.
-    if let Some(colon) = url.find(':') {
-        if !url[..colon].contains('/') {
-            return None;
-        }
+    if let Some(colon) = url.find(':')
+        && !url[..colon].contains('/')
+    {
+        return None;
     }
     Some(url.to_string())
 }

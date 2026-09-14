@@ -1,3 +1,5 @@
 # MSRV -- keeps clippy from suggesting newer-than-MSRV idioms.
-# Edition 2024 is the floor here, so this cannot go below 1.85.
-msrv = "1.85"
+# Edition 2024 puts the floor at 1.85. The extra three versions are `rcgen`, which
+# generates the constrained CA the https mode needs and requires 1.88 — and pinning a
+# certificate generator to an old release to save them would be the wrong trade.
+msrv = "1.88"
