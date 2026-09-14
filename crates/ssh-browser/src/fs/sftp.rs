@@ -56,6 +56,20 @@ impl SftpFs {
         Ok(Self::drive(sftp, Some(child)))
     }
 
+    /// Whether this connection is still worth sending a request down.
+    ///
+    /// The driver task owns the ssh child's pipes and returns when they close, which drops the
+    /// receiving end of this channel. So a shut channel is not a proxy for "the ssh died" --
+    /// it is the same event, observed from the only side that can see it without a syscall.
+    ///
+    /// Racy by nature: a connection alive when this is asked can be gone by the time the
+    /// request lands. That is fine, because the caller retries either way. What this prevents
+    /// is the other thing -- holding a corpse forever and answering every request with
+    /// `sftp session is gone` until somebody restarts the daemon.
+    pub fn is_alive(&self) -> bool {
+        !self.jobs.is_closed()
+    }
+
     /// Drive a session over arbitrary streams. Exists so the round-trip invariant
     /// can be asserted against an in-memory server, with no ssh anywhere.
     pub async fn over<W, R>(w: W, r: R) -> Result<Self>

@@ -127,13 +127,24 @@ impl FakeRemote {
     /// Start serving, and hand back a client driving it through the real `SftpFs`,
     /// including its writer coalescing and its round-trip counter.
     pub async fn spawn(self) -> SftpFs {
+        self.spawn_stoppable().await.0
+    }
+
+    /// The same, but handing back the way to end the remote.
+    ///
+    /// Aborting it drops the server's half of the pipe, which ends the client's driver task --
+    /// which is what happens when an ssh dies. There is no other way to produce a dead
+    /// `SftpFs` to test against, and a daemon that reconnects but has never been asked to face
+    /// a dead connection is a daemon that reconnects in the comments.
+    pub async fn spawn_stoppable(self) -> (SftpFs, tokio::task::AbortHandle) {
         let (client, server) = tokio::io::duplex(1 << 20);
         let (cr, cw) = tokio::io::split(client);
         let (sr, sw) = tokio::io::split(server);
-        tokio::spawn(serve(self, sr, sw));
-        SftpFs::over(cw, cr)
+        let serving = tokio::spawn(serve(self, sr, sw));
+        let fs = SftpFs::over(cw, cr)
             .await
-            .expect("handshake with the in-memory remote")
+            .expect("handshake with the in-memory remote");
+        (fs, serving.abort_handle())
     }
 }
 

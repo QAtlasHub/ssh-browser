@@ -289,5 +289,7 @@ fn parse_alias(spec: &str) -> Result<Alias> {
         Some((host, base)) => (host, Some(base)),
         None => (rest, None),
     };
-    Alias::new(name, host, base).with_context(|| format!("in {spec:?}"))
+    Alias::new(name, host, base)
+        .map(Alias::for_this_run)
+        .with_context(|| format!("in {spec:?}"))
 }

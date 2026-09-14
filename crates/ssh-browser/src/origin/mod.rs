@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
@@ -83,8 +84,25 @@ pub struct Alias {
     /// Deferred rather than filled in with a guess, because the answer lives on the
     /// remote. `~` is shell syntax and this transport never runs a shell; expanding it
     /// here would produce this machine's home directory, which is a different computer's.
-    /// It is resolved once in `bind`, by asking.
+    /// It is resolved once on connecting, by asking.
     base: Option<String>,
+    named: Named,
+}
+
+/// Where an alias's name came from, which is what failing to open it means.
+///
+/// A name typed for this run is something the reader is standing there waiting on, so a daemon
+/// that started without it would be answering a different question than the one asked. A name
+/// in a config file is what they use in a week: a cluster in maintenance, a laptop off the
+/// VPN, an agent with no key loaded yet. Refusing to start until every one of those answers
+/// makes the daemon useless exactly when it is most wanted -- which is the rule `[[host]]` has
+/// followed all along, written down two hundred lines below this and not applied here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Named {
+    /// Typed on the command line: `ssh-browser serve docs=myhost`.
+    ForThisRun,
+    /// `[[alias]]` in the config file.
+    InTheFile,
 }
 
 impl Alias {
@@ -109,7 +127,20 @@ impl Alias {
             name: name.to_string(),
             host: host.to_string(),
             base: base.map(str::to_string),
+            named: Named::InTheFile,
         })
+    }
+
+    /// The same alias, but typed on the command line rather than read out of a file.
+    ///
+    /// Only `parse_alias` calls this, and the asymmetry is the point: failing to open one of
+    /// these stops the daemon, and that is a thing to opt into at one call site rather than a
+    /// default every construction inherits.
+    pub fn for_this_run(self) -> Self {
+        Self {
+            named: Named::ForThisRun,
+            ..self
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -123,6 +154,10 @@ impl Alias {
     /// Where this alias is rooted, or `None` for the remote's home directory.
     pub fn base(&self) -> Option<&str> {
         self.base.as_deref()
+    }
+
+    pub fn named(&self) -> Named {
+        self.named
     }
 }
 
@@ -175,6 +210,13 @@ struct OpenAlias {
 #[derive(serde::Serialize)]
 struct KnownHosts {
     open: Vec<OpenAlias>,
+    /// Declared aliases that are not connected, and why.
+    ///
+    /// The other half of `open`, and the half that used to not exist: before the daemon could
+    /// run without every alias connected, a name was either being served or the daemon was not
+    /// running. Now one can be neither, and a reader who is not told which is looking at the
+    /// silent failure this project says it does not have.
+    stalled: Vec<StalledAlias>,
     hosts: Vec<KnownHost>,
     unusable: Vec<ssh_config::Unusable>,
     /// What TLS handshakes have done, under https.
@@ -183,6 +225,34 @@ struct KnownHosts {
     /// belongs where somebody is looking. `None` under http, where there are no handshakes.
     #[serde(skip_serializing_if = "Option::is_none")]
     tls: Option<control::Handshakes>,
+}
+
+/// How long a failed dial is remembered before another is attempted.
+///
+/// Not a backoff and not tuning. It is the smallest number that makes a remote page unable to
+/// choose how often this machine opens an ssh, while leaving a reload a real retry. See
+/// `session_for`.
+const DIAL_COOLDOWN: Duration = Duration::from_secs(3);
+
+/// What happened the last time an alias was dialled, and when.
+struct Trouble {
+    at: Instant,
+    why: String,
+}
+
+/// A declared alias with no connection behind it.
+#[derive(serde::Serialize)]
+struct StalledAlias {
+    alias: String,
+    host: String,
+    url: String,
+    /// What ssh said the last time this was tried, or `None` if it has not been tried since
+    /// it was stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    why: Option<String>,
+    /// Stopped from the dashboard rather than unreachable. A different thing to do about it:
+    /// one is fixed by a restart, the other by the host coming back.
+    stopped: bool,
 }
 
 /// Whether a configured base is one this daemon can resolve.
@@ -336,6 +406,33 @@ pub struct Origin {
     /// not been connected to since it started simply has no dashboard to point at, which is
     /// the truth at that moment.
     dashboard: RwLock<Option<String>>,
+    /// Every alias this daemon serves, whether or not it is connected.
+    ///
+    /// Fixed after `bind`: aliases come from the command line and the config file, and neither
+    /// changes while the daemon runs. Hosts opened from the dashboard are a different set and
+    /// live in `reachable`.
+    declared: HashMap<String, Declared>,
+    /// Why an alias is not connected, from the last attempt.
+    ///
+    /// Kept so the reason survives the request that discovered it. A reader who opens a site
+    /// and gets `ssh: connect to host ... port 22: Network is unreachable` learns something;
+    /// one who opens the dashboard an hour later and sees a name with no explanation beside it
+    /// does not, and that is the same failure told twice.
+    trouble: RwLock<HashMap<String, Trouble>>,
+    /// Declared aliases stopped from the dashboard, for this run only.
+    ///
+    /// Without this, stopping one would be undone by the next request that reached it, and a
+    /// button that undoes itself is worse than no button. Not persisted, because for a
+    /// declared alias the persistent statement is the config file: a restart serves it again,
+    /// and the answer says so rather than leaving somebody to discover it.
+    stopped: RwLock<HashSet<String>>,
+    /// How long a failed dial is remembered. `DIAL_COOLDOWN` everywhere but in tests.
+    ///
+    /// A field rather than the constant read directly, so a test can set it to zero and watch
+    /// the dial happen again. Left as the constant, the only thing a test can observe is the
+    /// same answer twice -- which is what a latched failure looks like too, so the test would
+    /// pass either way and mean nothing.
+    cooldown: Duration,
     /// The certificate resolver, when there is one.
     ///
     /// Held here as well as inside the TLS configuration, because `/_control/certificate` answers
@@ -412,6 +509,26 @@ impl Startup {
     }
 }
 
+/// One alias this daemon is meant to serve, connected or not.
+///
+/// Separate from `sessions`, which is what is connected *now*, because they answer different
+/// questions and answering both with one map is what made a host that was asleep at breakfast
+/// a name the daemon had never heard of at lunch. The PAC routes this set; the dashboard lists
+/// it; a request against it opens a connection if there is not one already.
+struct Declared {
+    host: String,
+    base: Option<String>,
+    named: Named,
+    /// Held while dialling, so a page's subresources do not each start their own ssh.
+    ///
+    /// A first visit to an alias that is not connected is one navigation and then forty
+    /// requests for stylesheets, scripts and images, all within a few milliseconds and all
+    /// finding no session. Without this they would open forty ssh connections, thirty-nine of
+    /// which lose the race in `adopt` and are dropped -- which is the correct answer arrived at
+    /// by the most expensive route available.
+    dialling: tokio::sync::Mutex<()>,
+}
+
 impl Origin {
     /// Take the port, then connect every alias.
     ///
@@ -460,72 +577,60 @@ impl Origin {
             other => bail!("scheme {other:?} is not one this daemon serves; use http or https"),
         };
 
-        let mut sessions = HashMap::new();
-        let mut routes = Vec::new();
+        let mut declared = HashMap::new();
         for a in aliases {
-            let fs = SftpFs::connect(&a.host)
-                .await
-                .with_context(|| format!("alias {} -> ssh host {}", a.name, a.host))?;
-            // Asked here, once, rather than per request. An alias written without a base
-            // means the account's home, and only the remote knows where that is.
-            let base = resolve_base(a.base.as_deref(), &fs)
-                .await
-                .with_context(|| {
-                    format!(
-                        "alias {} -> ssh host {}: working out where {} is",
-                        a.name,
-                        a.host,
-                        a.base.as_deref().unwrap_or("the home directory")
-                    )
-                })?;
-            // Built from the resolved base, so what is announced is where requests will
-            // actually go. Formatting it from the alias beforehand would print the word
-            // "home" and leave the reader to find out which directory that was.
-            routes.push(format!(
-                "  {scheme}://{}.{suffix}/  ->  {}:{base}",
-                a.name, a.host
-            ));
-            // Checked where the map is built, so there is no way to reach a session map with
-            // a name silently missing from it. A caller may have checked earlier and should;
+            // Checked where the map is built, so there is no way to reach one with a name
+            // silently missing from it. A caller may have checked earlier and should;
             // `insert` returning the displaced value is the check that cannot be skipped.
             ensure!(
-                sessions
+                declared
                     .insert(
                         a.name.clone(),
-                        Arc::new(Session {
+                        Declared {
                             host: a.host.clone(),
-                            base,
-                            fs,
-                        }),
+                            base: a.base.clone(),
+                            named: a.named,
+                            dialling: tokio::sync::Mutex::new(()),
+                        },
                     )
                     .is_none(),
                 "alias {:?} is defined twice",
                 a.name
             );
         }
+
         let origin = Arc::new(Self {
             suffix,
             scheme,
             certificates,
             tls,
             port,
-            sessions: RwLock::new(sessions),
+            sessions: RwLock::new(HashMap::new()),
             cache: Cache::default(),
             token,
             theme: RwLock::new(theme),
             reachable: RwLock::new(hosts),
             handshakes: Handshakes::default(),
             dashboard: RwLock::new(None),
+            declared,
+            trouble: RwLock::new(HashMap::new()),
+            stopped: RwLock::new(HashSet::new()),
+            cooldown: DIAL_COOLDOWN,
         });
 
-        // Opened after the aliases, and on different terms. An alias failing stops the daemon:
-        // it was named for this run and serving without it would be answering a different
-        // question. An enabled host failing does not, because the set is everything somebody
-        // uses in a week and a laptop on the wrong network has half of them unreachable — a
-        // daemon that refused to start until every one answered would be useless exactly when
-        // it is most wanted. So the failures are reported and the rest is served.
-        let (opened, refused) = origin.open_enabled().await;
+        // Opened here rather than on first use so that the first page request does not also
+        // pay for an ssh handshake -- and at once rather than in turn, because these are
+        // independent handshakes and in sequence three hosts cost the sum of three round trips
+        // before the daemon answers anything.
+        let (mut routes, refused_aliases) = origin.open_declared().await?;
+
+        // Enabled hosts, on the same terms now: reported and retried rather than fatal. They
+        // used to be the only ones treated that way, with the reason written out beside them,
+        // and the reason was never specific to them.
+        let (opened, mut refused) = origin.open_enabled().await;
         routes.extend(opened);
+        refused.extend(refused_aliases);
+        refused.sort();
 
         Ok((
             Bound { origin, listener },
@@ -848,10 +953,79 @@ impl Origin {
             );
         }
 
-        let Some(session) = self.session(alias).await else {
-            return fail(StatusCode::NOT_FOUND, format!("no alias named {alias:?}"));
-        };
-        let session = session.as_ref();
+        // Twice at most, and the second time is not a policy but a consequence.
+        //
+        // A connection can be gone without this process knowing yet: the driver task learns
+        // of it when its own read fails, which is *after* a request has been handed down the
+        // pipe. So a request that arrives in that window is sent into a connection that looks
+        // alive, and comes back `sftp session closed before replying`. Checking liveness first
+        // cannot close that window -- nothing can, from this side.
+        //
+        // What closes it is checking afterwards. If the answer failed and the connection is
+        // now known to be gone, that was not the remote saying no, it was the pipe, and the
+        // request has not been answered at all. Measured against a real host by killing the
+        // ssh under a live daemon: without this a reload returned 502 and only the one after
+        // it succeeded, which is a retry that needs to be done twice to count as one.
+        for attempt in 0..2 {
+            let session = match self.session_for(alias).await {
+                Reached::Open(session) => session,
+                Reached::Unknown => {
+                    return fail(StatusCode::NOT_FOUND, format!("no alias named {alias:?}"));
+                }
+                Reached::Down(why) => {
+                    return fail(
+                        StatusCode::BAD_GATEWAY,
+                        format!(
+                            "{alias} is not connected: {why}\n\n\
+                             Reload to try again. Nothing needs restarting: the alias is still \
+                             served, and the next request opens the ssh afresh. The line above is \
+                             what the host said when asked just now."
+                        ),
+                    );
+                }
+                Reached::Stopped => {
+                    return fail(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "{alias} was stopped from the dashboard.\n\n\
+                             It is in this daemon's configuration, so restarting serves it again. \
+                             Reloading will not: a stop the next request undid would not be a stop."
+                        ),
+                    );
+                }
+            };
+
+            let res = self.serve_alias(&session, alias, path, cond, query).await;
+            if attempt == 0 && res.status().is_server_error() && !session.fs.is_alive() {
+                self.evict(alias, &session).await;
+                continue;
+            }
+            return res;
+        }
+        unreachable!("the loop returns on its last pass")
+    }
+
+    /// Drop a session, but only the one the caller was holding.
+    ///
+    /// Compared by pointer rather than by name: another request may have re-dialled while
+    /// this one was failing, and removing that fresh session by name would start the same
+    /// dance over for whoever holds it.
+    async fn evict(&self, alias: &str, held: &Arc<Session>) {
+        let mut sessions = self.sessions.write().await;
+        if sessions.get(alias).is_some_and(|s| Arc::ptr_eq(s, held)) {
+            sessions.remove(alias);
+        }
+    }
+
+    /// One attempt at serving, over a connection the caller has already obtained.
+    async fn serve_alias(
+        &self,
+        session: &Session,
+        alias: &str,
+        path: &str,
+        cond: &Conditions,
+        query: Option<&str>,
+    ) -> Response<Full<Bytes>> {
         let resolved = match guard::resolve(&session.base, path) {
             Ok(p) => p,
             Err(e) => return fail(StatusCode::FORBIDDEN, format!("{e:#}")),
@@ -1182,8 +1356,27 @@ impl Origin {
                 unresolved,
             });
         }
+        // Every declared alias that is not in `open`. Read from `declared` rather than from
+        // the difference of two lists somewhere else, so an alias cannot be absent from both.
+        let (trouble, stopped) = (self.trouble.read().await, self.stopped.read().await);
+        let mut stalled: Vec<StalledAlias> = self
+            .declared
+            .iter()
+            .filter(|(name, _)| !open.iter().any(|o| &&o.alias == name))
+            .map(|(name, d)| StalledAlias {
+                alias: name.clone(),
+                host: d.host.clone(),
+                url: self.site_url(name),
+                why: trouble.get(name).map(|t| t.why.clone()),
+                stopped: stopped.contains(name),
+            })
+            .collect();
+        stalled.sort_by(|a, b| a.alias.cmp(&b.alias));
+        drop((trouble, stopped));
+
         control::json(&KnownHosts {
             open,
+            stalled,
             hosts,
             unusable: found.unusable,
             tls: self.tls.is_some().then(|| control::Handshakes {
@@ -1357,6 +1550,12 @@ impl Origin {
         // Dropping the `Arc` is what ends the ssh session, and a request already in flight
         // holds one — so the connection goes when the last reader is done with it rather
         // than out from under them.
+        // Marked before the session goes, so no request can slip between the two and re-open
+        // what is being closed. Only for declared aliases: a host opened from the dashboard is
+        // not in `declared`, so removing its session is already the whole of stopping it.
+        if self.declared.contains_key(&ask.alias) {
+            self.stopped.write().await.insert(ask.alias.clone());
+        }
         let gone = self.sessions.write().await.remove(&ask.alias);
         match gone {
             Some(session) => {
@@ -1407,13 +1606,20 @@ impl Origin {
     /// A session that lost the race is dropped rather than replacing the winner. Dropping it
     /// closes that ssh child, which is the right end for a connection nothing is using;
     /// replacing the winner would close one that requests are already going through.
+    ///
+    /// Unless the winner is dead, in which case it is replaced. Otherwise a reconnection could
+    /// never land: `live` evicts the corpse, this would put the new session behind it, and the
+    /// alias would be permanently unreachable by a daemon that was reconnecting correctly.
     async fn adopt(&self, alias: &str, session: Session) -> Arc<Session> {
         let mut sessions = self.sessions.write().await;
-        Arc::clone(
-            sessions
-                .entry(alias.to_string())
-                .or_insert_with(|| Arc::new(session)),
-        )
+        match sessions.get(alias) {
+            Some(held) if held.fs.is_alive() => Arc::clone(held),
+            _ => {
+                let session = Arc::new(session);
+                sessions.insert(alias.to_string(), Arc::clone(&session));
+                session
+            }
+        }
     }
 
     async fn connect(&self, alias: &str, host: &str, base: Option<&str>) -> Result<Arc<Session>> {
@@ -1424,6 +1630,164 @@ impl Origin {
         )
         .await?;
         Ok(self.adopt(alias, session).await)
+    }
+
+    /// Open every declared alias, at once, and say which ones would not.
+    ///
+    /// Returns the routes that came up and a line per one that did not. Only a name typed for
+    /// this run is an error: the reader is standing there waiting on it, so starting without it
+    /// would answer a different question than the one asked. A name in a config file is
+    /// reported and left declared, which is what makes it retryable.
+    async fn open_declared(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let mut dialling = tokio::task::JoinSet::new();
+        for (name, d) in &self.declared {
+            let (name, host, base) = (name.clone(), d.host.clone(), d.base.clone());
+            dialling.spawn(async move {
+                let got = Self::dial(name.clone(), host, base).await;
+                (name, got)
+            });
+        }
+
+        let (mut routes, mut refused) = (Vec::new(), Vec::new());
+        while let Some(finished) = dialling.join_next().await {
+            let (name, got) = finished.context("dialling an alias")?;
+            let d = &self.declared[&name];
+            match got {
+                Ok(session) => {
+                    // Built from the resolved base, so what is announced is where requests
+                    // will actually go. Formatting it from the alias beforehand would print
+                    // the word "home" and leave the reader to find out which directory that
+                    // was.
+                    routes.push(format!(
+                        "  {}://{name}.{}/  ->  {}:{}",
+                        self.scheme, self.suffix, session.host, session.base
+                    ));
+                    self.adopt(&name, session).await;
+                }
+                Err(e) => {
+                    if d.named == Named::ForThisRun {
+                        return Err(e).with_context(|| {
+                            format!("alias {name} -> ssh host {}, named for this run", d.host)
+                        });
+                    }
+                    // Said now and remembered, because the reader will meet it again when they
+                    // open the site and the two should agree.
+                    let why = format!("{e:#}");
+                    refused.push(format!("  {name} could not be opened: {why}"));
+                    self.trouble.write().await.insert(
+                        name,
+                        Trouble {
+                            at: Instant::now(),
+                            why,
+                        },
+                    );
+                }
+            }
+        }
+        routes.sort();
+        Ok((routes, refused))
+    }
+}
+
+/// What asking for an alias's connection found.
+///
+/// Four answers because there are four situations, and an `Option` can carry two. Collapsing
+/// them is how a host that was asleep became indistinguishable from a name nobody ever wrote
+/// down -- which is the bug this whole path exists to end, so the shape says it.
+enum Reached {
+    Open(Arc<Session>),
+    /// Declared, and the ssh would not come up. Carries what ssh said.
+    Down(String),
+    /// Declared, and stopped from the dashboard for this run.
+    Stopped,
+    /// Not an alias this daemon serves.
+    Unknown,
+}
+
+impl Origin {
+    /// The connection for an alias, opening one if there is not a live one already.
+    ///
+    /// This is the retry. There is no timer and no background loop: a reader who reloads has
+    /// asked for exactly one more attempt, which is the right number, and a host that is down
+    /// does not get dialled every thirty seconds by a daemon nobody is using.
+    ///
+    /// Three outcomes, and they are different answers. A live session serves. A declared alias
+    /// with no live session is dialled here and either serves or says why. A name that was
+    /// never declared is not an alias at all.
+    async fn session_for(&self, alias: &str) -> Reached {
+        if let Some(live) = self.live(alias).await {
+            return Reached::Open(live);
+        }
+        let Some(d) = self.declared.get(alias) else {
+            return Reached::Unknown;
+        };
+        // Asked before dialling, so stopping something does not cost an ssh handshake to
+        // discover.
+        if self.stopped.read().await.contains(alias) {
+            return Reached::Stopped;
+        }
+
+        // One dial per alias at a time, and the check again inside it. A first visit is one
+        // navigation and then every subresource on the page, all arriving before the first ssh
+        // has finished; without this each of them starts its own.
+        let _dialling = d.dialling.lock().await;
+        if let Some(live) = self.live(alias).await {
+            return Reached::Open(live);
+        }
+
+        // A failure is remembered for a few seconds, and inside that window this answers from
+        // the memory rather than dialling again.
+        //
+        // Because every request to an alias origin arrives through the proxy, and a page can
+        // make them: `<img src="http://docs.ssh-browser/x">` in a loop is a remote document
+        // deciding how often this machine opens an ssh. It cannot name a host that was not
+        // declared -- `declared` is fixed at startup and is not `ssh_config` -- so the worst it
+        // reaches is a host the reader already asked to have served. But "already yours" is not
+        // "free", and one attempt per request is a rate somebody else chooses.
+        //
+        // Short enough that reloading is still a retry, which is the whole point of the retry
+        // being a reload: nobody reads a failure and reloads inside three seconds.
+        if let Some(t) = self.trouble.read().await.get(alias)
+            && t.at.elapsed() < self.cooldown
+        {
+            return Reached::Down(t.why.clone());
+        }
+
+        match Self::dial(alias.to_string(), d.host.clone(), d.base.clone()).await {
+            Ok(session) => {
+                self.trouble.write().await.remove(alias);
+                Reached::Open(self.adopt(alias, session).await)
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                self.trouble.write().await.insert(
+                    alias.to_string(),
+                    Trouble {
+                        at: Instant::now(),
+                        why: why.clone(),
+                    },
+                );
+                Reached::Down(why)
+            }
+        }
+    }
+
+    /// The session for an alias, if there is one and it is still connected.
+    ///
+    /// A dead one is dropped here rather than returned. Holding it would mean answering every
+    /// request with `sftp session is gone` until somebody restarted the daemon, which is the
+    /// one failure mode a reconnecting daemon must not have.
+    async fn live(&self, alias: &str) -> Option<Arc<Session>> {
+        if self.sessions.read().await.get(alias)?.fs.is_alive() {
+            return self.sessions.read().await.get(alias).cloned();
+        }
+        let mut sessions = self.sessions.write().await;
+        // Checked again under the write lock: another request may have replaced it since, and
+        // evicting the replacement would start this over.
+        if sessions.get(alias).is_some_and(|s| !s.fs.is_alive()) {
+            sessions.remove(alias);
+        }
+        sessions.get(alias).cloned()
     }
 
     /// Open every enabled host, at once, and say which ones would not.
@@ -2227,6 +2591,29 @@ impl Origin {
             .collect();
         sites.sort();
 
+        // Declared and not connected. Listed rather than left out: a reader who can see
+        // `panza` in their config file and not on the page whose whole job is saying what is
+        // served has been told nothing, and that is the silent failure under another name.
+        let (trouble, stopped) = (self.trouble.read().await, self.stopped.read().await);
+        let mut down: Vec<(String, String)> = self
+            .declared
+            .iter()
+            .filter(|(name, _)| !sites.iter().any(|(open, ..)| open == *name))
+            .map(|(name, d)| {
+                let why = if stopped.contains(name) {
+                    "stopped from the dashboard; a restart serves it again".to_string()
+                } else {
+                    trouble
+                        .get(name)
+                        .map(|t| t.why.clone())
+                        .unwrap_or_else(|| format!("{} has not answered", d.host))
+                };
+                (name.clone(), why)
+            })
+            .collect();
+        down.sort();
+        drop((trouble, stopped));
+
         let mut s = String::from(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
              <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -2284,10 +2671,29 @@ impl Origin {
             s.push_str("</ul>");
         }
 
+        if !down.is_empty() {
+            s.push_str("<h2>not connected</h2><ul>");
+            for (alias, why) in &down {
+                // Still a link. Opening it is the retry -- a request is what dials -- so the
+                // thing to do about it is the thing that was already there.
+                s.push_str("<li><a data-alias=\"");
+                s.push_str(&escape(alias));
+                s.push_str("\" href=\"");
+                s.push_str(&escape(&self.site_url(alias)));
+                s.push_str("\"><div class=\"name\">");
+                s.push_str(&escape(alias));
+                s.push_str("</div><div class=\"bad-host\">");
+                s.push_str(&escape(why));
+                s.push_str("</div></a></li>");
+            }
+            s.push_str("</ul>");
+        }
+
         s.push_str(
             "<p class=\"note\">Each of these is its own origin, which is what this page is a \
-             list of. Serving a host and stopping one happen in the dashboard: those go \
-             through the daemon's control API, and no page reaches that.</p>\
+             list of. Opening one that is not connected is what retries it. Serving a host and \
+             stopping one happen in the dashboard: those go through the daemon's control API, \
+             and no page reaches that.</p>\
              </div></body></html>",
         );
         s
@@ -3152,7 +3558,11 @@ mod tests {
     }
 
     async fn origin_with_cache(remote: FakeRemote, cache: Cache) -> Origin {
-        let fs = remote.spawn().await;
+        origin_over(remote.spawn().await, cache)
+    }
+
+    /// The same origin, over a connection the caller made -- so it can also end it.
+    fn origin_over(fs: SftpFs, cache: Cache) -> Origin {
         let mut sessions = HashMap::new();
         sessions.insert(
             "docs".to_string(),
@@ -3179,6 +3589,22 @@ mod tests {
             reachable: RwLock::new(reachable::Set::default()),
             handshakes: Handshakes::default(),
             dashboard: RwLock::new(None),
+            // Declared as well as connected, because that is what production looks like and
+            // because the reconnect path reads it: an alias whose session dies has to be
+            // re-dialled from somewhere, and a test whose `docs` was connected but never
+            // declared would exercise the half of `session_for` that cannot retry.
+            declared: HashMap::from([(
+                "docs".to_string(),
+                Declared {
+                    host: "nowhere".to_string(),
+                    base: Some("/srv".to_string()),
+                    named: Named::InTheFile,
+                    dialling: tokio::sync::Mutex::new(()),
+                },
+            )]),
+            trouble: RwLock::new(HashMap::new()),
+            stopped: RwLock::new(HashSet::new()),
+            cooldown: DIAL_COOLDOWN,
         }
     }
 
@@ -3190,6 +3616,14 @@ mod tests {
             b = b.header(IF_NONE_MATCH, tag);
         }
         b.body(Empty::new()).expect("request builds")
+    }
+
+    fn get_on(alias: &str, path: &str) -> Request<Empty<Bytes>> {
+        Request::builder()
+            .uri(format!("http://{alias}.ssh-browser{path}"))
+            .header(HOST, format!("{alias}.ssh-browser"))
+            .body(Empty::new())
+            .expect("request builds")
     }
 
     async fn trips(origin: &Origin) -> u64 {
@@ -4690,20 +5124,169 @@ mod tests {
     /// A setting that took effect at the next restart is indistinguishable from one that did
     /// not work, and in this direction it is worse than confusing: a host still answering after
     /// you switched it off is an ssh session you believe you have given back.
+    /// The failure this whole path exists to end.
+    ///
+    /// A declared alias whose ssh will not come up used to be fatal at startup and, once past
+    /// that, indistinguishable from a name nobody had written down. Now it is a gateway that
+    /// did not answer, said in the status code, and the next request asks again.
+    #[tokio::test]
+    async fn an_alias_whose_host_is_down_is_still_an_alias() {
+        let mut origin = origin_with(one_page()).await;
+        // No cooldown, so the second request below reaches the dial rather than the memory of
+        // the first. The cooldown itself is the next test.
+        origin.cooldown = Duration::ZERO;
+        // The declared host is `nowhere`, so re-dialling it fails without a network.
+        origin.sessions.write().await.remove("docs");
+
+        let res = origin.handle(get("/a.html", None)).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_GATEWAY,
+            "a declared alias that will not connect is 502, not 404"
+        );
+        assert!(
+            origin.trouble.read().await.contains_key("docs"),
+            "the reason has to outlive the request that found it"
+        );
+
+        // Not latched. Asked again, the dial happens again -- a daemon that took the first
+        // failure as final would pass every check above and still need restarting.
+        //
+        // `at` is the evidence and the status is not: a second 502 is what a re-dial and a
+        // remembered failure both look like from outside, so a test that only read the status
+        // would pass whichever this did.
+        let first = origin.trouble.read().await["docs"].at;
+        assert_eq!(
+            origin.handle(get("/a.html", None)).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert!(
+            origin.trouble.read().await["docs"].at > first,
+            "the second request did not reach the dial"
+        );
+    }
+
+    /// But not once per request, because a page decides how often those arrive.
+    ///
+    /// `<img src="http://docs.ssh-browser/x">` in a loop is a remote document choosing how
+    /// often this machine opens an ssh. It cannot name a host that was not declared -- the set
+    /// is fixed at startup and is not `ssh_config` -- so the reach is a host the reader already
+    /// asked to have served. That makes it cheap, not free, and the rate is the part somebody
+    /// else was choosing.
+    #[tokio::test]
+    async fn a_page_cannot_choose_how_often_an_ssh_is_opened() {
+        let mut origin = origin_with(one_page()).await;
+        origin.cooldown = Duration::from_secs(300);
+        origin.sessions.write().await.remove("docs");
+
+        assert_eq!(
+            origin.handle(get("/a.html", None)).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        let first = origin.trouble.read().await["docs"].at;
+
+        for _ in 0..5 {
+            assert_eq!(
+                origin.handle(get("/a.html", None)).await.status(),
+                StatusCode::BAD_GATEWAY,
+                "the answer is still the truth, it just costs nothing to give"
+            );
+        }
+        assert_eq!(
+            origin.trouble.read().await["docs"].at,
+            first,
+            "a loop of requests dialled more than once inside the cooldown"
+        );
+    }
+
+    /// A connection that dies is dropped, not held.
+    ///
+    /// Without this the daemon answers `sftp session is gone` for as long as it runs. It is
+    /// the one failure mode a reconnecting daemon must not have, and the only way to see it is
+    /// to kill a real connection under a live origin.
+    #[tokio::test]
+    async fn a_dead_connection_is_not_held() {
+        let (fs, stop) = one_page().spawn_stoppable().await;
+        let origin = origin_over(fs, Cache::default());
+        assert_eq!(
+            origin.handle(get("/a.html", None)).await.status(),
+            StatusCode::OK
+        );
+
+        stop.abort();
+        // The driver task notices when its reader fails, which is a scheduling hop away rather
+        // than a duration. Bounded so a change that stops it noticing fails here instead of
+        // hanging the suite.
+        for _ in 0..1000 {
+            if origin.live("docs").await.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            origin.live("docs").await.is_none(),
+            "a connection whose remote is gone must not stay in the map"
+        );
+
+        // And what follows is a re-dial rather than a corpse. Both are 502, so the status is
+        // not the evidence -- what it says is. `nowhere` is not a host, so a request that
+        // re-dialled reports ssh failing to reach it; one that went down the dead connection
+        // instead would report the pipe, and only the request after that would try again.
+        let res = origin.handle(get("/a.html", None)).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let said = String::from_utf8_lossy(&body_of(res).await).to_string();
+        assert!(said.contains("is not connected"), "{said}");
+        assert!(
+            !said.contains("session closed"),
+            "the dead connection was used rather than replaced: {said}"
+        );
+
+        // The window this cannot reach: a connection that is gone but whose driver task has
+        // not noticed yet, because the notice arrives when its own read fails and a request
+        // can be handed down the pipe before that. An in-memory duplex closes synchronously,
+        // so there is no window here to open. It was measured instead against a real host --
+        // kill the ssh under a live daemon, reload once -- three times for three reloads, all
+        // 200. Before `alias` checked liveness *after* the attempt, that reload was a 502 and
+        // only the one after it worked.
+    }
+
+    /// A name nobody declared stays a 404.
+    ///
+    /// The three answers have to stay three. If everything unreachable became 502 then a typo
+    /// in a URL would read as somebody's host being down.
+    #[tokio::test]
+    async fn an_undeclared_name_is_not_a_gateway_failure() {
+        let origin = origin_with(one_page()).await;
+        let res = origin.handle(get_on("typo", "/a.html")).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn disabling_a_host_closes_it_now() {
         let origin = origin_with(one_page()).await;
-        // `docs` is the alias the test origin serves. Naming it here needs no ssh_config, but
-        // the route checks ssh_config before it does anything -- so this asserts the closing
-        // through the piece that does not need a network, and the gate above covers the rest.
-        assert!(origin.session("docs").await.is_some());
-        origin.sessions.write().await.remove("docs");
-        assert!(
-            origin.session("docs").await.is_none(),
-            "removing the session is what disabling does, and a request must then 404"
-        );
-        let res = origin.handle(get("/a.html", None)).await;
+        // A host opened from the dashboard, not a declared alias. The two are closed on
+        // different terms now and this is the one disabling is about: it was never in
+        // `declared`, so removing the session is the whole of stopping it and the name goes
+        // back to being one this daemon does not serve. Sharing the `Arc` rather than opening
+        // a second remote means dropping this one leaves `docs` connected, which is the point
+        // -- disabling one host must not disturb another.
+        let session = Arc::clone(&origin.sessions.read().await["docs"]);
+        origin
+            .sessions
+            .write()
+            .await
+            .insert("opened".to_string(), session);
+        assert!(origin.live("opened").await.is_some());
+
+        origin.sessions.write().await.remove("opened");
+        assert!(origin.live("opened").await.is_none());
+        let res = origin.handle(get_on("opened", "/a.html")).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            origin.handle(get("/a.html", None)).await.status(),
+            StatusCode::OK,
+            "closing one must not disturb another"
+        );
     }
 
     /// Nothing about how to reach a host is reported to anything but the dashboard.
@@ -4845,9 +5428,20 @@ mod tests {
 
         // The origin stops answering, rather than answering with stale bytes out of the
         // cache. An alias that is closed but still serving would be the worst of both.
+        //
+        // 503 and not 404, and the difference is the whole of this change: `docs` is still an
+        // alias this daemon serves, it has been switched off. A 404 here would say the name
+        // was never known, which is what the daemon used to say about every host that was
+        // merely asleep -- and the reader would go looking in the config file for a name that
+        // is sitting right there in it.
+        let res = origin.handle(get("/a.html", None)).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // And a reload does not undo it. A stop that the next request reversed would not be a
+        // stop, and this is the exact path that would reverse it.
         assert_eq!(
             origin.handle(get("/a.html", None)).await.status(),
-            StatusCode::NOT_FOUND
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
