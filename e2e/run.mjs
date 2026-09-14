@@ -344,10 +344,14 @@ async function main() {
       return { spent: (await remoteTrips()) - before, status: res.status, headers: res.headers };
     };
 
-    const cold = await costOf("/index.html");
-    const warm = await costOf("/index.html");
-    const sliced = await costOf("/index.html", { Range: "bytes=0-15" });
-    const validated = await costOf("/index.html", { "If-None-Match": cold.headers["etag"] });
+    // A file nothing else in this run reads, and nothing links to. Asserting on index.html
+    // made the first read cold only on a machine slow enough for the freshness window to
+    // expire between sections: it passed against a real host and failed in CI, which is the
+    // worst way round. The file itself says why it has to stay unread.
+    const cold = await costOf("/cold-read.txt");
+    const warm = await costOf("/cold-read.txt");
+    const sliced = await costOf("/cold-read.txt", { Range: "bytes=0-15" });
+    const validated = await costOf("/cold-read.txt", { "If-None-Match": cold.headers["etag"] });
 
     check("the first read of a file costs the remote something", () =>
       assert.ok(cold.spent > 0, `nothing was fetched at all (${cold.spent})`),
