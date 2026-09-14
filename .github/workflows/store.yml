@@ -1,0 +1,117 @@
+name: store
+
+# Upload a release to the Chrome Web Store, and publish it.
+#
+# What this can and cannot do, because the line is not where you would guess:
+#
+#   - It cannot create the listing. The Store listing and Privacy tabs have to be filled in the
+#     dashboard by a person, and the extension ID does not exist until they have been.
+#     Description, screenshots, category, the data disclosure — none of them are reachable from
+#     this API. The first submission is by hand and always will be.
+#   - After that it can do every update: upload the package and publish it.
+#
+# The human gate is not removed, it moves. Merging the release PR is the decision; a release is
+# what triggers this. Nothing reaches anybody that was not merged first.
+#
+# A service account rather than a refresh token. Refresh tokens issued by an OAuth consent
+# screen still in "Testing" expire in a week, which makes a release pipeline that worked in
+# March fail in April for a reason nobody changed.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload, e.g. v0.5.0"
+        required: true
+        type: string
+      publish:
+        description: "Publish after uploading, rather than leaving it as a draft"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  store:
+    name: upload to the Chrome Web Store
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse early if this has never been set up
+        # Before the token exchange, so a missing secret is named rather than arriving as an
+        # authentication error twenty lines into a log.
+        env:
+          KEY: ${{ secrets.CWS_SERVICE_ACCOUNT }}
+          PUBLISHER: ${{ secrets.CWS_PUBLISHER_ID }}
+          ITEM: ${{ secrets.CWS_EXTENSION_ID }}
+        run: |
+          missing=
+          [ -n "$KEY" ] || missing="$missing CWS_SERVICE_ACCOUNT"
+          [ -n "$PUBLISHER" ] || missing="$missing CWS_PUBLISHER_ID"
+          [ -n "$ITEM" ] || missing="$missing CWS_EXTENSION_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secrets:$missing — see extension/STORE.md"
+            exit 1
+          fi
+
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          credentials_json: ${{ secrets.CWS_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/chromewebstore
+
+      - name: Fetch the release package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release download "$TAG" --repo "$REPO" --pattern '*.zip' --dir .
+          # Exactly one, or the shell picks. Two zips on a release would otherwise mean
+          # uploading whichever sorted first.
+          count=$(ls -1 ./*.zip | wc -l)
+          test "$count" -eq 1 || { echo "::error::expected one zip, found $count"; exit 1; }
+          mv ./*.zip package.zip
+          unzip -p package.zip manifest.json | grep '"version"'
+
+      - name: Upload
+        env:
+          TOKEN: ${{ steps.auth.outputs.access_token }}
+          PUBLISHER: ${{ secrets.CWS_PUBLISHER_ID }}
+          ITEM: ${{ secrets.CWS_EXTENSION_ID }}
+        run: |
+          # `--fail-with-body` rather than `--fail`: the store says why in the body, and a bare
+          # "exit 22" is the least useful half of that.
+          curl --silent --show-error --fail-with-body \
+            -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/zip" \
+            --data-binary @package.zip \
+            "https://chromewebstore.googleapis.com/upload/v2/publishers/$PUBLISHER/items/$ITEM:upload" \
+            | tee upload.json
+          # The HTTP status can be 200 while the item state is FAILURE, so the body decides.
+          grep -q '"uploadState"[[:space:]]*:[[:space:]]*"SUCCESS"' upload.json
+
+      - name: Publish
+        # A release publishes; a manual run does so only when asked. The button defaults to the
+        # cautious answer because somebody pressing it is usually testing the pipeline.
+        if: ${{ github.event_name == 'release' || inputs.publish }}
+        env:
+          TOKEN: ${{ steps.auth.outputs.access_token }}
+          PUBLISHER: ${{ secrets.CWS_PUBLISHER_ID }}
+          ITEM: ${{ secrets.CWS_EXTENSION_ID }}
+        run: |
+          # Visibility is whatever the dashboard already says; this API does not set it. If it
+          # was changed by hand, the store refuses until it has been published by hand once at
+          # the new visibility — so a failure here is worth reading rather than retrying.
+          curl --silent --show-error --fail-with-body \
+            -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Length: 0" \
+            "https://chromewebstore.googleapis.com/v2/publishers/$PUBLISHER/items/$ITEM:publish" \
+            | tee publish.json
+          # Review is not instant. This says it was accepted, not that it is live.
+          echo "submitted; the store reviews it before anyone sees it"
