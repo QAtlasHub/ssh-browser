@@ -45,6 +45,7 @@ use crate::sftp::wire::Attrs;
 use crate::ssh_config;
 use crate::theme;
 use crate::tls;
+use rustls_pki_types::pem::PemObject;
 
 /// A file worth holding whole. Anything larger is served by range and not cached: a
 /// seek into a video must not pull the entire file, and holding one would evict every
@@ -331,25 +332,39 @@ pub struct Origin {
 pub struct Bound {
     origin: Arc<Origin>,
     listener: TcpListener,
+}
+
+/// What to tell the reader about a daemon that has just come up.
+///
+/// Returned beside [`Bound`] rather than reachable through it, and that separation is
+/// load-bearing rather than tidy. `Bound` owns the `Origin`, and the `Origin` owns the TLS
+/// configuration, and that owns a private key — so a banner line reached through `Bound` is a
+/// string a static analyser must treat as derived from the key, and it said so: CodeQL flagged
+/// both `eprintln!`s in `main` as cleartext logging of the certificate resolver.
+///
+/// It was wrong about the values — these are host names and paths — and right about the shape.
+/// Handing the caller strings that were never near the key makes the question unanswerable
+/// rather than answered.
+pub struct Startup {
     routes: Vec<String>,
     refused: Vec<String>,
 }
 
-impl Bound {
+impl Startup {
     /// One line per alias, naming where it actually points.
     ///
-    /// Only available once bound, which is the point: an alias rooted at the home
-    /// directory has no printable base until the remote has been asked.
+    /// Only available once bound, which is the point: an alias rooted at the home directory has
+    /// no printable base until the remote has been asked.
+    pub fn routes(&self) -> &[String] {
+        &self.routes
+    }
+
     /// Enabled hosts that would not connect, and what ssh said about each.
     ///
     /// Separate from `routes` so a caller cannot print them as though they were working. Empty
     /// on an ordinary run; not an error, because the daemon is serving everything else.
     pub fn refused(&self) -> &[String] {
         &self.refused
-    }
-
-    pub fn routes(&self) -> &[String] {
-        &self.routes
     }
 }
 
@@ -371,7 +386,7 @@ impl Origin {
         port: u16,
         token: Token,
         theme: String,
-    ) -> Result<Bound> {
+    ) -> Result<(Bound, Startup)> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let listener = TcpListener::bind(addr)
             .await
@@ -462,20 +477,13 @@ impl Origin {
         let (opened, refused) = origin.open_enabled().await;
         routes.extend(opened);
 
-        Ok(Bound {
-            routes,
-            refused,
-            origin,
-            listener,
-        })
+        Ok((Bound { origin, listener }, Startup { routes, refused }))
     }
 }
 
 impl Bound {
     pub async fn serve(self) -> Result<()> {
-        let Bound {
-            origin, listener, ..
-        } = self;
+        let Bound { origin, listener } = self;
         let self_ = origin;
 
         loop {
@@ -2263,12 +2271,14 @@ impl rustls::server::ResolvesServerCert for PerName {
         // again by the name constraint in the authority, but failing here means never signing
         // the certificate at all.
         let leaf = self.authority.leaf_for(&name).ok()?;
-        let certs = rustls_pemfile::certs(&mut leaf.certificate_pem.as_bytes())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .ok()?;
-        let key = rustls_pemfile::private_key(&mut leaf.key_pem.as_bytes())
-            .ok()
-            .flatten()?;
+        // `rustls-pki-types` rather than `rustls-pemfile`: the latter is unmaintained
+        // (RUSTSEC-2025-0134) and this is where its job moved. It is already in the tree as
+        // rustls's own dependency, so this removes a crate rather than adding one.
+        let certs =
+            rustls_pki_types::CertificateDer::pem_slice_iter(leaf.certificate_pem.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()?;
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).ok()?;
         let signing = rustls::crypto::ring::default_provider()
             .key_provider
             .load_private_key(key)

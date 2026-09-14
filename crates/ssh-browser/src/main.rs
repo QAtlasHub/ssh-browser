@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
                     })
                     .collect(),
             );
-            let bound = Origin::bind(
+            let (bound, startup) = Origin::bind(
                 aliases,
                 reachable,
                 suffix.clone(),
@@ -217,13 +217,13 @@ async fn main() -> Result<()> {
             // asked, and announcing it as "home" would leave the reader to find out which
             // directory that was.
             eprintln!("listening on 127.0.0.1:{port}");
-            for route in bound.routes() {
+            for route in startup.routes() {
                 eprintln!("{route}");
             }
             // Starting with none is the ordinary case now: the extension opens a host from
             // your ssh_config when you pick one. Said outright, because a daemon that
             // listed nothing used to mean a misconfiguration.
-            if bound.routes().is_empty() {
+            if startup.routes().is_empty() {
                 eprintln!("  no aliases open yet — pick a host in the extension, or see");
                 eprintln!("  `ssh-browser hosts` for what your ssh_config can reach");
             }
@@ -231,9 +231,9 @@ async fn main() -> Result<()> {
             // answer is not a reason to refuse to start — a laptop on the wrong network has
             // half of them unreachable — but it is a reason to say so, because the alternative
             // is a URL that quietly 404s and no hint as to why.
-            if !bound.refused().is_empty() {
+            if !startup.refused().is_empty() {
                 eprintln!();
-                for line in bound.refused() {
+                for line in startup.refused() {
                     eprintln!("{line}");
                 }
             }
