@@ -9,21 +9,98 @@ The two halves ship through different channels, and only one of them has shipped
 is on crates.io as [`ssh-browser`](https://crates.io/crates/ssh-browser); the extension goes
 through a browser store and has not been submitted. No surface is stable.
 
-## [Unreleased]
+## [0.3.0] - 2026-09-14
 
 ### Added
 
+- **A host you use every day is opened every run.** Turning one on in the dashboard used to
+  last until the daemon stopped; now the choice is remembered, so `http://<host>.ssh-browser/`
+  simply works after a restart. `[[host]] name = "..."` sets the default, and a change made
+  from the dashboard is remembered beside the control token rather than written back into the
+  hand-written config file — the same arrangement the theme uses, for the same reason.
+  **Only the name is written down.** Which account, which port and which jump host is already
+  in `~/.ssh/config`, and a second copy would be two answers to one question and a new place
+  for the interesting ones to sit.
+  Enabled hosts are connected at startup, all at once, and one that does not answer is
+  reported rather than fatal. Unlike an alias this list is everything somebody uses in a week,
+  and a laptop on the wrong network has half of it unreachable: refusing to start then would
+  be refusing exactly when it is wanted.
+  Enabled means open, not "opens on demand". Connecting when a request for an unopened host
+  arrives would let any web page start ssh sessions by naming a host in an `<img src>`, and
+  time the answer to learn which hosts you have. The header that would separate a navigation
+  from a subresource is not available: measured against a real browser, **Chromium sends no
+  `Sec-Fetch-*` at all on a proxied request**, while the same browser sends them to
+  `127.0.0.1` directly. So a session is opened by the daemon at startup or by a control call
+  carrying the token, and by nothing else.
 - A first run with no daemon now says what ssh-browser is, what to run to get one, and where
   the source is, instead of one red line naming a command the reader has never heard of. It
   is the only screen somebody sees before anything works — including whoever reviews the
   extension for a store, who installs it with no daemon anywhere.
   A daemon that has merely stopped still gets the terse message: a returning reader does not
   need the explanation, and giving it to them every time would be noise.
+- `GET /_control/hosts` and `GET /_control/hello` report how many remote round trips each open
+  session has cost. The counter existed already and was reachable only from unit tests holding
+  a fake remote, which made the claim this daemon is built on checkable against the fake and
+  nowhere else.
+
+### Changed
+
+- **A whole file is read by range rather than polled in 32 KiB chunks.** The length was
+  already in hand — it comes off the listing that resolved the path — and the prefetcher had
+  used it since it was written, while the request a reader actually waits on had not. It is
+  the direct path that needs it most, because the files that reach it are the ones a prefetch
+  could not have warmed: the page itself, which has to be read before it can be scanned, and
+  anything a script fetches at runtime. Against real Documenter output over SSH — a 700 KB
+  `index.html` and a 2 MB `search_index.js` — one page cost 95 remote round trips and now
+  costs 26, and loads in 3.6 s rather than 5.9 s.
+  A short read falls back to the poll rather than being served: a body shorter than the length
+  it is served with is exactly the silent truncation this daemon must not produce.
 
 ### Fixed
 
 - A failed connection left the previous daemon's sites in place, so going back reached a list
   of things that were not being served — every one of them a link that would not answer.
+- An enabled host was dialled by its URL *label* rather than the `Host` in `ssh_config`, so a
+  config saying `Host Panza` and a remembered `panza` gave `Could not resolve hostname panza`
+  at every start — while enabling it a moment earlier had worked, because that path had the
+  ssh_config entry in hand and startup had only the name. Startup now resolves through
+  `ssh_config` like the other two paths, which also closes the hole underneath it: it was the
+  one path that reached ssh with names out of a file and no check that ssh had ever heard of
+  them.
+
+### Documentation
+
+- The README claimed `file://` breaks service workers, in a section arguing for this over an
+  sshfs mount — implying ssh-browser restores them. It does not. An alias origin is plain http
+  on a name that is not loopback, so it is not a potentially trustworthy origin, and service
+  workers, `crypto.subtle` and `CacheStorage` are absent from it exactly as they are from
+  `file://`. The loopback fallback *is* a secure context and has all of them, but puts every
+  alias in one origin. The two modes trade against each other and `https` is what would give
+  both; there is a section saying so, and the e2e pins both halves in one run.
+- Invariant 2 promised that a revisit costs zero remote round trips, with no qualification.
+  Once a listing is not trusted, "is this still the current version?" cannot be answered
+  without asking, so outside the freshness window a revisit costs a listing refresh by
+  construction. Measured against a real host, a revisit straight after a load costs zero and
+  the same revisit three seconds later costs ten. The claim now says which window it holds in.
+- The config example carried `author = "souta"`, left over from the annotation feature. Unknown
+  keys are refused, so anybody who copied that block got a daemon that would not start.
+- The extension's store description, the crate's keywords, the issue template's scope text and
+  one of its required checkboxes all still described annotating files, which this does not do.
+  The same template's required "Phase target" dropdown listed another project's phases, so
+  every filer had to pick an option that meant nothing here.
+
+### Testing
+
+- `e2e/probe.mjs` points the daemon at a site nobody wrote for it and prints the failed
+  requests, the console errors, the round trips and the revisit cost. It asserts nothing: it is
+  for reading, and then for writing a check for whatever it found. `run.mjs` checks the claims
+  against fixtures this repository wrote, which therefore cannot surprise it — this is what
+  found the 32 KiB polling above.
+- The e2e harness refuses a daemon binary older than the source. Nothing in it builds one, so a
+  run against yesterday's binary checked yesterday's code and printed `ok` for all of it. That
+  is this project's own named failure mode arriving through its test harness, and it happened:
+  a new control field came back `undefined` and a measurement printed `NaN`. `NaN` is a lucky
+  shape — a changed *behaviour* would have read as a passing test.
 
 ## [0.2.0] - 2026-09-13
 
