@@ -88,26 +88,41 @@ The form asks for one per permission. Keep these in step with `../PRIVACY.md`.
 > The extension's only network destination. This is the user's own daemon, which they started
 > themselves, listening on loopback.
 
+**`web_accessible_resources: dashboard.html` for `http://ssh-browser/*`**
+
+Not a permission, so the form does not ask — but a reviewer reads the manifest, and this is
+the entry that would raise the question.
+
+> The daemon serves a page at the root of the configured suffix whose only job is to hand the
+> browser to this extension's dashboard. That navigation is refused unless the page is listed
+> here, so exactly one origin is: the bare suffix, which serves nothing but that page. Pages
+> served from a host — `docs.ssh-browser`, remote content, untrusted — are not covered by the
+> pattern and are refused the same navigation.
+
 **Remote code**
 
 > None. Everything the extension executes is in the uploaded package.
 
 ## Data disclosure
 
-Tick these three and explain in the notes. Under-declaring is a policy violation, so anything
-arguable is declared; the notes are where the shape of it gets said.
+Tick **one**. Under-declaring is a policy violation, so anything arguable is declared — but
+declaring a category the extension has no code for is a false statement on the same form, and
+this section had two of them until it was checked against the extension that actually shipped.
 
 - **Authentication information** — the daemon's control token. Held in the service worker,
   stored in `chrome.storage.local`, sent only to `http://127.0.0.1:<port>` as a request
-  header. Never given to a content script, because pages from the remote host are untrusted.
-- **Website content** — the text of pages under the configured suffix, read in order to find
-  the words a note was attached to. Anchoring cannot be done without reading them. The text is
-  not transmitted; only the note and its selectors go to the local daemon.
-- **Personal communications** — the notes the user types. They go to the local daemon, which
-  writes them to a file on the user's own SSH host. There is no service in between.
+  header. Never given to a page, because pages from the remote host are untrusted code.
 
-Also sent to the local daemon: the path of the page being viewed, which is how a document is
-identified. No browsing history is assembled or retained.
+Nothing else, and each of these is checkable rather than asserted:
+
+- **Website content** — no. There is no content script — `extension/permissions.json` pins
+  that and CI fails if it changes — and no host permission for any site, so there is no code
+  path that could read a page.
+- **Personal communications** — no. There was going to be an annotation feature; it was
+  removed, and with it the only thing the user would have typed.
+- **Web history, location, financial, health, personal identifiers, user activity** — no.
+  Nothing about the page being viewed is reported anywhere. The extension makes three `fetch`
+  calls and all three begin `http://127.0.0.1:`.
 
 All three certifications are true:
 
@@ -121,8 +136,20 @@ All three certifications are true:
 
 ## Screenshots
 
-At least one, 1280×800 or 640×400. `npm --prefix e2e run shots` captures them from the real
-product against a live daemon rather than mocking anything up, and writes to `e2e/shots/`.
+At least one, 1280×800 or 640×400. Taken from the real product against a live daemon rather
+than mocked up — but **not on your own machine**:
+
+```
+gh workflow run shots.yml
+gh run download <id> -n store-screenshots
+```
+
+The dashboard lists every host your ssh can reach, with the user, address, port and jump host
+`ssh -G` resolves for each, and above that what is being served, with the account and path it
+is rooted at. On a laptop that is your infrastructure in an image destined for a public page;
+the first run of this produced exactly that. `shots.yml` runs on a fresh runner against a
+throwaway sshd and the invented `ssh_config` in `e2e/shots-config/`, and `shots.mjs` refuses
+any host but a local one so it cannot happen by habit.
 
 ## Still to do by hand
 
