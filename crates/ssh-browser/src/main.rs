@@ -237,6 +237,15 @@ async fn main() -> Result<()> {
                     eprintln!("{line}");
                 }
             }
+            // Before the PAC advice rather than after, because it is the step that decides
+            // whether following the PAC advice works at all. A first run that printed
+            // `https://...` and nothing about the certificate left the reader at
+            // `ERR_CERT_AUTHORITY_INVALID` with nothing to go on — measured by doing exactly
+            // that on a machine which had never run this.
+            if let Some(advice) = startup.trust() {
+                eprintln!();
+                eprintln!("{advice}");
+            }
             eprintln!();
             // A PAC is not discoverable, so the banner says outright what to do with it
             // rather than leaving it to be found.
