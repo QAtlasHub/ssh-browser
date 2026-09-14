@@ -10,6 +10,7 @@ pub mod reachable;
 pub mod sftp;
 pub mod ssh_config;
 pub mod theme;
+pub mod tls;
 
 #[cfg(test)]
 mod testing;

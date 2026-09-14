@@ -58,7 +58,7 @@ body:
       description: "OS, Rust toolchain, network constraints, anything else relevant."
       placeholder: |
         OS: macOS 14.5 / Ubuntu 22.04 / Windows 11
-        Rust: 1.85.0 (rustup show)
+        Rust: 1.88.0 (rustup show)
         Network: behind corporate proxy, on-campus IP, etc.
     validations:
       required: false

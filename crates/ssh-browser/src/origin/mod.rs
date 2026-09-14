@@ -701,13 +701,10 @@ impl Origin {
         // The conditional GET never leaves this process: the validator came from the
         // cached listing, so a browser already holding the current copy is answered
         // with zero remote round trips. That is invariant 2.
-        //
-        // Nested rather than written as a let-chain: those stabilised in 1.88 and the
-        // declared MSRV here is 1.85.
-        if let (Some(tag), Some(header)) = (tag.as_deref(), cond.if_none_match.as_deref()) {
-            if cache::etag_matches(header, tag) {
-                return not_modified(tag);
-            }
+        if let (Some(tag), Some(header)) = (tag.as_deref(), cond.if_none_match.as_deref())
+            && cache::etag_matches(header, tag)
+        {
+            return not_modified(tag);
         }
 
         // Size comes from the listing, which is what makes a range answerable without
@@ -729,33 +726,33 @@ impl Origin {
         // Too large to hold: fetch only what was asked for. This branch is what makes
         // seeking in a video possible. Without it a seek pulls the whole file, and
         // holding that file would evict every page body that makes a revisit free.
-        if let range::Resolved::Part { start, end } = wanted {
-            if size > CACHE_WHOLE_MAX {
-                let req = RangeReq {
-                    path: file.clone(),
-                    offset: start,
-                    len: end - start + 1,
-                };
-                let mut got = session.fs.read_ranges(std::slice::from_ref(&req)).await;
-                return match got.pop() {
-                    Some(Ok(body)) => partial(
-                        mime::guess(&file),
-                        Bytes::from(body),
-                        tag.as_deref(),
-                        start,
-                        end,
-                        size,
-                    ),
-                    Some(Err(e)) => {
-                        self.cache.forget_listing(&chain[last].0);
-                        fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}"))
-                    }
-                    None => fail(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "read_ranges returned no result",
-                    ),
-                };
-            }
+        if let range::Resolved::Part { start, end } = wanted
+            && size > CACHE_WHOLE_MAX
+        {
+            let req = RangeReq {
+                path: file.clone(),
+                offset: start,
+                len: end - start + 1,
+            };
+            let mut got = session.fs.read_ranges(std::slice::from_ref(&req)).await;
+            return match got.pop() {
+                Some(Ok(body)) => partial(
+                    mime::guess(&file),
+                    Bytes::from(body),
+                    tag.as_deref(),
+                    start,
+                    end,
+                    size,
+                ),
+                Some(Err(e)) => {
+                    self.cache.forget_listing(&chain[last].0);
+                    fail(StatusCode::NOT_FOUND, format!("{path}: {e:#}"))
+                }
+                None => fail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "read_ranges returned no result",
+                ),
+            };
         }
 
         // The length the listing already gave is what turns this from a poll into one round
@@ -1329,13 +1326,12 @@ impl Origin {
             // Connected before it is remembered. A host that cannot be reached is not written
             // into the file, so the answer is the same failure `open` would give rather than a
             // silent "saved" followed by a URL that does not work.
-            if self.session(&known.alias).await.is_none() {
-                if let Err(e) = self
+            if self.session(&known.alias).await.is_none()
+                && let Err(e) = self
                     .connect(&known.alias, &known.host, ask.base.as_deref())
                     .await
-                {
-                    return control::text(StatusCode::BAD_GATEWAY, format!("{e:#}"));
-                }
+            {
+                return control::text(StatusCode::BAD_GATEWAY, format!("{e:#}"));
             }
         } else {
             self.sessions.write().await.remove(&known.alias);
