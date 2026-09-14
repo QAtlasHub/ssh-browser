@@ -325,6 +325,12 @@ pub struct Origin {
     /// certificate; one that fails at this stage almost always means it did not. So the daemon
     /// stops guessing and reports what happened.
     handshakes: Handshakes,
+    /// The certificate resolver, when there is one.
+    ///
+    /// Held here as well as inside the TLS configuration, because `/_control/certificate` answers
+    /// what is served for a name — and that has to be the same certificate a handshake gets, from
+    /// the same cache, or the key pin it reports is for something nobody will ever see.
+    certificates: Option<Arc<PerName>>,
     /// The serving certificate, when there is one.
     ///
     /// `None` under http, and that is what a `CONNECT` is refused by: there is no certificate to
@@ -434,11 +440,11 @@ impl Origin {
         // https mode fails at startup with a reason rather than on the first request with a
         // handshake error. Under http nothing is generated at all: no key is written for a
         // feature nobody asked for.
-        let (tls, trust) = match scheme.as_str() {
-            "http" => (None, None),
+        let (tls, certificates, trust) = match scheme.as_str() {
+            "http" => (None, None, None),
             "https" => {
-                let (config, advice) = serving_config(&suffix)?;
-                (Some(Arc::new(config)), Some(advice))
+                let (config, resolver, advice) = serving_config(&suffix)?;
+                (Some(Arc::new(config)), Some(resolver), Some(advice))
             }
             other => bail!("scheme {other:?} is not one this daemon serves; use http or https"),
         };
@@ -489,6 +495,7 @@ impl Origin {
         let origin = Arc::new(Self {
             suffix,
             scheme,
+            certificates,
             tls,
             port,
             sessions: RwLock::new(sessions),
@@ -755,7 +762,7 @@ impl Origin {
             ) {
                 return refusal;
             }
-            return self.control(method, path, body).await;
+            return self.control(method, path, query, body).await;
         }
 
         if path == "/proxy.pac" {
@@ -1013,7 +1020,13 @@ impl Origin {
         }
     }
 
-    async fn control(&self, method: &Method, path: &str, body: &[u8]) -> Response<Full<Bytes>> {
+    async fn control(
+        &self,
+        method: &Method,
+        path: &str,
+        query: Option<&str>,
+        body: &[u8],
+    ) -> Response<Full<Bytes>> {
         match (method, control::route_of(path)) {
             (&Method::GET, "hello") => {
                 let aliases = self.alias_names().await;
@@ -1032,6 +1045,7 @@ impl Origin {
             (&Method::POST, "open") => self.open_host(body).await,
             (&Method::POST, "close") => self.close_alias(body).await,
             (&Method::POST, "enabled") => self.set_enabled(body).await,
+            (&Method::GET, "certificate") => self.show_certificate(query),
             (&Method::GET, "theme") => self.show_theme().await,
             (&Method::POST, "theme") => self.set_theme(body).await,
             (&Method::GET, route) => {
@@ -1567,6 +1581,71 @@ impl Origin {
             enabled: ask.enabled,
             remembered,
             url: ask.enabled.then(|| self.site_url(&known.alias)),
+        })
+    }
+
+    /// `GET /_control/certificate?name=<alias>.<suffix>` -- what is served for that name.
+    ///
+    /// Two reasons this exists rather than being an implementation detail.
+    ///
+    /// A reader being asked to trust a root may reasonably want to see what it signs before
+    /// deciding, and "run openssl on this file" is a poor answer to that when the file is a root
+    /// and the question is about a leaf.
+    ///
+    /// And it makes the https mode testable without a trust store. A browser can be told to
+    /// accept one specific public key for one launch — Chromium's
+    /// `--ignore-certificate-errors-spki-list` takes exactly the `pin` below — which means the
+    /// whole path can be exercised in CI, where installing a root is not an option. Measured:
+    /// with the pin, an https alias origin reports `isSecureContext` with service workers,
+    /// `crypto.subtle` and `caches`, and nothing on the machine changes.
+    fn show_certificate(&self, query: Option<&str>) -> Response<Full<Bytes>> {
+        let Some(certificates) = self.certificates.as_ref() else {
+            return control::text(
+                StatusCode::NOT_IMPLEMENTED,
+                "this daemon serves http, so there is no certificate",
+            );
+        };
+
+        // The name has to be asked for, because there is a certificate per name and no single
+        // "the" certificate. Defaulting to something would answer a question nobody asked.
+        let Some(name) = query.and_then(|q| {
+            q.split('&')
+                .find_map(|pair| pair.strip_prefix("name="))
+                .map(str::to_string)
+        }) else {
+            return control::text(
+                StatusCode::BAD_REQUEST,
+                "certificate needs a name, e.g. ?name=docs.ssh-browser",
+            );
+        };
+
+        // Through the resolver's own cache, so this is the certificate a handshake gets rather
+        // than a second one that happens to be valid. Minting a fresh one here is what the first
+        // version did, and the pin it reported was for a certificate nobody would ever be served.
+        let Some(minted) = certificates.certificate_for(&name) else {
+            return control::text(
+                StatusCode::BAD_REQUEST,
+                format!("{name:?} is not a name this daemon can vouch for"),
+            );
+        };
+
+        #[derive(serde::Serialize)]
+        struct Served<'a> {
+            name: &'a str,
+            certificate: &'a str,
+            /// Base64 of the SHA-256 of the certificate's `SubjectPublicKeyInfo`.
+            ///
+            /// The form a browser takes for a one-launch pin, so it can be handed straight to
+            /// `--ignore-certificate-errors-spki-list` without anybody computing a digest — and
+            /// without trusting a root to try the https mode at all.
+            pin: &'a str,
+            authority: &'a str,
+        }
+        control::json(&Served {
+            name: &name,
+            certificate: &minted.certificate_pem,
+            pin: &minted.pin,
+            authority: certificates.authority.certificate_pem(),
         })
     }
 
@@ -2286,8 +2365,12 @@ struct Handshakes {
 /// registry and a wildcard directly beneath one reads as covering a whole top-level domain. A
 /// certificate naming the alias outright is accepted, and the origin is then a real secure
 /// context — service workers, `crypto.subtle` and all.
-fn serving_config(suffix: &str) -> Result<(rustls::ServerConfig, String)> {
+fn serving_config(suffix: &str) -> Result<(rustls::ServerConfig, Arc<PerName>, String)> {
     let (authority, found) = tls::load_or_create_reporting(suffix)?;
+    let resolver = Arc::new(PerName {
+        authority: Arc::new(authority),
+        minted: Mutex::new(HashMap::new()),
+    });
 
     // Said on every https run, not only the first. Nothing portable can ask a trust store
     // whether this is still in it, and the failure when it is not — `ERR_CERT_AUTHORITY_INVALID`
@@ -2320,26 +2403,78 @@ fn serving_config(suffix: &str) -> Result<(rustls::ServerConfig, String)> {
     // decides what to serve based on who is asking. The token does that, on the control API.
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(PerName {
-            authority,
-            suffix: suffix.to_string(),
-            minted: Mutex::new(HashMap::new()),
-        }));
+        .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn rustls::server::ResolvesServerCert>);
     // The browser asked for https, so http/1.1 is what is spoken inside the tunnel. Advertised
     // rather than left to chance: without it a browser may negotiate h2, which nothing here
     // serves, and the failure is a dead connection rather than a refusal.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok((config, advice))
+    Ok((config, resolver, advice))
 }
 
 /// Signs a certificate the first time each name is asked for, and remembers it.
 ///
 /// Remembered because a handshake must not wait on key generation twice for the same site, and
 /// because a browser opening a page and its subresources will handshake more than once.
+///
+/// The cache is also the *only* source of truth for what is being served, which
+/// `/_control/certificate` reads. Minting a second certificate to answer that question is what the
+/// first version did, and it produced a key pin for a certificate no browser would ever see: the
+/// right length, the right shape, and never a match. The e2e caught it on the first run.
 struct PerName {
-    authority: tls::Authority,
-    suffix: String,
-    minted: Mutex<HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    authority: Arc<tls::Authority>,
+    minted: Mutex<HashMap<String, Minted>>,
+}
+
+/// One name's certificate, in all three forms anything here needs.
+#[derive(Clone)]
+struct Minted {
+    key: Arc<rustls::sign::CertifiedKey>,
+    certificate_pem: String,
+    /// Base64 of the SHA-256 of the public key info, which is what a browser takes as a pin.
+    pin: String,
+}
+
+impl PerName {
+    /// The certificate for this name, signing one if there is not one yet.
+    ///
+    /// `None` for a name the authority may not vouch for, which is also what a handshake gets.
+    fn certificate_for(&self, name: &str) -> Option<Minted> {
+        if let Some(found) = self
+            .minted
+            .lock()
+            .ok()
+            .and_then(|held| held.get(name).cloned())
+        {
+            return Some(found);
+        }
+
+        // `leaf_for` refuses anything that is not a single label under the suffix, so this is also
+        // the point where a request for somebody else's name stops. The name constraint in the
+        // authority would stop it again at the verifier, but failing here means never signing it.
+        let leaf = self.authority.leaf_for(name).ok()?;
+        let certs =
+            rustls_pki_types::CertificateDer::pem_slice_iter(leaf.certificate_pem.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()?;
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).ok()?;
+        let signing = rustls::crypto::ring::default_provider()
+            .key_provider
+            .load_private_key(key)
+            .ok()?;
+        let minted = Minted {
+            key: Arc::new(rustls::sign::CertifiedKey::new(certs, signing)),
+            pin: tls::spki_pin(&leaf.certificate_pem).ok()?,
+            certificate_pem: leaf.certificate_pem,
+        };
+
+        // Whoever got here first wins, and the loser's certificate is dropped rather than
+        // replacing it. Two valid certificates for one name would both work, but only one of them
+        // is the one `/_control/certificate` reported.
+        if let Ok(mut held) = self.minted.lock() {
+            return Some(held.entry(name.to_string()).or_insert(minted).clone());
+        }
+        Some(minted)
+    }
 }
 
 impl std::fmt::Debug for PerName {
@@ -2347,7 +2482,7 @@ impl std::fmt::Debug for PerName {
         // Hand-written because `Authority` holds a private key and deriving this would put it one
         // `{:?}` away from a log line.
         f.debug_struct("PerName")
-            .field("suffix", &self.suffix)
+            .field("suffix", &self.authority.suffix())
             .finish()
     }
 }
@@ -2360,40 +2495,8 @@ impl rustls::server::ResolvesServerCert for PerName {
         // No SNI means no name to vouch for. Returning nothing fails the handshake, which is the
         // honest answer: a certificate for a name the client did not ask about would be rejected
         // by the client anyway, and more confusingly.
-        let name = hello.server_name()?.to_string();
-
-        if let Some(found) = self
-            .minted
-            .lock()
-            .ok()
-            .and_then(|held| held.get(&name).cloned())
-        {
-            return Some(found);
-        }
-
-        // `leaf_for` refuses anything that is not a single label under the suffix, so this is
-        // also the point where a handshake for somebody else's name stops. It would be stopped
-        // again by the name constraint in the authority, but failing here means never signing
-        // the certificate at all.
-        let leaf = self.authority.leaf_for(&name).ok()?;
-        // `rustls-pki-types` rather than `rustls-pemfile`: the latter is unmaintained
-        // (RUSTSEC-2025-0134) and this is where its job moved. It is already in the tree as
-        // rustls's own dependency, so this removes a crate rather than adding one.
-        let certs =
-            rustls_pki_types::CertificateDer::pem_slice_iter(leaf.certificate_pem.as_bytes())
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .ok()?;
-        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).ok()?;
-        let signing = rustls::crypto::ring::default_provider()
-            .key_provider
-            .load_private_key(key)
-            .ok()?;
-        let certified = Arc::new(rustls::sign::CertifiedKey::new(certs, signing));
-
-        if let Ok(mut held) = self.minted.lock() {
-            held.insert(name, Arc::clone(&certified));
-        }
-        Some(certified)
+        let name = hello.server_name()?;
+        Some(self.certificate_for(name)?.key)
     }
 }
 
@@ -2838,6 +2941,7 @@ mod tests {
             // http, because these tests drive `handle` directly and never open a socket. An
             // https origin here would only change the URLs printed in a listing.
             scheme: "http".to_string(),
+            certificates: None,
             tls: None,
             port: 7391,
             sessions: RwLock::new(sessions),

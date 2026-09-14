@@ -7,6 +7,11 @@
 # For project-specific jargon spelled this way on purpose, map the token to
 # itself. Keep the table sorted; prefer fixing the typo over adding an entry.
 
+# One of RFC 4648's own base64 test vectors: "", "f", "fo", "foo", "foob",
+# "fooba", "foobar". Spelling it differently would test something the RFC does
+# not specify, which is the whole reason for using its vectors.
+fo = "fo"
+
 [files]
 # Generated / vendored files where typo enforcement is not useful.
 extend-exclude = ["Cargo.lock", "*.lock"]

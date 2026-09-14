@@ -150,6 +150,15 @@ cargo install ssh-browser
 ssh-browser serve docs=myhost:/srv/docs cluster=login-node
 ```
 
+**What that needs on your machine:** a Rust toolchain and a C compiler. The C compiler is for
+`ring`, which the TLS stack compiles — `cc` on Linux and macOS, the MSVC build tools or a MinGW
+toolchain on Windows. Nothing else: no OpenSSL, no system TLS library, no daemon, no service.
+Everything TLS is inside the binary, and `deny.toml` bans the OpenSSL crates so it stays that way.
+
+At runtime it needs `ssh` on your `PATH` and nothing more. Trusting the https certificate uses a
+command your OS already has — `certutil`, `security`, or `update-ca-certificates` — and
+`ssh-browser trust` prints the one for your platform.
+
 A host on its own means that account's home directory, which the daemon asks the remote
 for. `ssh-browser hosts` prints what your `~/.ssh/config` already knows how to reach —
 user, hostname, port and any `ProxyJump` — which is the list worth picking an alias from.

@@ -335,6 +335,55 @@ async function main() {
       .then((r) => r.json())
       .catch(() => null);
 
+
+    // The https path itself, in CI, with nothing on the machine changed.
+    //
+    // Trusting a root is not something CI can do, and for a long time that meant the loading
+    // half of this mode was only ever measured by hand. It does not have to be: a browser can be
+    // told to accept one specific public key for one launch, and the daemon can say which key it
+    // is serving. So the whole path is exercised here — the tunnel, the handshake, the
+    // certificate, and the secure context that is the entire point of the mode.
+    //
+    // The pin is of the *leaf*, not the authority. Pinning the authority does not work, which is
+    // how the first attempt at this failed: Chromium compares against the certificate it was
+    // actually served.
+    const certificate = await fetch(
+      `http://127.0.0.1:${PORT + 1}/_control/certificate?name=${ALIAS}.${SUFFIX}`,
+      { headers: { [TOKEN_HEADER]: https.token } },
+    ).then((r) => (r.ok ? r.json() : null));
+
+    let overHttps = null;
+    if (certificate?.pin) {
+      const pinned = await mkdtemp(join(tmpdir(), "ssh-browser-https-"));
+      const withPin = await chromium.launchPersistentContext(pinned, {
+        ...browserOptions(),
+        proxy: { server: `http://127.0.0.1:${PORT + 1}` },
+        // Not `ignoreHTTPSErrors`: that would make the origin insecure, which is the thing
+        // being measured. This trusts one key and keeps every other check in place.
+        args: [`--ignore-certificate-errors-spki-list=${certificate.pin}`],
+      });
+      try {
+        const page = await withPin.newPage();
+        await page.goto(`https://${ALIAS}.${SUFFIX}/index.html`, {
+          waitUntil: "networkidle",
+          timeout: 45_000,
+        });
+        overHttps = await page.evaluate(() => ({
+          origin: location.origin,
+          secure: window.isSecureContext,
+          serviceWorker: "serviceWorker" in navigator,
+          subtle: typeof crypto !== "undefined" && crypto.subtle !== undefined,
+          caches: typeof caches !== "undefined",
+          module: document.getElementById("module")?.textContent ?? "",
+        }));
+      } catch (e) {
+        overHttps = { failed: e.message.split("\n")[0] };
+      } finally {
+        await withPin.close();
+        await rm(pinned, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+
     await stop(https.child);
 
     check("a first https run says the authority is not trusted yet", () =>
@@ -352,6 +401,26 @@ async function main() {
 
     check("under https the daemon reports what handshakes have done", () =>
       assert.deepEqual(beforeAnyPage?.tls, { completed: 0, failed: 0 }),
+    );
+
+    check("the daemon says which key it is serving, so it can be pinned", () => {
+      assert.ok(certificate?.pin, `no pin came back: ${JSON.stringify(certificate)}`);
+      // 44 characters is base64 of a SHA-256, which is the only shape the browser flag takes.
+      assert.equal(certificate.pin.length, 44);
+      assert.match(certificate.certificate, /BEGIN CERTIFICATE/);
+    });
+    // The claim the whole mode exists for, in CI, with nothing on the machine changed.
+    check("and over https the alias origin is a secure context", () => {
+      assert.ok(overHttps && !overHttps.failed, `https did not load: ${JSON.stringify(overHttps)}`);
+      assert.equal(overHttps.origin, `https://${ALIAS}.${SUFFIX}`);
+      assert.equal(overHttps.secure, true);
+      assert.equal(overHttps.serviceWorker, true);
+      assert.equal(overHttps.subtle, true);
+      assert.equal(overHttps.caches, true);
+    });
+    // And it is a real page, not just a handshake that completed.
+    check("with the page actually running", () =>
+      assert.equal(overHttps?.module, "module executed"),
     );
     console.log("\nwhat CONNECT is allowed to reach");
     // The https mode terminates TLS behind a `CONNECT`, which makes this daemon a proxy — and a
