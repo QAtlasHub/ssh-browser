@@ -24,7 +24,21 @@ const OUT = join(here, "icons");
 
 /// The four Chrome asks for: 16 in the toolbar, 48 on the extensions page, 128 in the store,
 /// and 32 for the displays that sit between them.
-const SIZES = [16, 32, 48, 128];
+///
+/// The 128 is drawn smaller inside its square, and that is the store's rule rather than a
+/// preference: the listing wants 96×96 of artwork with 16 transparent pixels on every side,
+/// because it draws its own rounded frame around whatever it is given and a tile that fills
+/// the canvas has that frame drawn across its corners. The others are toolbar icons, where the
+/// opposite holds and padding is wasted pixels at sixteen across.
+///
+/// Still one drawing. `fill` is where it is sampled from, not a second set of numbers.
+const SIZES = [
+  { px: 16, fill: 1 },
+  { px: 32, fill: 1 },
+  { px: 48, fill: 1 },
+  // The tile is 93% of the canvas, so 96/128 of the canvas means 96/119 of the tile.
+  { px: 128, fill: 96 / 119 },
+];
 
 /// Supersampling factor. Drawn straight at 16×16 the diagonals stair-step; drawn at 64×64 and
 /// averaged down, the same shape has edges that read as smooth.
@@ -63,7 +77,7 @@ function ink(x, y) {
   return Math.min(upper, lower, bar);
 }
 
-function render(size) {
+function render(size, fill) {
   const n = size * SS;
   const px = new Uint8Array(size * size * 4);
 
@@ -77,8 +91,10 @@ function render(size) {
       for (let sy = 0; sy < SS; sy += 1) {
         for (let sx = 0; sx < SS; sx += 1) {
           // The centre of each subpixel, mapped to -1..1.
-          const u = ((pxi * SS + sx + 0.5) / n) * 2 - 1;
-          const v = ((py * SS + sy + 0.5) / n) * 2 - 1;
+          // Divided by `fill`, so a smaller `fill` moves the sample further out and the
+          // drawing lands smaller in the same square. One drawing, sampled from further away.
+          const u = (((pxi * SS + sx + 0.5) / n) * 2 - 1) / fill;
+          const v = (((py * SS + sy + 0.5) / n) * 2 - 1) / fill;
 
           if (roundedRect(u, v, 1.86, 1.86, 0.42) > 0) {
             continue;
@@ -139,7 +155,7 @@ function png(size, pixels) {
 }
 
 await mkdir(OUT, { recursive: true });
-for (const size of SIZES) {
-  await writeFile(join(OUT, `icon-${size}.png`), png(size, render(size)));
+for (const { px: size, fill } of SIZES) {
+  await writeFile(join(OUT, `icon-${size}.png`), png(size, render(size, fill)));
   console.log(`  wrote icons/icon-${size}.png`);
 }
