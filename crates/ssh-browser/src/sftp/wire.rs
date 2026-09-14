@@ -1,14 +1,40 @@
 //! SFTP v3 wire format.
 
+/// A request this daemon can send.
+///
+/// The README says nothing is written to your remote, and this is the sentence that makes it
+/// true: `Verb` wraps a `u8` that nothing outside this module can construct, and there are six
+/// of them. `SSH_FXP_WRITE`, `SETSTAT`, `REMOVE`, `MKDIR`, `RMDIR`, `RENAME` and `SYMLINK` are
+/// not missing by policy -- there is no value of this type that means them, so the code that
+/// would send one does not compile.
+///
+/// A seventh means adding a `pub const` here, which is a line in a diff somebody reads. That
+/// is the point: the claim stops being a thing to remember and becomes a thing to notice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Verb(u8);
+
+impl Verb {
+    /// The byte that goes on the wire.
+    ///
+    /// One way only. There is no `from_u8`, because a byte that arrived from somewhere is a
+    /// reply type or somebody's input, and neither is a request this may send.
+    pub const fn code(self) -> u8 {
+        self.0
+    }
+}
+
+pub const OPEN: Verb = Verb(3);
+pub const CLOSE: Verb = Verb(4);
+pub const READ: Verb = Verb(5);
+pub const OPENDIR: Verb = Verb(11);
+pub const READDIR: Verb = Verb(12);
+pub const REALPATH: Verb = Verb(16);
+
+/// The version handshake, which is not a filesystem request and so is not a `Verb`.
 pub const INIT: u8 = 1;
 pub const VERSION: u8 = 2;
-pub const OPEN: u8 = 3;
-pub const CLOSE: u8 = 4;
-pub const READ: u8 = 5;
-pub const LSTAT: u8 = 7;
-pub const OPENDIR: u8 = 11;
-pub const READDIR: u8 = 12;
-pub const REALPATH: u8 = 16;
+
+/// Reply types. These arrive; they are never sent, which is why they stay bytes.
 pub const STATUS: u8 = 101;
 pub const HANDLE: u8 = 102;
 pub const DATA: u8 = 103;
@@ -159,6 +185,32 @@ impl Attrs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The README says nothing is written to your remote. This is the list that claim is about.
+    ///
+    /// It fails two ways, and both are the point. Adding a `Verb` and forgetting this list
+    /// fails it; deleting one that is in use fails to compile. So the set cannot grow quietly,
+    /// which is the only way a read-only client stops being one.
+    #[test]
+    fn the_verbs_are_the_six_read_ones() {
+        let mut codes = [OPEN, CLOSE, READ, OPENDIR, READDIR, REALPATH].map(Verb::code);
+        codes.sort_unstable();
+        assert_eq!(codes, [3, 4, 5, 11, 12, 16]);
+
+        // SSH_FXP_WRITE, SETSTAT, FSETSTAT, REMOVE, MKDIR, RMDIR, RENAME, SYMLINK. Named here
+        // so that the absence is written down: a reader should not have to know SFTP v3 by
+        // heart to see that the dangerous half of it is not in the list above.
+        for writes in [6u8, 9, 10, 13, 14, 15, 18, 20] {
+            assert!(!codes.contains(&writes), "{writes} is a write");
+        }
+    }
+
+    /// The only open mode there is. `FXF_WRITE`, `FXF_APPEND`, `FXF_CREAT` and `FXF_TRUNC` are
+    /// not defined anywhere in this crate, so `OPEN` has nothing else it could ask for.
+    #[test]
+    fn the_only_open_flag_is_read() {
+        assert_eq!(FXF_READ, 1);
+    }
 
     #[test]
     fn roundtrips_primitives() {

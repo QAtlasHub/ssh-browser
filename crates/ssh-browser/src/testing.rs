@@ -22,6 +22,18 @@ const SSH_FX_OK: u32 = 0;
 const SSH_FX_EOF: u32 = 1;
 const SSH_FX_NO_SUCH_FILE: u32 = 2;
 
+/// The bytes a request arrives as, for the fake server below to match on.
+///
+/// Spelled out here rather than matched on `Verb` directly, because what comes off a socket is
+/// a byte and a byte is not a request this daemon may send -- which is the whole distinction
+/// `Verb` exists to keep. Derived from the constants, so they cannot drift apart.
+const B_OPEN: u8 = OPEN.code();
+const B_CLOSE: u8 = CLOSE.code();
+const B_READ: u8 = READ.code();
+const B_OPENDIR: u8 = OPENDIR.code();
+const B_READDIR: u8 = READDIR.code();
+const B_REALPATH: u8 = REALPATH.code();
+
 pub fn file_attrs(size: u64, mtime: u32) -> Attrs {
     Attrs {
         size: Some(size),
@@ -158,7 +170,7 @@ where
         let id = d.u32().expect("request id");
 
         let (out_kind, body) = match kind {
-            OPENDIR => {
+            B_OPENDIR => {
                 let path = utf8(d.str().expect("opendir path"));
                 // A declared refusal wins over the tree, so a directory can be made to exist
                 // and still be refused — which is what a permission problem looks like.
@@ -177,7 +189,7 @@ where
                     (STATUS, status(id, SSH_FX_NO_SUCH_FILE, "no such directory"))
                 }
             }
-            READDIR => {
+            B_READDIR => {
                 let handle = d.str().expect("readdir handle").to_vec();
                 let path = path_of(&handle).expect("readdir handle shape");
                 if drained.contains(&handle) {
@@ -188,7 +200,7 @@ where
                     (NAME, names(id, entries))
                 }
             }
-            OPEN => {
+            B_OPEN => {
                 let path = utf8(d.str().expect("open path"));
                 // Read and discarded: this daemon only ever opens for reading, so there is
                 // no create flag left to honour.
@@ -206,7 +218,7 @@ where
                     (STATUS, status(id, SSH_FX_NO_SUCH_FILE, "no such file"))
                 }
             }
-            READ => {
+            B_READ => {
                 let handle = d.str().expect("read handle").to_vec();
                 let path = path_of(&handle).expect("read handle shape");
                 let offset = d.u64().expect("read offset") as usize;
@@ -222,7 +234,7 @@ where
                     (DATA, Enc::new().u32(id).str(&body[offset..end]).done())
                 }
             }
-            REALPATH => {
+            B_REALPATH => {
                 d.str().expect("realpath path");
                 match &remote.home {
                     // A one-entry NAME page, built by the same encoder a listing uses.
@@ -245,7 +257,7 @@ where
                     ),
                 }
             }
-            CLOSE => {
+            B_CLOSE => {
                 d.str().expect("close handle");
                 (STATUS, status(id, SSH_FX_OK, "ok"))
             }

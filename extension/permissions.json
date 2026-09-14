@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "The extension's whole reach, pinned. CI rebuilds this from manifest.json and fails if the",
+    "two disagree, so widening what the extension can touch is a line in a diff with this file",
+    "next to it rather than a key somebody added while doing something else.",
+    "",
+    "Why these: `proxy` installs the PAC, which is the only reason any of this works in a",
+    "browser. `storage` holds the port and the control token. `http://127.0.0.1/*` is the",
+    "daemon and nothing else -- no host permission over any site is asked for, which is what",
+    "lets the extension claim it cannot read the pages it routes. `web_accessible_resources`",
+    "names one origin, the bare suffix, so the front door may open the dashboard and remote",
+    "HTML served from a host may not.",
+    "",
+    "There are no content scripts. Nothing is injected into a page the reader came for."
+  ],
+  "permissions": [
+    "proxy",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "optional_permissions": [],
+  "optional_host_permissions": [],
+  "content_scripts": [],
+  "web_accessible_resources": [
+    {
+      "matches": [
+        "http://ssh-browser/*",
+        "https://ssh-browser/*"
+      ],
+      "resources": [
+        "dashboard.html"
+      ]
+    }
+  ],
+  "externally_connectable": null,
+  "content_security_policy": null
+}

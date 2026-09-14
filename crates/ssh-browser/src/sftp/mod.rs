@@ -15,7 +15,7 @@ pub mod wire;
 use anyhow::{Context, Result, bail, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use wire::{Dec, Enc, INIT, VERSION};
+use wire::{Dec, Enc, INIT, VERSION, Verb};
 
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -66,8 +66,13 @@ impl<W: AsyncWrite + Unpin> Tx<W> {
         id
     }
 
-    pub async fn queue(&mut self, kind: u8, payload: &[u8]) -> Result<()> {
-        write_frame(&mut self.w, kind, payload).await
+    /// Send one request.
+    ///
+    /// A `Verb`, not a byte. `write_frame` below still takes a byte because a reply is a byte
+    /// and the test server writes replies -- but nothing outside this module reaches it to
+    /// send a *request*, and `Verb` has six values. See `wire::Verb`.
+    pub async fn queue(&mut self, kind: Verb, payload: &[u8]) -> Result<()> {
+        write_frame(&mut self.w, kind.code(), payload).await
     }
 
     pub async fn flush(&mut self) -> Result<()> {
@@ -124,7 +129,7 @@ impl<W: AsyncWrite + Unpin, R: AsyncRead + Unpin> Sftp<W, R> {
         self.tx.alloc_id()
     }
 
-    pub async fn queue(&mut self, kind: u8, payload: &[u8]) -> Result<()> {
+    pub async fn queue(&mut self, kind: Verb, payload: &[u8]) -> Result<()> {
         self.tx.queue(kind, payload).await
     }
 

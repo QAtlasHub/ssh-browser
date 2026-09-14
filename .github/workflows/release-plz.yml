@@ -78,7 +78,10 @@ jobs:
     if: needs.release.outputs.released == 'true'
     permissions:
       contents: write
-    uses: ./.github/workflows/release-assets.yml
+    # `$/` is the better spelling, and this is the one workflow whose first real run is a
+    # release. A path that resolves today is worth more here than a path that reads better;
+    # revisit once a release has gone out on it.
+    uses: ./.github/workflows/release-assets.yml # zizmor: ignore[self-repository]
     with:
       tag: ${{ needs.release.outputs.tag }}
 

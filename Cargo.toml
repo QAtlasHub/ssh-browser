@@ -8,3 +8,9 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/QAtlasHub/ssh-browser"
+
+[workspace.lints.rust]
+# There is none today. Forbidding it means there is none tomorrow either, without anyone
+# having to look: `forbid` cannot be lifted by an `allow` further down, so adding the first
+# `unsafe` block is a build failure rather than a line in a diff nobody reads.
+unsafe_code = "forbid"

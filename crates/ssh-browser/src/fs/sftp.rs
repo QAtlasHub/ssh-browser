@@ -19,7 +19,7 @@ use super::{Entry, RangeReq, Refused, RemoteFs};
 use crate::sftp::transport::{self, SshChild};
 use crate::sftp::wire::{
     Attrs, CLOSE, DATA, Dec, Enc, FXF_READ, HANDLE, NAME, OPEN, OPENDIR, READ, READDIR, REALPATH,
-    STATUS, STATUS_EOF,
+    STATUS, STATUS_EOF, Verb,
 };
 use crate::sftp::{Reply, Rx, Sftp, Tx};
 
@@ -34,7 +34,7 @@ const READ_CHUNK: u32 = 32 * 1024;
 const COALESCE: Duration = Duration::from_micros(200);
 
 struct Job {
-    kind: u8,
+    kind: Verb,
     /// Request body without the leading id; the writer owns id allocation.
     body: Vec<u8>,
     reply: oneshot::Sender<Reply>,
@@ -93,7 +93,7 @@ impl SftpFs {
     }
 
     /// Hand a request to the writer without awaiting its reply.
-    async fn issue(&self, kind: u8, body: Vec<u8>) -> Result<oneshot::Receiver<Reply>> {
+    async fn issue(&self, kind: Verb, body: Vec<u8>) -> Result<oneshot::Receiver<Reply>> {
         let (reply, rx) = oneshot::channel();
         self.jobs
             .send(Job { kind, body, reply })
@@ -526,6 +526,15 @@ async fn reader<R: AsyncRead + Unpin>(mut rx: Rx<R>, pending: Pending) {
 mod tests {
     use super::*;
     use crate::sftp::wire::{INIT, VERSION};
+
+    /// The bytes a request arrives as, for the fake server below to match on.
+    ///
+    /// Spelled out here rather than matched on `Verb` directly, because what comes off a socket is
+    /// a byte and a byte is not a request this daemon may send -- which is the whole distinction
+    /// `Verb` exists to keep. Derived from the constants, so they cannot drift apart.
+    const B_OPEN: u8 = OPEN.code();
+    const B_CLOSE: u8 = CLOSE.code();
+    const B_READ: u8 = READ.code();
     use crate::sftp::{read_frame, write_frame};
     use tokio::io::AsyncWriteExt;
 
@@ -547,8 +556,8 @@ mod tests {
             let mut d = Dec::new(&payload);
             let id = d.u32().expect("request id");
             let (out_kind, out) = match kind {
-                OPEN => (HANDLE, Enc::new().u32(id).str(b"h").done()),
-                READ => {
+                B_OPEN => (HANDLE, Enc::new().u32(id).str(b"h").done()),
+                B_READ => {
                     d.str().expect("handle");
                     let offset = d.u64().expect("offset") as usize;
                     if fail_read {
@@ -571,7 +580,7 @@ mod tests {
                         (DATA, Enc::new().u32(id).str(&body[offset..]).done())
                     }
                 }
-                CLOSE => (STATUS, Enc::new().u32(id).u32(0).str(b"ok").str(b"").done()),
+                B_CLOSE => (STATUS, Enc::new().u32(id).u32(0).str(b"ok").str(b"").done()),
                 other => panic!("fake server got unexpected request type {other}"),
             };
             write_frame(&mut w, out_kind, &out).await.expect("reply");
