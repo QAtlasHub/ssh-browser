@@ -372,6 +372,57 @@ pub fn permits_only(certificate_pem: &str, suffix: &str) -> bool {
         && limits.signs_only_certificates
 }
 
+/// Base64 of the SHA-256 of a certificate's `SubjectPublicKeyInfo`.
+///
+/// The form a browser wants for a one-launch key pin: Chromium's
+/// `--ignore-certificate-errors-spki-list` takes exactly this. Computed here rather than left to
+/// the caller so that nobody has to know that it is the *public key info* being hashed and not
+/// the certificate — which is the mistake that makes a pin silently never match.
+///
+/// Measured, and the measurement corrected a guess: pinning the *authority's* key does not work,
+/// because Chromium compares against the certificate it was actually served. The leaf's pin does.
+pub fn spki_pin(certificate_pem: &str) -> Result<String> {
+    use x509_parser::prelude::*;
+
+    let (_, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes())
+        .context("the certificate is not PEM")?;
+    let (_, cert) =
+        X509Certificate::from_der(&pem.contents).context("the certificate is not X.509")?;
+    let spki = cert.tbs_certificate.subject_pki.raw;
+    let digest = ring::digest::digest(&ring::digest::SHA256, spki);
+    Ok(base64(digest.as_ref()))
+}
+
+/// Standard base64, which is what the browser flag expects.
+///
+/// Hand-rolled because the alternative is a dependency for twelve lines, and the alphabet is
+/// fixed by RFC 4648 rather than being a thing to get opinions about.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(char::from(ALPHABET[(n >> 18) as usize & 63]));
+        out.push(char::from(ALPHABET[(n >> 12) as usize & 63]));
+        out.push(if chunk.len() > 1 {
+            char::from(ALPHABET[(n >> 6) as usize & 63])
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            char::from(ALPHABET[n as usize & 63])
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Where the authority lives between runs.
 ///
 /// Beside the control token, so it is under the same directory and the same permissions. Not in
@@ -867,6 +918,53 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The base64 encoder, against RFC 4648's own test vectors.
+    ///
+    /// Hand-rolled twelve lines with a padding rule, which is exactly the shape of thing that is
+    /// wrong in the last two characters and looks right. The vectors are from the RFC so they are
+    /// not this implementation checked against itself.
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        // Every bit set, which is where an alphabet typo shows up.
+        assert_eq!(base64(&[0xff, 0xff, 0xff]), "////");
+        assert_eq!(base64(&[0xfb, 0xff, 0xbf]), "+/+/");
+    }
+
+    /// The pin is of the public key, not of the certificate.
+    ///
+    /// Two certificates for different names signed with the same key must pin the same, and a
+    /// different key must pin differently. Getting this wrong gives a pin that silently never
+    /// matches — which is how the first attempt at this failed: pinning the authority's key
+    /// instead of the served certificate's.
+    #[test]
+    fn the_pin_follows_the_key_and_not_the_certificate() {
+        let ca = Authority::create("ssh-browser").expect("an authority");
+        let one = ca.leaf_for("a.ssh-browser").expect("a leaf");
+        let two = ca.leaf_for("b.ssh-browser").expect("another leaf");
+
+        let pin_one = spki_pin(&one.certificate_pem).expect("a pin");
+        let pin_two = spki_pin(&two.certificate_pem).expect("a pin");
+        let pin_ca = spki_pin(ca.certificate_pem()).expect("a pin");
+
+        // Different keys, so different pins -- each leaf gets its own key.
+        assert_ne!(pin_one, pin_two);
+        // And neither is the authority's, which is the mistake that produced a pin the browser
+        // ignored.
+        assert_ne!(pin_one, pin_ca);
+        // Base64 of a SHA-256 is always 44 characters with one pad.
+        for pin in [&pin_one, &pin_two, &pin_ca] {
+            assert_eq!(pin.len(), 44, "{pin}");
+            assert!(pin.ends_with('='), "{pin}");
+        }
     }
 
     /// The date arithmetic, against a calendar rather than against itself.

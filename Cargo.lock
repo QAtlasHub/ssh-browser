@@ -585,6 +585,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",

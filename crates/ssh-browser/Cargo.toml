@@ -20,6 +20,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "crypto", "ring", "x509-parser"] }
+ring = "0.17.14"
 rustls = { version = "0.23.44", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
 serde = { version = "1", features = ["derive"] }

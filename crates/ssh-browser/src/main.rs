@@ -134,16 +134,29 @@ async fn main() -> Result<()> {
                 bail!("no state directory to keep a local certificate authority in");
             };
             println!("{}", tls::trust_instructions(&suffix, &path));
-            // After the instructions rather than before: the command is what the reader came
-            // for, and this is the reassurance they may want once they have read it.
-            println!(
-                "It permits {:?} and nothing else, which you can check without trusting anything:",
-                authority.suffix()
-            );
-            println!(
-                "  openssl x509 -in \"{}\" -noout -text | grep -A 3 \"Name Constraints\"",
-                path.display()
-            );
+            // What it permits, read back out of the certificate this command just wrote rather
+            // than restated from the code that wrote it. Somebody deciding whether to trust a
+            // root should be able to see the limit, and "take our word for it" is not that.
+            match tls::limits_of(authority.certificate_pem()) {
+                Ok(limits) => {
+                    println!("What it is allowed to vouch for, read out of that file:");
+                    println!("  names under:        {}", limits.permitted.join(", "));
+                    println!(
+                        "  marked critical:    {}  (so a browser cannot skip the limit)",
+                        limits.constraints_critical
+                    );
+                    println!(
+                        "  can sign a sub-CA:  {}",
+                        match limits.path_len {
+                            Some(0) => "no".to_string(),
+                            other => format!("{other:?}"),
+                        }
+                    );
+                }
+                // Not fatal: the instructions above are the point, and this is the reassurance.
+                // Refusing to print them because the extra could not be read would be backwards.
+                Err(e) => println!("  (could not read the certificate back: {e:#})"),
+            }
             Ok(())
         }
         "serve" => {
