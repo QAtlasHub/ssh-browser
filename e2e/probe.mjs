@@ -3,6 +3,10 @@
 //   node e2e/probe.mjs <ssh-host> <remote-dir> [path]
 //   node e2e/probe.mjs Panza '~/work/Vault/lib/QAtlas.jl/docs/build'
 //
+// SSH_BROWSER_PROBE_SCHEME=https points it at the https mode. Nothing on the machine is
+// changed for that: the daemon says which key it is serving and the browser is told to accept
+// that one key for this launch, which is what `/_control/certificate` exists for.
+//
 // Not a test, and it asserts nothing. `run.mjs` checks the claims against `e2e/tree/`, which
 // this repository wrote and which therefore cannot surprise it. This points the same daemon at
 // a site nobody wrote for it — Documenter output, a generated report, whatever is on the host —
@@ -44,7 +48,11 @@ const {
 
 const PORT = Number(process.env["SSH_BROWSER_E2E_PORT"] ?? 17393);
 
-const { child, token } = await startDaemon(PORT);
+// http unless asked. The https mode needs a certificate generated and, for a real browser, a
+// decision about trust — so it is opt-in here for the same reason it is opt-in in the product.
+const SCHEME = process.env["SSH_BROWSER_PROBE_SCHEME"] === "https" ? "https" : "http";
+
+const { child, token } = await startDaemon(PORT, { scheme: SCHEME });
 const profile = await mkdtemp(join(tmpdir(), "ssh-browser-probe-"));
 const extension = await extensionWithPermissionGranted();
 let browser;
@@ -54,9 +62,26 @@ try {
   // pulls fonts and KaTeX off a CDN, and a blanket proxy sends those to the daemon too,
   // where they fail as `ERR_TUNNEL_CONNECTION_FAILED` and drown the findings. The PAC sends
   // anything that is not an alias host DIRECT, which is also what a reader would have.
+  // Under https the browser has to be told to accept the serving key before it is launched,
+  // so the pin is fetched first. `ignoreHTTPSErrors` would be simpler and wrong: it makes the
+  // origin insecure, which is the one thing the https mode exists to avoid.
+  let pin = null;
+  if (SCHEME === "https") {
+    const res = await fetch(
+      `http://127.0.0.1:${PORT}/_control/certificate?name=${ALIAS}.${SUFFIX}`,
+      { headers: { [TOKEN_HEADER]: token } },
+    );
+    if (!res.ok) throw new Error(`/_control/certificate said ${res.status}`);
+    pin = (await res.json()).pin;
+    console.log(`  serving key pinned for this launch: ${pin}`);
+  }
+
   browser = await chromium.launchPersistentContext(profile, {
     ...browserOptions(),
-    args: loadExtension(extension),
+    args: [
+      ...loadExtension(extension),
+      ...(pin ? [`--ignore-certificate-errors-spki-list=${pin}`] : []),
+    ],
   });
   await connectThroughDashboard(browser, PORT);
 
@@ -79,7 +104,7 @@ try {
   page.on("requestfailed", (r) => failed.push(`${r.url()} — ${r.failure()?.errorText}`));
   page.on("response", (r) => statuses.push([r.status(), r.url()]));
 
-  const url = `http://${ALIAS}.${SUFFIX}${path}`;
+  const url = `${SCHEME}://${ALIAS}.${SUFFIX}${path}`;
   console.log(`\n${url}\n  -> ${host}:${dir}\n`);
 
   // Read from the daemon rather than counted here. What a browser asks for and what the
@@ -127,6 +152,9 @@ try {
     }, 0),
     broken: [...document.images].filter((i) => !i.naturalWidth).length,
     images: document.images.length,
+    // What the origin is, which is the whole difference between the two schemes.
+    secure: window.isSecureContext,
+    serviceWorker: "serviceWorker" in navigator,
   }));
 
   console.log(`loaded in ${elapsed} ms (${landed})`);
@@ -135,6 +163,9 @@ try {
   console.log(`  scripts     ${seen.scripts}`);
   console.log(`  stylesheets ${seen.sheets} (${seen.rules} rules)`);
   console.log(`  images      ${seen.images}, broken: ${seen.broken}`);
+  console.log(
+    `  origin      ${SCHEME}, secure context ${seen.secure}, service workers ${seen.serviceWorker}`,
+  );
   console.log(`  text        ${seen.text.slice(0, 160)}`);
 
   // The two numbers the product is about, side by side. The browser's request count is what
