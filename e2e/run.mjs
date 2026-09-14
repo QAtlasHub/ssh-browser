@@ -314,6 +314,45 @@ async function main() {
       assert.equal(local.headingColour, "rgb(0, 128, 64)"),
     );
 
+    console.log("\nwhat a first run of the https mode says");
+    // The question this answers is "can somebody who has never used this get through on their
+    // first try", and the answer used to be no. A first run printed `https://alias.ssh-browser/`
+    // and nothing about a certificate, so following the banner exactly led to
+    // `ERR_CERT_AUTHORITY_INVALID` with no way to guess what to do next. Measured by doing it.
+    //
+    // CI cannot trust a root, so the happy path stays a hand measurement. What CI can hold is
+    // that the banner tells you the step exists — which is the part that was missing.
+    const https = await startDaemon(PORT + 1, { scheme: "https" });
+    const banner = https.log();
+
+    // And the daemon can answer "is it trusted" without being able to ask a trust store,
+    // because a handshake is the question. Nothing has handshaked yet on this fresh daemon, so
+    // both counters are zero — which is the third state, and the one that must not be reported
+    // as either trusted or untrusted.
+    const beforeAnyPage = await fetch(`http://127.0.0.1:${PORT + 1}/_control/hello`, {
+      headers: { [TOKEN_HEADER]: https.token },
+    })
+      .then((r) => r.json())
+      .catch(() => null);
+
+    await stop(https.child);
+
+    check("a first https run says the authority is not trusted yet", () =>
+      assert.match(banner, /nothing trusts it yet/),
+    );
+    check("and names the command that fixes it", () => assert.match(banner, /ssh-browser trust/));
+    // The path, because the command prints it too and somebody may want to look at the
+    // certificate before trusting it.
+    check("and where the certificate is", () => assert.match(banner, /authority\.pem/));
+    // Still advertises the https URL, which is the thing the above makes reachable.
+    check("and still says where the site will be", () =>
+      assert.match(banner, new RegExp(`https://${ALIAS}\\.${SUFFIX}/`)),
+    );
+
+
+    check("under https the daemon reports what handshakes have done", () =>
+      assert.deepEqual(beforeAnyPage?.tls, { completed: 0, failed: 0 }),
+    );
     console.log("\nwhat CONNECT is allowed to reach");
     // The https mode terminates TLS behind a `CONNECT`, which makes this daemon a proxy — and a
     // proxy on loopback is reachable by every process on the machine and by every page in the
