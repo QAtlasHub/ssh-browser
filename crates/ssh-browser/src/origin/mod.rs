@@ -1031,7 +1031,21 @@ impl Origin {
             Err(e) => return fail(StatusCode::FORBIDDEN, format!("{e:#}")),
         };
 
+        // `?ls` asks for one level of the tree, and it asks that of a directory holding an
+        // `index.html` as much as of any other. Resolving to the index first meant the tree
+        // fetched a whole document and spliced it into itself: measured against a gallery on
+        // souta's host, 15 kB of rendered page arriving where 468 bytes of `<ul>` belonged,
+        // and a file list with somebody's figures sitting inside it.
+        //
+        // Answered here rather than inside `autoindex_of`, because by the time control reaches
+        // that function the question has already been turned into a different one.
+        let wants_list = query == Some("ls");
         let wants_dir = path.ends_with('/');
+        if wants_dir && wants_list {
+            return self
+                .autoindex_of(session, alias, path, &resolved, query)
+                .await;
+        }
         let file = if wants_dir {
             format!("{resolved}/index.html")
         } else {
@@ -3284,11 +3298,18 @@ font-size:11px;font-variant-numeric:tabular-nums}\
 /// Without it every level costs a page load, and the tree still works that way: every row is
 /// a real link to a real URL, so a browser with no script at all walks the tree one
 /// directory at a time, exactly as the old listing did.
+///
+/// A site is the exception: a directory holding an `index.html` is somewhere to read, so
+/// clicking its row follows the link and opens the page. Only its twisty looks inside. It used
+/// to expand like any folder, and because a site answers with its page rather than a listing
+/// the result was a rendered document spliced into the middle of a file tree — souta sent a
+/// screenshot of their own gallery sitting under three rows of directory names.
 const LISTING_JS: &str = "\
 const tree=document.getElementById('tree');\
 tree.addEventListener('click',async e=>{\
 const row=e.target.closest('a.row');\
 if(!row||row.dataset.dir!=='1')return;\
+if(row.classList.contains('site')&&!e.target.closest('.tw'))return;\
 e.preventDefault();\
 const li=row.parentElement;\
 if(li.querySelector(':scope>ul')){li.classList.toggle('open');mark(row);return;}\
@@ -4349,6 +4370,72 @@ mod tests {
             four <= one + 2,
             "a tree four deep cost {four} round trips against {one} for one directory"
         );
+    }
+
+    /// Including when the folder holds an `index.html`.
+    ///
+    /// It did not. A directory with an index is served *as* that page, and that resolution ran
+    /// before the query was looked at — so the tree asked for one level, received a whole
+    /// document, and spliced it into itself. souta sent a screenshot of their own figure
+    /// gallery rendered inside a file list, under three rows of directory names.
+    ///
+    /// The body is what this asserts, not the status: both answers are `200 text/html`, and a
+    /// check on the status would have passed throughout.
+    #[tokio::test]
+    async fn asking_for_one_level_of_a_site_is_still_a_level() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir("/srv", vec![("site", dir_attrs())])
+                .dir(
+                    "/srv/site",
+                    vec![
+                        ("index.html", file_attrs(9, 1)),
+                        ("notes.md", file_attrs(4, 1)),
+                    ],
+                )
+                .file("/srv/site/index.html", b"<h1>hi</h1>"),
+        )
+        .await;
+
+        let req = Request::builder()
+            .uri("http://docs.ssh-browser/site/?ls")
+            .header(HOST, "docs.ssh-browser")
+            .body(Empty::<Bytes>::new())
+            .expect("request builds");
+        let body =
+            String::from_utf8(body_of(origin.handle(req).await).await.to_vec()).expect("utf-8");
+
+        assert!(body.starts_with("<ul>"), "{body}");
+        assert!(
+            !body.contains("<html"),
+            "a document arrived where a fragment belongs: {body}"
+        );
+        assert!(
+            !body.contains("<h1>hi</h1>"),
+            "the page was served instead: {body}"
+        );
+        assert!(body.contains("href=\"/site/notes.md\""), "{body}");
+    }
+
+    /// And without `?ls` the same directory is still its page. The fix must not cost that.
+    #[tokio::test]
+    async fn a_site_without_the_query_is_still_its_page() {
+        let origin = origin_with(
+            FakeRemote::new()
+                .dir("/srv", vec![("site", dir_attrs())])
+                .dir("/srv/site", vec![("index.html", file_attrs(11, 1))])
+                .file("/srv/site/index.html", b"<h1>hi</h1>"),
+        )
+        .await;
+
+        let req = Request::builder()
+            .uri("http://docs.ssh-browser/site/")
+            .header(HOST, "docs.ssh-browser")
+            .body(Empty::<Bytes>::new())
+            .expect("request builds");
+        let body =
+            String::from_utf8(body_of(origin.handle(req).await).await.to_vec()).expect("utf-8");
+        assert_eq!(body, "<h1>hi</h1>");
     }
 
     /// What the script asks for when a folder is expanded: the same level, as the fragment
