@@ -54,6 +54,8 @@ interface Reply {
   unusable?: { host: string; why: string }[];
   url?: string;
   current?: string;
+  /// The current palette, as the `:root` block that carries it.
+  css?: string;
   themes?: { name: string; label: string; variant: string }[];
   /// Under https: completed and failed TLS handshakes.
   ///
@@ -439,6 +441,14 @@ async function renderConfig(): Promise<void> {
     void (async () => {
       const chose = await send({ kind: "setTheme", name: select.value });
       say(chose.detail, !chose.ok);
+      // This page repaints with it too. Choosing a dark theme and watching everything but the
+      // page you chose it on go dark is how the two looks drifted apart in the first place.
+      if (chose.ok) {
+        const now = await send({ kind: "theme" });
+        if (now.ok && now.css !== undefined) {
+          await applyTheme(now.css);
+        }
+      }
     })();
   });
   picker.append(select);
@@ -744,9 +754,46 @@ async function start(): Promise<void> {
   el("daemon").textContent = `${reply.detail} on 127.0.0.1:${port}`;
   say("");
 
+  // Here rather than only on the settings view, which is where this lived and where almost
+  // nobody goes. A dashboard themed only after you had been to settings is a dashboard that
+  // does not match the pages it links to.
+  const themed = await send({ kind: "theme" });
+  if (themed.ok && themed.css !== undefined) {
+    await applyTheme(themed.css);
+  }
+
   if (await refresh()) {
     route();
   }
+}
+
+/// Paint this page with the palette the daemon renders listings with.
+///
+/// The stylesheet both halves share carries no colours of its own, so without this the
+/// dashboard is the browser's black on white while a directory on a host is whatever theme
+/// was chosen — two products sharing a suffix, which is what souta was looking at.
+///
+/// Remembered between runs, and applied before the daemon is asked. A dashboard that flashed
+/// white and then went dark on every open would be worse than one that never changed.
+async function applyTheme(css?: string): Promise<void> {
+  if (css === undefined) {
+    const seen = (await chrome.storage.local.get("themeCss")) as { themeCss?: string };
+    css = seen.themeCss;
+  } else {
+    await chrome.storage.local.set({ themeCss: css });
+  }
+  if (css === undefined) {
+    return;
+  }
+  // After the linked stylesheet, so the palette wins wherever both have something to say.
+  // One element reused, or picking a theme twice would leave two.
+  let held = document.getElementById("palette");
+  if (held === null) {
+    held = document.createElement("style");
+    held.id = "palette";
+    document.head.append(held);
+  }
+  held.textContent = css;
 }
 
 window.addEventListener("hashchange", route);
@@ -758,5 +805,7 @@ void (async () => {
   if (typeof port === "number") {
     currentPort = port;
   }
+  // Before `start`, so the page is already the right colour when it first paints.
+  await applyTheme();
   await start();
 })();

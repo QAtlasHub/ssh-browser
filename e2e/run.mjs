@@ -769,6 +769,38 @@ async function main() {
     ]);
     await spare.close();
 
+    // One look, not two. The dashboard and a directory on a host are both ssh-browser, and
+    // until the palette was shared they were a light card UI and a dark file explorer that
+    // happened to live under one suffix. Compared as resolved colours rather than as CSS
+    // text, because what matters is what the two pages became.
+    const aTree = await browser.newPage();
+    // `assets/`, not the alias root: the root holds an `index.html`, so it is served as that
+    // page and there is no tree on it to compare.
+    await aTree.goto(`http://${ALIAS}.${SUFFIX}/assets/`, { waitUntil: "domcontentloaded" });
+    const onTree = await aTree.evaluate(() => {
+      return {
+        // On `html`, which is where both stylesheets put it -- a colour on `body` stops at the
+        // content box and leaves the browser's white below a short page.
+        background: getComputedStyle(document.documentElement).backgroundColor,
+        colour: getComputedStyle(document.body).color,
+      };
+    });
+    // And the way back out, which an origin of its own otherwise has none of.
+    const home = await aTree.getAttribute("header .home", "href");
+    await aTree.close();
+
+    const dashboardBody = await dashboard.evaluate(() => ({
+      background: getComputedStyle(document.documentElement).backgroundColor,
+      colour: getComputedStyle(document.body).color,
+    }));
+
+    check("a directory and the dashboard are painted the same", () =>
+      assert.deepEqual(onTree, dashboardBody),
+    );
+    check("and a directory says how to get back to the list of sites", () =>
+      assert.equal(home, `http://${SUFFIX}/`),
+    );
+
     check("the fallback is the dashboard's own page", () => {
       assert.notEqual(onSpare, null, "no site card on the loopback listener");
       assert.deepEqual(onSpare?.look, onDashboard?.look);

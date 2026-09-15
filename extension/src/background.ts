@@ -59,6 +59,12 @@ export interface Reply {
   suffix?: string;
   open?: OpenAlias[];
   current?: string;
+  /// The palette the daemon renders a listing with, as the `:root` block carrying it.
+  ///
+  /// Relayed rather than reconstructed. Sixteen hex values copied into TypeScript would be a
+  /// second place for a theme to be wrong, and only one of them would be the one anybody had
+  /// looked at.
+  css?: string;
   themes?: { name: string; label: string }[];
   hosts?: KnownHost[];
   unusable?: { host: string; why: string }[];
@@ -435,8 +441,16 @@ async function getTheme(): Promise<Reply> {
   if (!res.ok) {
     return { ok: false, detail: `${res.status}: ${await res.text()}` };
   }
-  const body = (await res.json()) as { current: string; themes: { name: string; label: string }[] };
-  return { ok: true, detail: "", current: body.current, themes: body.themes };
+  const body = (await res.json()) as {
+    current: string;
+    css: string;
+    themes: { name: string; label: string }[];
+  };
+  // `css` too. Naming the fields one at a time is what keeps a page from being handed
+  // whatever the daemon happens to add — and it is also why the palette reached this function
+  // and stopped here, leaving the dashboard black on white beside the pages it links to.
+  // Adding a field is one line; noticing the missing one took a screenshot.
+  return { ok: true, detail: "", current: body.current, css: body.css, themes: body.themes };
 }
 
 async function setTheme(name: string): Promise<Reply> {

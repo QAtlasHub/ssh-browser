@@ -5,17 +5,24 @@
  * file rather than a `<style>` block — the root of the suffix and the dashboard are the same
  * page in two places, and a second copy of these rules is how they stop being.
  *
- * Not themed. The theme decides what a *listing* looks like — the pages that show what is on
- * a host — and this is the chrome around them, which stays put while they change.
+ * Themed, by the same palette the daemon renders a listing with. It was not, and the seam
+ * showed: choosing a dark theme turned the daemon's pages dark and left this one white,
+ * because its four colours were hex values written here that no scheme had a say in.
+ *
+ * So there is no palette in this file. It arrives first — inline from the daemon, and in the
+ * extension from `/_control/theme` through the service worker — and every colour below is a
+ * `var()` reading it. Before any daemon has answered there is nothing to inject and these
+ * fall back to the browser's own black on white, which is the honest look for a page that
+ * cannot reach anything.
  */
-
-:root {
-  --line: #e3e3e3;
-  --dim: #666;
-  --bad: #b00020;
-  --good: #0a7d33;
+/* On `html`, the way the listing's stylesheet does it. Put on `body` the colour stops at the
+   content box, so a short page leaves the browser's own white below the fold on one of these
+   two pages and not the other. */
+html {
+  background: var(--bg);
 }
 body {
+  color: var(--fg);
   font:
     14px/1.6 system-ui,
     sans-serif;
@@ -73,8 +80,8 @@ li > a {
 }
 li > button:hover,
 li > a:hover {
-  background: #fafafa;
-  border-color: #c9c9c9;
+  background: var(--hover);
+  border-color: var(--dim);
 }
 li > button:disabled {
   cursor: progress;
@@ -168,10 +175,10 @@ dd {
 }
 .act button:hover,
 .open-site:hover {
-  background: #fafafa;
+  background: var(--hover);
 }
 .danger {
-  border-color: #e8c4c9 !important;
+  border-color: var(--bad) !important;
   color: var(--bad);
 }
 .note {
@@ -194,7 +201,7 @@ footer input {
   width: 6em;
 }
 .cmd {
-  background: #f6f6f6;
+  background: var(--hover);
   border: 1px solid var(--line);
   border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, monospace;

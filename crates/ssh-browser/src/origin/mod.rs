@@ -331,6 +331,14 @@ impl Origin {
         format!("{}://{alias}.{}/", self.scheme, self.suffix)
     }
 
+    /// The root of the suffix: the list of sites, and the way back to it from inside one.
+    ///
+    /// Beside `site_url` and built the same way, because the two differ by a label and getting
+    /// that difference wrong means linking out of the daemon entirely.
+    fn home_url(&self) -> String {
+        format!("{}://{}/", self.scheme, self.suffix)
+    }
+
     async fn alias_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.sessions.read().await.keys().cloned().collect();
         names.sort();
@@ -2088,12 +2096,21 @@ impl Origin {
         #[derive(serde::Serialize)]
         struct Themes<'a> {
             current: &'a str,
+            /// The current palette, as the `:root` block that carries it.
+            ///
+            /// Sent rather than named, because the dashboard cannot read a `.yaml` compiled
+            /// into this binary and a second copy of sixteen hex values in TypeScript is the
+            /// thing this whole arrangement exists to avoid. The dashboard drops it into the
+            /// page and the one stylesheet both halves share reads it.
+            css: String,
             themes: Vec<Choice<'a>>,
         }
         // The list comes from the daemon rather than being written out again in the
         // dashboard. Two copies of it is how a theme gets added and stays invisible.
+        let current = self.theme.read().await;
         control::json(&Themes {
-            current: &self.theme.read().await,
+            css: theme::css_for(&current),
+            current: &current,
             themes: theme::all()
                 .iter()
                 .map(|t| Choice {
@@ -2201,7 +2218,13 @@ impl Origin {
 
         plain_ok(
             "text/html; charset=utf-8",
-            Bytes::from(autoindex(alias, &rel, &levels, &self.theme.read().await)),
+            Bytes::from(autoindex(
+                alias,
+                &rel,
+                &levels,
+                &self.theme.read().await,
+                &self.home_url(),
+            )),
         )
     }
 
@@ -2633,6 +2656,10 @@ impl Origin {
              <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
              <title>ssh-browser</title><style>",
         );
+        // The palette first, then the layout that reads it -- the same order a listing uses,
+        // and now the same palette. This page and a directory on a host used to be two
+        // different-looking products sharing a suffix.
+        s.push_str(&theme::css_for(&self.theme.read().await));
         s.push_str(DASHBOARD_CSS);
         s.push_str("</style>");
 
@@ -3252,6 +3279,9 @@ body{color:var(--fg);font:13px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;m
 header{align-items:baseline;background:var(--bg);border-bottom:1px solid var(--line);\
 display:flex;gap:6px;padding:7px 12px;position:sticky;top:0;z-index:1}\
 header b{font-size:12px;font-weight:600;letter-spacing:.04em}\
+header .home{border-right:1px solid var(--line);color:var(--dim);font-size:11px;\
+margin-right:6px;padding-right:8px;text-decoration:none;white-space:nowrap}\
+header .home:hover{color:var(--accent)}\
 header span{color:var(--dim);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;\
 font-size:11px;overflow-wrap:anywhere}\
 #tree{padding:4px 0 40px}\
@@ -3394,7 +3424,19 @@ fn render_level(out: &mut String, path: &str, rows: &[Row], open: &[(String, Vec
 /// `levels` runs from the alias base down to where the reader is, each already sorted, so
 /// the page opens with the whole path expanded and the rest of every level beside it. They
 /// come out of the cache the path walk already filled, so the depth costs no round trips.
-fn autoindex(alias: &str, rel: &str, levels: &[(String, Vec<Row>)], theme: &str) -> String {
+///
+/// `home` is the root of the suffix, and the header links to it. A reader who has walked into
+/// `panza.ssh-browser` has no way back to the list of sites: it is a different origin, so the
+/// back button is the only route and only if they arrived by it. This is the daemon's own page
+/// so a link on it costs nobody anything — and it stays off the pages that are somebody's
+/// file, which get nothing added to them, ever.
+fn autoindex(
+    alias: &str,
+    rel: &str,
+    levels: &[(String, Vec<Row>)],
+    theme: &str,
+    home: &str,
+) -> String {
     let shown = if rel.is_empty() { "/" } else { rel };
     let mut s = String::from("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     s.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>");
@@ -3403,7 +3445,12 @@ fn autoindex(alias: &str, rel: &str, levels: &[(String, Vec<Row>)], theme: &str)
     // The palette first, then the layout that reads it.
     s.push_str(&theme::css_for(theme));
     s.push_str(LISTING_CSS);
-    s.push_str("</style></head><body><header><b>");
+    s.push_str("</style></head><body><header><a class=\"home\" href=\"");
+    s.push_str(&escape(home));
+    // A word rather than a glyph. This header already carries an alias and a path in small
+    // type; a house drawn in it would be one more thing to decode, and "all sites" says both
+    // where it goes and what is there.
+    s.push_str("\" title=\"every site this daemon serves\">all sites</a><b>");
     s.push_str(&escape(alias));
     s.push_str("</b><span>");
     s.push_str(&escape(shown));
@@ -4227,7 +4274,7 @@ mod tests {
     /// the ancestors or the site scan. Both of those need a remote; these do not.
     fn listing(alias: &str, rel: &str, entries: &[Entry]) -> String {
         let levels = vec![(rel.to_string(), rows_of(entries, &HashSet::new()))];
-        autoindex(alias, rel, &levels, theme::DEFAULT)
+        autoindex(alias, rel, &levels, theme::DEFAULT, "http://ssh-browser/")
     }
 
     #[test]
