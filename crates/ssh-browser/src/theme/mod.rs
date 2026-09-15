@@ -22,9 +22,26 @@ use anyhow::{Result, bail};
 
 /// The theme used when nothing says otherwise.
 ///
-/// Following the operating system, because a page that ignores the system setting is the
-/// one thing every dark-mode reader notices immediately.
-pub const DEFAULT: &str = "auto";
+/// The dashboard's own light: what these pages looked like before any of them were themed, and
+/// the look souta asked the rest to be brought *to* rather than away from. base16's reference
+/// light scheme reproduces it closely — `base01` lands on `#e8e8e8` against the `#e3e3e3` the
+/// dashboard drew its borders in, so a card still has an edge.
+///
+/// `auto` was here and is the wrong default, which took being told twice to see. It follows
+/// the operating system, so a machine set to dark gets a dark scheme — and a default should be
+/// the look somebody gets without choosing, not one that turns on a setting they made about
+/// something else. Dark is a choice, it is remembered, and `auto` is still in the list for
+/// anyone who wants their system to decide.
+pub const DEFAULT: &str = "default-light";
+
+/// The entry that follows the operating system.
+///
+/// Its own constant rather than `DEFAULT`, which is what it was. The two were the same string
+/// and so the same idea by accident: the list is built by putting one synthetic entry named
+/// `DEFAULT` in front of the vendored schemes, and the moment `DEFAULT` became the name of a
+/// real scheme that entry collided with it. `theme_names_are_unique` caught it, which is the
+/// whole reason to have a test that counts.
+pub const AUTO: &str = "auto";
 
 /// The pair `auto` follows the system with: base16's own reference schemes.
 ///
@@ -111,7 +128,7 @@ fn themes() -> &'static [Theme] {
     static PARSED: OnceLock<Vec<Theme>> = OnceLock::new();
     PARSED.get_or_init(|| {
         let mut out = vec![Theme {
-            name: DEFAULT.to_string(),
+            name: AUTO.to_string(),
             label: "Follow the system".to_string(),
             variant: "system",
             // Filled by `css_for`, which needs both halves and a media query.
@@ -166,13 +183,18 @@ pub fn css_for(name: &str) -> String {
     let found = themes().iter().find(|t| t.name == name);
     match found {
         Some(t) if t.variant != "system" => format!(":root{{{}}}", t.vars),
-        // Both palettes, and the browser picks. This way round so that a browser without
-        // the query still gets a complete light palette rather than no variables at all.
-        _ => {
+        // The one entry that follows the reader: both palettes, and the browser picks. This
+        // way round so that a browser without the query still gets a complete light palette
+        // rather than no variables at all.
+        Some(_) => {
             let light = vars_named(AUTO_LIGHT);
             let dark = vars_named(AUTO_DARK);
             format!(":root{{{light}}}@media(prefers-color-scheme:dark){{:root{{{dark}}}}}")
         }
+        // A name nobody has. The default, looked up rather than recursed into, so a `DEFAULT`
+        // that named no scheme would be an empty palette here instead of a hang -- and
+        // `the_default_is_a_theme_that_exists` is what stops it being either.
+        None => format!(":root{{{}}}", vars_named(DEFAULT)),
     }
 }
 
@@ -402,10 +424,12 @@ mod tests {
         assert!(dark >= 6, "only {dark} dark schemes");
     }
 
-    /// The default follows the system, and following the system means shipping both.
+    /// Following the system means shipping both. That is `auto` now, not the default: the
+    /// default is a fixed light scheme, and this test named `DEFAULT` while meaning `auto`
+    /// -- which is the same confusion that put one name on two entries in the list.
     #[test]
-    fn the_default_carries_a_light_and_a_dark_palette() {
-        let css = css_for(DEFAULT);
+    fn following_the_system_carries_a_light_and_a_dark_palette() {
+        let css = css_for(AUTO);
         assert!(css.contains("prefers-color-scheme:dark"), "{css}");
         assert!(css.contains(vars_named(AUTO_LIGHT)), "{css}");
         assert!(css.contains(vars_named(AUTO_DARK)), "{css}");
@@ -440,6 +464,13 @@ mod tests {
     #[test]
     fn an_unknown_theme_renders_as_the_default_rather_than_as_nothing() {
         assert_eq!(css_for("no-such-theme"), css_for(DEFAULT));
+        // And the default is a palette rather than a pair, so an unknown name does not
+        // quietly become "whatever this machine is set to".
+        assert!(
+            !css_for(DEFAULT).contains("prefers-color-scheme"),
+            "{}",
+            css_for(DEFAULT)
+        );
     }
 
     /// But it is refused where it is *set*, which is the place that can still say so.
