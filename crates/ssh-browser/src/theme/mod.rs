@@ -261,6 +261,12 @@ impl Scheme {
             format!("--k-code:{}", c(0xE)),
             format!("--k-media:{}", c(0xB)),
             format!("--k-plain:{}", c(0x3)),
+            // base08 is what every scheme paints an error in, base0B what it paints a string
+            // in. The dashboard had its own red and green, written as two hex values no
+            // palette had a say in — which is why choosing a dark theme turned the daemon's
+            // pages dark and left the dashboard white.
+            format!("--bad:{}", c(0x8)),
+            format!("--good:{}", c(0xB)),
         ]
         .join(";")
     }
@@ -371,6 +377,8 @@ mod tests {
             "--k-code",
             "--k-media",
             "--k-plain",
+            "--bad",
+            "--good",
         ];
         for theme in all() {
             let css = css_for(&theme.name);
