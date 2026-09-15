@@ -101,7 +101,31 @@ the entry that would raise the question.
 
 **Remote code**
 
+Answered **no** on the form. Not an obvious no, so the reasoning is written here rather than
+left in somebody's memory of a decision made while filling in a text box.
+
 > None. Everything the extension executes is in the uploaded package.
+
+What makes it a question: `applyPac` fetches `http://127.0.0.1:<port>/proxy.pac` from the
+user's own daemon and hands the text to `chrome.proxy` as `pacScript.data`. Chrome's definition
+of remotely hosted code is "anything that is executed by the browser that is loaded from
+someplace other than the extension's own files", and a PAC is JavaScript.
+
+Why it is still no:
+
+- It does not run in the extension. `chrome.proxy` is a first-party API whose documented input
+  is a PAC string, and the browser's network stack evaluates it — no page, no service worker,
+  no `eval`.
+- It is not remotely hosted. It comes from loopback, from a program the user installed and
+  started. Nothing on the network can serve it and no update of ours can change it.
+- The policy exists so that an extension's behaviour cannot be changed after review by a server
+  its author controls. Nobody controls this one but the person running the extension.
+
+If a reviewer disagrees, the fix is small and already scoped: the PAC is a function of the
+suffix and the port, and the extension knows both. Generating it locally makes the answer
+unambiguous and keeps what the fetch was for — the suffix stays data the daemon reports, so
+changing it still needs no extension release. What would be lost is having one generator, and
+an e2e check that runs both and compares their answers covers that.
 
 ## Data disclosure
 
