@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use ssh_browser::autostart;
 use ssh_browser::config;
 use ssh_browser::control::{self, Token};
 use ssh_browser::origin::{Alias, Origin, pac};
@@ -12,7 +13,7 @@ use ssh_browser::theme;
 use ssh_browser::tls;
 
 const USAGE: &str = "usage:\n  ssh-browser serve [--config FILE] [--port N] [--suffix S] [--scheme http|https] [--new-token] [<alias>=<ssh-host>[:<base>] ...]\n  ssh-browser pac   [--config FILE] [--port N] [--suffix S]
-  ssh-browser trust [--config FILE] [--suffix S]\n  ssh-browser hosts\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n  scheme = \"http\"   # https terminates TLS behind CONNECT; see `ssh-browser trust`\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"~/docs\"   # or an absolute path; omit for the home directory itself";
+  ssh-browser trust [--config FILE] [--suffix S]\n  ssh-browser autostart [--off]\n  ssh-browser hosts\n\nWith no --config, a file at <config dir>/ssh-browser/config.toml is used if it exists:\n\n  [server]\n  port = 7391\n  suffix = \"ssh-browser\"\n  scheme = \"http\"   # https terminates TLS behind CONNECT; see `ssh-browser trust`\n\n  [[alias]]\n  name = \"docs\"\n  host = \"myhost\"\n  base = \"~/docs\"   # or an absolute path; omit for the home directory itself";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,6 +25,7 @@ async fn main() -> Result<()> {
     let mut named_config: Option<PathBuf> = None;
     let mut cli = config::Overrides::default();
     let mut new_token = false;
+    let mut off = false;
 
     // Driven by an iterator rather than an index, so the number of tokens consumed is the
     // number actually taken. With a hand-kept counter, an arm that forgets its step silently
@@ -51,6 +53,7 @@ async fn main() -> Result<()> {
             // A flag rather than a value, so it consumes nothing: rotating is a thing you
             // do, not a thing you configure.
             "--new-token" => new_token = true,
+            "--off" => off = true,
             spec => cli.aliases.push(parse_alias(spec)?),
         }
     }
@@ -157,6 +160,32 @@ async fn main() -> Result<()> {
                 // Refusing to print them because the extra could not be read would be backwards.
                 Err(e) => println!("  (could not read the certificate back: {e:#})"),
             }
+            Ok(())
+        }
+        // Does it, rather than printing what to do -- the opposite of `trust` above, and the
+        // difference is consent. Trusting a root changes what the whole machine believes;
+        // starting a program of your own at login is the thing that was asked for, and handing
+        // back a command to paste would be the same failure more politely.
+        "autostart" => {
+            let kind = autostart::Kind::here();
+            let Some(home) = autostart::home() else {
+                bail!("no home directory, so nowhere to put a login entry");
+            };
+            let Some(state) = control::state_dir() else {
+                bail!("no state directory to keep a login entry in");
+            };
+
+            let plan = if off {
+                autostart::remove_plan(kind, &home, &state)
+            } else {
+                // Its own path, resolved now. A login session's PATH is not a shell's, and an
+                // entry that starts whatever `ssh-browser` it can find may find none.
+                let exe = std::env::current_exe().context("finding this executable")?;
+                autostart::install_plan(kind, &exe, &home, &state)
+            };
+            autostart::apply(&plan)?;
+            println!();
+            println!("{}", plan.note);
             Ok(())
         }
         "serve" => {
