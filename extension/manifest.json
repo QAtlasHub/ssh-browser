@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ssh-browser",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Open files on an SSH host as a real browser origin.",
   "minimum_chrome_version": "116",
   "permissions": [
