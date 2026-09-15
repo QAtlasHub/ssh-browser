@@ -151,10 +151,51 @@ the first run of this produced exactly that. `shots.yml` runs on a fresh runner 
 throwaway sshd and the invented `ssh_config` in `e2e/shots-config/`, and `shots.mjs` refuses
 any host but a local one so it cannot happen by habit.
 
-## Still to do by hand
+## The first submission, by hand
+
+Once. The API cannot create a listing — description, screenshots, category and the data
+disclosure are not reachable from it, and the extension ID does not exist until the Store
+listing and Privacy tabs have been filled in.
 
 1. Register the developer account. Five dollars, once.
 2. Upload the zip, paste the text above, attach the screenshots.
 3. Choose visibility. Unlisted is worth considering first: this extension does nothing without
    a daemon installed separately, and a public listing collects installs from people who have
    not done that and will reasonably report it as broken.
+
+## Every release after that, by CI
+
+`.github/workflows/store.yml` uploads the release's zip and publishes it. The decision is still
+a person's — it is merging the release PR — but nothing is retyped, and what reaches the store
+is the package that was built, tested and attached to the release rather than one somebody
+dragged into a browser.
+
+Three repository secrets, set once:
+
+| secret | where it comes from |
+|---|---|
+| `CWS_EXTENSION_ID` | the item's ID, from its dashboard URL, once it exists |
+| `CWS_PUBLISHER_ID` | Developer Dashboard → Account |
+| `CWS_SERVICE_ACCOUNT` | the JSON key of a Google Cloud service account |
+
+A service account rather than a refresh token: a refresh token issued while the OAuth consent
+screen is still in "Testing" expires after a week, so the pipeline would work today and fail
+next month having changed nothing.
+
+1. In the Google Cloud console, create a project and enable the **Chrome Web Store API**.
+2. Create a service account. It needs no roles.
+3. Create a JSON key for it, and put the whole file in `CWS_SERVICE_ACCOUNT`.
+4. In the Developer Dashboard, under **Account**, add the service account's email address.
+   Only one service account can be attached to a publisher, so this is the one.
+
+Then `gh workflow run store.yml -f tag=v0.5.0` tries it without publishing, and after that
+every published release goes on its own.
+
+Two things that will bite:
+
+- **Visibility is not set by this API.** The item publishes at whatever the dashboard says, and
+  if visibility is changed by hand the store refuses API publishing until it has been published
+  by hand once at the new setting.
+- **A version cannot be uploaded twice.** `versions agree` in CI keeps `manifest.json` in step
+  with `Cargo.toml`; if that ever drifts, the store rejects the upload rather than quietly
+  taking it.
