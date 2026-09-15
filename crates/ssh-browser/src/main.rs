@@ -193,24 +193,26 @@ async fn main() -> Result<()> {
             // Printed as well as written, because a first run has nowhere else to look.
             // To stderr so that piping the daemon's output does not carry it along.
             eprintln!("control token: {}", token.as_str());
-            // Which of the two it is, said outright. Somebody who has already pasted this
-            // into a browser needs to know whether they must do it again, and comparing
-            // sixty-four hex characters by eye is not a way to find out.
+            // Which of the two it is, and where it lives. Not "paste it into the extension",
+            // which is what this said and had stopped being true: the extension asks the
+            // daemon for the token and the daemon hands it to anything that is not a page,
+            // which is why the dashboard has no field to paste into — there is a check in the
+            // e2e asserting exactly that. An instruction nobody can follow is worse than none.
             match source {
-                control::Source::Reused(path) => eprintln!(
-                    "  unchanged since last time, from {} — a browser holding it is still connected",
-                    path.display()
-                ),
-                control::Source::Fresh(Some(path)) => eprintln!(
-                    "  new, and written to {} — paste it into the extension once",
-                    path.display()
-                ),
+                control::Source::Reused(path) => {
+                    eprintln!("  unchanged since last time, from {}", path.display());
+                }
+                control::Source::Fresh(Some(path)) => {
+                    eprintln!("  new, and written to {}", path.display());
+                }
                 control::Source::Fresh(None) => {
                     eprintln!("  new, and could not be written to disk; copy it from above");
                 }
             }
+            // On screen for the things that are not the extension. `curl -H` against the
+            // control API is the reason to print a credential at all.
             eprintln!(
-                "  the extension sends it as {}",
+                "  the extension fetches it for itself; anything else sends it as {}",
                 ssh_browser::control::TOKEN_HEADER
             );
             eprintln!();
@@ -289,12 +291,31 @@ async fn main() -> Result<()> {
                 eprintln!("{advice}");
             }
             eprintln!();
-            // A PAC is not discoverable, so the banner says outright what to do with it
-            // rather than leaving it to be found.
-            eprintln!("point the browser at the generated PAC, for example:");
-            eprintln!("  chrome --proxy-pac-url=http://127.0.0.1:{port}/proxy.pac");
+            // The half this program is not.
+            //
+            // Nothing said it existed. A first run printed a PAC flag and a loopback URL, and
+            // a reader following either got something that worked worse than the product and
+            // no way to find out there was a better one. The routes above are the names the
+            // extension makes resolve; without it they resolve to nothing, which reads as the
+            // daemon being broken.
+            //
+            // Named before the two fallbacks, because it is the thing to do and they are what
+            // to do instead.
+            // Named by the suffix rather than as "those names above", because with no aliases
+            // open there is nothing above and the sentence would point at blank space.
+            eprintln!("the browser half is a small extension, and it is what makes");
+            eprintln!("{scheme}://<alias>.{suffix}/ resolve at all. Install it once:");
+            eprintln!("  https://github.com/QAtlasHub/ssh-browser#the-extension");
+            eprintln!("It finds this daemon and takes the token itself — there is nothing to");
+            eprintln!("paste, and nothing to do again after a restart.");
             eprintln!();
-            eprintln!("or, without touching proxy settings: http://127.0.0.1:{port}/");
+            // Both fallbacks, marked as fallbacks. A PAC is not discoverable, so the flag is
+            // spelled out rather than left to be found; the loopback listener needs no proxy
+            // setting at all but puts every site in one origin, which is the thing this
+            // project exists to avoid.
+            eprintln!("Without it, a browser can be pointed at the PAC by hand:");
+            eprintln!("  chrome --proxy-pac-url=http://127.0.0.1:{port}/proxy.pac");
+            eprintln!("or read everything on one origin at http://127.0.0.1:{port}/");
 
             bound.serve().await
         }

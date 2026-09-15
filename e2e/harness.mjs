@@ -138,9 +138,21 @@ export async function startDaemon(port, { scheme } = {}) {
 
   let log = "";
   await new Promise((ok, no) => {
+    // Waited for to the end of the banner, not to `listening on`.
+    //
+    // The daemon is serving by the time it says `listening on`, but it has not finished
+    // saying things: the trust advice under https comes after it, and so does the note about
+    // the extension. Returning at the earlier line made `log()` a race — the three checks on
+    // the https banner were passing on whether one write had landed yet, which is a check
+    // that can go green while the daemon said nothing at all. A change to an unrelated line
+    // shifted the timing and they all failed at once, which is how it was noticed.
+    //
+    // This is the last thing printed before serving. Nothing between it and `listening on`
+    // can fail, so waiting for it is a fact rather than a delay.
+    const done = `or read everything on one origin at http://127.0.0.1:${port}/`;
     const onData = (chunk) => {
       log += String(chunk);
-      if (log.includes(`listening on 127.0.0.1:${port}`)) {
+      if (log.includes(done)) {
         ok();
       }
     };
