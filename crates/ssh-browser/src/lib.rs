@@ -1,5 +1,6 @@
 //! Turn an SSH host into a real browser origin.
 
+pub mod autostart;
 pub mod cache;
 pub mod config;
 pub mod control;

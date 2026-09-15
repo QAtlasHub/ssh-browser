@@ -171,6 +171,22 @@ At runtime it needs `ssh` on your `PATH` and nothing more. Trusting the https ce
 command your OS already has — `certutil`, `security`, or `update-ca-certificates` — and
 `ssh-browser trust` prints the one for your platform.
 
+### Starting it without thinking about it
+
+```
+ssh-browser autostart
+```
+
+Registers the daemon to start when you log in, and says what it wrote and where. `--off` takes
+it back out. No administrator rights on any of the three: a file in your Startup folder on
+Windows, a launchd agent in your own `LaunchAgents` on macOS, a systemd user unit on Linux.
+
+This is not a convenience. A bookmark that resolves only after you remember to start something
+is not a bookmark, and the daemon is not a program anyone wants to run — it is what makes a URL
+work. Unlike `trust`, which prints a command and executes nothing because trusting a root
+changes what the whole machine believes, this one does the thing: starting a program of your
+own at login is what you just asked for.
+
 A host on its own means that account's home directory, which the daemon asks the remote
 for. `ssh-browser hosts` prints what your `~/.ssh/config` already knows how to reach —
 user, hostname, port and any `ProxyJump` — which is the list worth picking an alias from.
