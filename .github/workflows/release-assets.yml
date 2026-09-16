@@ -95,7 +95,11 @@ jobs:
           cp "target/$TARGET/release/ssh-browser$EXE" "$out"
           # Published so somebody can check what they downloaded against what this built,
           # which is what an unsigned binary can offer instead of a signature.
-          shasum -a 256 "$out" > "$out.sha256"
+          #
+          # `sha256sum`, not `shasum`: the Git Bash on the Windows runner has the first and
+          # not the second, and this job was dispatched against an existing tag precisely so
+          # that finding out cost a failed test run rather than a failed release.
+          sha256sum "$out" > "$out.sha256"
           cat "$out.sha256"
           echo "ASSET=$out" >> "$GITHUB_ENV"
 
