@@ -978,8 +978,17 @@ async function main() {
     }));
     check("with no daemon, the first run says what this is and what to run", () => {
       assert.match(firstRun.view, /daemon is not running/);
-      assert.match(firstRun.cmd, /cargo install ssh-browser/);
-      assert.match(firstRun.cmd, /ssh-browser serve/);
+      // A download rather than a build. Somebody arriving from the store has neither a Rust
+      // toolchain nor a C compiler, and `cargo install` was a wall dressed as an instruction.
+      assert.match(firstRun.cmd, /curl -L -o ssh-browser/);
+      assert.match(firstRun.cmd, /releases\/latest\/download\/ssh-browser-/);
+      // `.exe` on Windows, none elsewhere, so the check is about the instruction rather
+      // than the filename. This runs on whichever platform is running it -- souta's
+      // Windows and CI's Linux take different branches of the same function.
+      assert.match(firstRun.cmd, /ssh-browser(\.exe)? serve/);
+      // Not a link to the releases page: a browser download is the one thing that attaches
+      // the quarantine flag these unsigned binaries would then be refused for.
+      assert.doesNotMatch(firstRun.cmd, /^https/m);
       assert.ok(firstRun.repo.includes("QAtlasHub/ssh-browser"), `no source link: ${firstRun.repo}`);
     });
     // Two versions of the same bad news, one of them in red, reads as two problems.
