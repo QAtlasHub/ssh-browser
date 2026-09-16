@@ -157,15 +157,40 @@ that is most of them, and all of what `file://` breaks.
 
 ## Usage
 
+Every release carries a binary per platform. One file, nothing to unpack:
+
 ```
-cargo install ssh-browser
-ssh-browser serve docs=myhost:/srv/docs cluster=login-node
+curl -L https://github.com/QAtlasHub/ssh-browser/releases/latest/download/ssh-browser-x86_64-unknown-linux-gnu -o ssh-browser
+chmod +x ssh-browser
+./ssh-browser serve docs=myhost:/srv/docs cluster=login-node
 ```
 
-**What that needs on your machine:** a Rust toolchain and a C compiler. The C compiler is for
-`ring`, which the TLS stack compiles — `cc` on Linux and macOS, the MSVC build tools or a MinGW
-toolchain on Windows. Nothing else: no OpenSSL, no system TLS library, no daemon, no service.
-Everything TLS is inside the binary, and `deny.toml` bans the OpenSSL crates so it stays that way.
+Swap the target for `aarch64-apple-darwin`, `x86_64-apple-darwin` or
+`x86_64-pc-windows-msvc.exe`. Each has a `.sha256` beside it.
+
+**`curl`, not your browser — and that is why it is the first thing on this page.** These
+binaries are unsigned, and macOS and Windows both refuse an unsigned executable: but only one
+the *browser* downloaded. Gatekeeper reads a `com.apple.quarantine` flag and SmartScreen a
+Mark-of-the-Web, and both are attached by the downloading application. `curl` and `scp` attach
+neither. A signature would cost a few hundred a year to remove a warning on the one route this
+page does not recommend.
+
+With cargo, the same binary without the URL:
+
+```
+cargo binstall ssh-browser
+```
+
+Or build it, which is also what to do for a platform not in that list:
+
+```
+cargo install ssh-browser
+```
+
+**That last one needs a Rust toolchain and a C compiler.** The C compiler is for `ring`, which
+the TLS stack compiles — `cc` on Linux and macOS, the MSVC build tools or a MinGW toolchain on
+Windows. Nothing else: no OpenSSL, no system TLS library, no daemon, no service. Everything TLS
+is inside the binary, and `deny.toml` bans the OpenSSL crates so it stays that way.
 
 At runtime it needs `ssh` on your `PATH` and nothing more. Trusting the https certificate uses a
 command your OS already has — `certutil`, `security`, or `update-ca-certificates` — and
