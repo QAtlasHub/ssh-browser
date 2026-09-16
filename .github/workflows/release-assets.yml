@@ -90,8 +90,14 @@ jobs:
       - name: name it after the platform
         shell: bash
         run: |
-          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          out="ssh-browser-$version-$TARGET$EXE"
+          # No version in the name, and that is what makes
+          # `releases/latest/download/ssh-browser-<target>` work -- the URL that never goes
+          # stale cannot interpolate one. Named with the version, it 404s, which is how this
+          # was found: by running the command the README gives rather than reading it.
+          #
+          # The version is still in the path of a pinned download,
+          # `releases/download/v0.5.1/...`, which is where it belongs.
+          out="ssh-browser-$TARGET$EXE"
           cp "target/$TARGET/release/ssh-browser$EXE" "$out"
           # Published so somebody can check what they downloaded against what this built,
           # which is what an unsigned binary can offer instead of a signature.

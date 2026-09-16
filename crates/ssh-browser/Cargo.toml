@@ -19,7 +19,7 @@ categories = ["network-programming", "command-line-utilities"]
 # near-miss falls back to building from source — which is the C compiler this exists to avoid,
 # arrived at silently. The names come from `release-assets.yml`; if one moves, both move.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/ssh-browser-{ version }-{ target }{ binary-ext }"
+pkg-url = "{ repo }/releases/download/v{ version }/ssh-browser-{ target }{ binary-ext }"
 # Not an archive. One file is the whole program, and unpacking a tarball that contains a
 # single binary is a step which exists only because most projects have more than one.
 pkg-fmt = "bin"
