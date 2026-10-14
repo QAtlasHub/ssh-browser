@@ -12,6 +12,18 @@ keywords = ["ssh", "sftp", "browser", "proxy", "origin"]
 # from a shell would be neither.
 categories = ["network-programming", "command-line-utilities"]
 
+# Where the built binaries are, so `cargo binstall ssh-browser` takes one instead of
+# compiling. Nothing but `cargo-binstall` reads this table; cargo ignores `package.metadata`.
+#
+# Spelled out rather than left to its defaults, because it tries several shapes and a
+# near-miss falls back to building from source — which is the C compiler this exists to avoid,
+# arrived at silently. The names come from `release-assets.yml`; if one moves, both move.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/ssh-browser-{ target }{ binary-ext }"
+# Not an archive. One file is the whole program, and unpacking a tarball that contains a
+# single binary is a step which exists only because most projects have more than one.
+pkg-fmt = "bin"
+
 [lints]
 workspace = true
 

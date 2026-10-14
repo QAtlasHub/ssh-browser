@@ -301,6 +301,38 @@ function renderList(): void {
 /// extension for the store, who will install it with no daemon anywhere. One red line
 /// naming a command they have never heard of is not enough to act on, and "does not
 /// function" is a fair reading of it.
+/// What to run to get the daemon, for the platform reading this.
+///
+/// `curl`, not a link to the releases page, and the difference is not convenience. These
+/// binaries are unsigned; macOS and Windows refuse an unsigned executable, but only one the
+/// *browser* downloaded — Gatekeeper reads a `com.apple.quarantine` flag and SmartScreen a
+/// Mark-of-the-Web, and both are attached by whatever did the downloading. `curl` attaches
+/// neither. Putting a download link here would walk somebody into the one warning the whole
+/// arrangement avoids.
+///
+/// The platform is a guess and says so by naming the file: somebody on an Intel Mac can see
+/// `aarch64` and change it. Guessing wrong is a wrong filename, which is visible; asking would
+/// be a question before the first useful thing has happened.
+function installCommand(): string {
+  const url = (target: string) =>
+    `https://github.com/QAtlasHub/ssh-browser/releases/latest/download/ssh-browser-${target}`;
+  const agent = navigator.userAgent;
+  if (agent.includes("Windows")) {
+    return [
+      `curl -L -o ssh-browser.exe ${url("x86_64-pc-windows-msvc.exe")}`,
+      ".\\ssh-browser.exe serve",
+    ].join("\n");
+  }
+  // Apple Silicon by default, because it is most Macs now and the alternative is named in the
+  // line above it either way.
+  const target = agent.includes("Mac OS X")
+    ? "aarch64-apple-darwin"
+    : "x86_64-unknown-linux-gnu";
+  return [`curl -L -o ssh-browser ${url(target)}`, "chmod +x ssh-browser", "./ssh-browser serve"].join(
+    "\n",
+  );
+}
+
 function renderOffline(firstRun: boolean): void {
   const view = clear();
   if (!firstRun) {
@@ -318,9 +350,15 @@ function renderOffline(firstRun: boolean): void {
         "half; the daemon runs on your own machine and does the SSH.",
     ),
   );
-  view.append(node("pre", "cmd", "cargo install ssh-browser\nssh-browser serve"));
+  view.append(node("pre", "cmd", installCommand()));
   view.append(
-    node("p", "note", "Then reload this page. It talks to 127.0.0.1 and to nothing else."),
+    node(
+      "p",
+      "note",
+      "Then reload this page. It talks to 127.0.0.1 and to nothing else. With cargo, " +
+        "cargo binstall ssh-browser fetches the same binary; cargo install ssh-browser " +
+        "builds it, which needs a C compiler.",
+    ),
   );
 
   const repo = document.createElement("a");

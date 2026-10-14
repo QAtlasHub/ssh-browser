@@ -29,6 +29,92 @@ permissions:
   contents: read
 
 jobs:
+  daemon:
+    # A binary per platform, so installing the daemon is a download rather than a Rust
+    # toolchain and a C compiler. The extension is on the store now, which means people arrive
+    # without either.
+    #
+    # Unsigned, deliberately. Gatekeeper and SmartScreen act on a flag the *downloading
+    # application* attaches — `com.apple.quarantine`, Mark-of-the-Web — and `curl` and `scp` do
+    # not attach one. A command-line tool installed the way command-line tools are installed
+    # meets neither. Signing would cost a few hundred a year to remove a warning on the one
+    # route the README does not recommend.
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      # Every platform that can build should, even when one cannot. A macOS runner out of
+      # capacity is not a reason to leave Linux users with nothing.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            exe: .exe
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            exe: ""
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            exe: ""
+          # Built on the older runner on purpose: a binary linked against a newer glibc will
+          # not start on an older one, and the people this is for are on login nodes somebody
+          # else administers. `musl` would remove the floor entirely and is not here yet,
+          # because `ring` wants a C toolchain targeting musl and an untested build inside a
+          # release job fails at the worst possible moment.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            exe: ""
+    env:
+      TAG: ${{ inputs.tag }}
+      TARGET: ${{ matrix.target }}
+      EXE: ${{ matrix.exe }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # `--locked` so the binary somebody downloads was built from the dependency versions in
+      # the tag rather than from whatever resolved on the day.
+      - name: build
+        run: cargo build --release --locked --bin ssh-browser --target ${{ matrix.target }}
+
+      # Named for the target rather than the runner: that is the string a reader matches
+      # against their own machine, and it is what `cargo-binstall` looks for.
+      - name: name it after the platform
+        shell: bash
+        run: |
+          # No version in the name, and that is what makes
+          # `releases/latest/download/ssh-browser-<target>` work -- the URL that never goes
+          # stale cannot interpolate one. Named with the version, it 404s, which is how this
+          # was found: by running the command the README gives rather than reading it.
+          #
+          # The version is still in the path of a pinned download,
+          # `releases/download/v0.5.1/...`, which is where it belongs.
+          out="ssh-browser-$TARGET$EXE"
+          cp "target/$TARGET/release/ssh-browser$EXE" "$out"
+          # Published so somebody can check what they downloaded against what this built,
+          # which is what an unsigned binary can offer instead of a signature.
+          #
+          # `sha256sum`, not `shasum`: the Git Bash on the Windows runner has the first and
+          # not the second, and this job was dispatched against an existing tag precisely so
+          # that finding out cost a failed test run rather than a failed release.
+          sha256sum "$out" > "$out.sha256"
+          cat "$out.sha256"
+          echo "ASSET=$out" >> "$GITHUB_ENV"
+
+      - name: upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+
   extension:
     name: attach the extension
     runs-on: ubuntu-latest
